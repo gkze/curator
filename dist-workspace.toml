@@ -1,0 +1,31 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.30.3"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+# Note: x86_64-apple-darwin removed as Determinate Nix Installer no longer supports Intel Macs
+# See: https://github.com/DeterminateSystems/nix-src/issues/224
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+# Homebrew tap to publish to
+tap = "gkze/homebrew-gkze"
+# Publish Homebrew formula on release
+publish-jobs = ["homebrew"]
+# Use Nix for build setup (installs dependencies via Nix)
+github-build-setup = "../build-setup.yml"

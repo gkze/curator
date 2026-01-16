@@ -1,0 +1,43 @@
+[package]
+name = "curator_cli"
+version.workspace = true
+edition = "2024"
+description = "A CLI tool for curating and managing Git repositories across multiple platforms"
+license = "MIT"
+repository = "https://github.com/gkze/curator"
+homepage = "https://github.com/gkze/curator"
+readme = "../../README.md"
+
+[[bin]]
+name = "curator"
+path = "src/main.rs"
+
+[features]
+default = ["all-databases", "github", "gitlab", "gitea"]
+postgres = ["curator/postgres", "sea-orm/sqlx-postgres"]
+sqlite = ["curator/sqlite", "sea-orm/sqlx-sqlite"]
+all-databases = ["postgres", "sqlite"]
+github = ["curator/github"]
+gitlab = ["curator/gitlab"]
+gitea = ["curator/gitea"]
+
+[dependencies]
+curator = { path = "../curator", features = ["migrate"] }
+chrono = "0.4"
+sea-orm = { version = "1.1", default-features = false, features = [
+  "runtime-tokio-rustls",
+] }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4.5"
+clap_mangen = "0.2"
+dotenvy = "0.15"
+indicatif = "0.18"
+console = "0.16"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tabled = "0.17"
+config = { version = "0.15", default-features = false, features = ["toml"] }
+directories = "6"

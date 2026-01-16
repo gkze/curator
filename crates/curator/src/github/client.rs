@@ -1,0 +1,1589 @@
+//! GitHub API client creation and rate limit management.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use backon::Retryable;
+use chrono::{DateTime, Utc};
+use octocrab::Octocrab;
+use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, IF_NONE_MATCH};
+use serde::de::DeserializeOwned;
+use tokio::sync::Semaphore;
+
+use super::convert::to_platform_repo;
+use super::error::{GitHubError, is_rate_limit_error_from_github, short_error_message};
+use crate::entity::code_platform::CodePlatform;
+use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
+use crate::platform::{
+    self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
+};
+use crate::retry::default_backoff;
+use crate::sync::SyncProgress;
+
+/// Extract ETag from response headers.
+///
+/// Returns the ETag value if present, handling both strong and weak ETags.
+pub fn extract_etag(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+}
+
+/// Pagination information extracted from the Link header.
+#[derive(Debug, Clone, Default)]
+pub struct PaginationInfo {
+    /// The last page number (from rel="last" link).
+    pub last_page: Option<u32>,
+    /// The next page number (from rel="next" link).
+    pub next_page: Option<u32>,
+}
+
+impl PaginationInfo {
+    /// Returns the total number of pages if known.
+    pub fn total_pages(&self) -> Option<u32> {
+        self.last_page
+    }
+}
+
+/// Parse the Link header to extract pagination info.
+///
+/// GitHub Link headers look like:
+/// `<https://api.github.com/organizations/123/repos?per_page=100&page=2>; rel="next", <...&page=3>; rel="last"`
+pub fn parse_link_header(link_header: &str) -> PaginationInfo {
+    let mut info = PaginationInfo::default();
+
+    for part in link_header.split(',') {
+        let part = part.trim();
+
+        // Extract URL and rel type
+        let mut url = None;
+        let mut rel = None;
+
+        for segment in part.split(';') {
+            let segment = segment.trim();
+            if segment.starts_with('<') && segment.ends_with('>') {
+                url = Some(&segment[1..segment.len() - 1]);
+            } else if let Some(rel_value) = segment.strip_prefix("rel=") {
+                rel = Some(rel_value.trim_matches('"'));
+            }
+        }
+
+        if let (Some(url), Some(rel_type)) = (url, rel) {
+            // Extract page number from URL query string
+            if let Some(page_num) = extract_page_from_url(url) {
+                match rel_type {
+                    "last" => info.last_page = Some(page_num),
+                    "next" => info.next_page = Some(page_num),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    info
+}
+
+/// Extract the page parameter from a URL.
+fn extract_page_from_url(url: &str) -> Option<u32> {
+    // Find the query string
+    let query_start = url.find('?')?;
+    let query = &url[query_start + 1..];
+
+    // Parse query parameters
+    for param in query.split('&') {
+        if let Some(value) = param.strip_prefix("page=") {
+            return value.parse().ok();
+        }
+    }
+
+    None
+}
+
+/// Result of a conditional fetch operation.
+#[derive(Debug, Clone)]
+pub enum FetchResult<T> {
+    /// The resource was not modified (304 response).
+    NotModified,
+    /// The resource was fetched successfully with optional ETag and pagination info.
+    Fetched {
+        data: T,
+        etag: Option<String>,
+        pagination: PaginationInfo,
+    },
+}
+
+impl<T> FetchResult<T> {
+    /// Returns true if the result indicates not modified (cache hit).
+    pub fn is_not_modified(&self) -> bool {
+        matches!(self, FetchResult::NotModified)
+    }
+
+    /// Extract data if fetched, returning None if not modified.
+    pub fn into_data(self) -> Option<T> {
+        match self {
+            FetchResult::NotModified => None,
+            FetchResult::Fetched { data, .. } => Some(data),
+        }
+    }
+
+    /// Get ETag if fetched, None otherwise.
+    pub fn etag(&self) -> Option<&str> {
+        match self {
+            FetchResult::NotModified => None,
+            FetchResult::Fetched { etag, .. } => etag.as_deref(),
+        }
+    }
+
+    /// Get pagination info if fetched, None otherwise.
+    pub fn pagination(&self) -> Option<&PaginationInfo> {
+        match self {
+            FetchResult::NotModified => None,
+            FetchResult::Fetched { pagination, .. } => Some(pagination),
+        }
+    }
+}
+
+/// Create an authenticated Octocrab instance from a GitHub token.
+pub fn create_client(token: &str) -> Result<Octocrab, GitHubError> {
+    Octocrab::builder()
+        .personal_token(token.to_string())
+        .build()
+        .map_err(GitHubError::Api)
+}
+
+/// Check rate limit and return error if exceeded.
+pub async fn check_rate_limit(client: &Octocrab) -> Result<(), GitHubError> {
+    let rate_limit = client.ratelimit().get().await?;
+    let core = &rate_limit.resources.core;
+
+    if core.remaining == 0 {
+        let reset_at = DateTime::from_timestamp(core.reset as i64, 0).unwrap_or_else(Utc::now);
+        return Err(GitHubError::RateLimited { reset_at });
+    }
+
+    Ok(())
+}
+
+/// Get current rate limit status (core API only).
+pub async fn get_rate_limit(client: &Octocrab) -> Result<RateLimitInfo, GitHubError> {
+    let rate_limit = client.ratelimit().get().await?;
+    let core = &rate_limit.resources.core;
+
+    Ok(RateLimitInfo {
+        limit: core.limit,
+        remaining: core.remaining,
+        reset_at: DateTime::from_timestamp(core.reset as i64, 0).unwrap_or_else(Utc::now),
+    })
+}
+
+/// Get full rate limit status for all resources.
+pub async fn get_rate_limits(
+    client: &Octocrab,
+) -> Result<super::types::GitHubRateLimitResponse, GitHubError> {
+    // Fetch raw JSON to get all fields including those octocrab may not expose
+    let response: super::types::GitHubRateLimitResponse = client
+        .get("/rate_limit", None::<&()>)
+        .await
+        .map_err(GitHubError::Api)?;
+    Ok(response)
+}
+
+/// Get organization info including repo count.
+pub async fn get_org_info(client: &Octocrab, org: &str) -> Result<OrgInfo, GitHubError> {
+    let org_data: serde_json::Value = client
+        .get(format!("/orgs/{}", org), None::<&()>)
+        .await
+        .map_err(GitHubError::Api)?;
+
+    let public_repos = org_data
+        .get("public_repos")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let name = org_data
+        .get("login")
+        .and_then(|v| v.as_str())
+        .unwrap_or(org)
+        .to_string();
+
+    let description = org_data
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Ok(OrgInfo {
+        name,
+        public_repos,
+        description,
+    })
+}
+
+/// GitHub API client implementing the PlatformClient trait.
+///
+/// This wraps an `Octocrab` instance and provides a unified interface
+/// for interacting with GitHub repositories.
+#[derive(Clone)]
+pub struct GitHubClient {
+    inner: Arc<Octocrab>,
+    /// The authentication token, stored for making raw conditional requests.
+    token: Arc<String>,
+}
+
+impl GitHubClient {
+    /// Create a new GitHub client from an authentication token.
+    pub fn new(token: &str) -> Result<Self, GitHubError> {
+        let client = create_client(token)?;
+        Ok(Self {
+            inner: Arc::new(client),
+            token: Arc::new(token.to_string()),
+        })
+    }
+
+    /// Create a GitHub client from an existing Octocrab instance.
+    ///
+    /// Note: This constructor doesn't have access to the token, so conditional
+    /// requests with ETags won't work. Use `new()` instead for full functionality.
+    pub fn from_octocrab(client: Octocrab) -> Self {
+        Self {
+            inner: Arc::new(client),
+            token: Arc::new(String::new()),
+        }
+    }
+
+    /// Get a reference to the inner Octocrab client.
+    pub fn inner(&self) -> &Octocrab {
+        &self.inner
+    }
+
+    /// Make a GET request with optional conditional ETag.
+    ///
+    /// If `cached_etag` is provided, sends an `If-None-Match` header.
+    /// Returns `FetchResult::NotModified` if the server returns 304.
+    /// Also extracts pagination info from the Link header.
+    pub async fn get_conditional<T: DeserializeOwned>(
+        &self,
+        route: &str,
+        cached_etag: Option<&str>,
+    ) -> Result<FetchResult<T>, GitHubError> {
+        // Build the request URL
+        let url = format!("https://api.github.com{}", route);
+
+        // Build the request with authentication
+        let mut request = reqwest::Client::new()
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "curator")
+            .header("Authorization", format!("Bearer {}", self.token.as_str()));
+
+        // Add conditional header if we have a cached ETag
+        if let Some(etag) = cached_etag {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| GitHubError::Internal(format!("HTTP request failed: {}", e)))?;
+
+        let status = response.status();
+        let headers = response.headers().clone();
+
+        match status {
+            StatusCode::NOT_MODIFIED => Ok(FetchResult::NotModified),
+            StatusCode::OK => {
+                let etag = extract_etag(&headers);
+
+                // Parse pagination from Link header
+                let pagination = headers
+                    .get("link")
+                    .and_then(|v| v.to_str().ok())
+                    .map(parse_link_header)
+                    .unwrap_or_default();
+
+                let data: T = response
+                    .json()
+                    .await
+                    .map_err(|e| GitHubError::Internal(format!("JSON parse error: {}", e)))?;
+                Ok(FetchResult::Fetched {
+                    data,
+                    etag,
+                    pagination,
+                })
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(GitHubError::AuthRequired),
+            StatusCode::NOT_FOUND => Err(GitHubError::OrgNotFound(route.to_string())),
+            _ => Err(GitHubError::Internal(format!(
+                "Unexpected HTTP status: {}",
+                status
+            ))),
+        }
+    }
+
+    /// Get the authentication token.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// List organization repositories with ETag caching support.
+    ///
+    /// This method supports conditional requests using ETags to avoid
+    /// refetching unchanged data. When a database connection is provided,
+    /// it will:
+    /// - Check for cached ETags before each page fetch
+    /// - Skip fetching if the server returns 304 Not Modified
+    /// - Store new ETags and pagination info after successful fetches
+    /// - Continue checking all pages using stored pagination metadata
+    ///
+    /// # Arguments
+    ///
+    /// * `org` - The organization name
+    /// * `db` - Optional database connection for ETag caching
+    /// * `on_progress` - Optional progress callback
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(repos, cache_stats)` where `cache_stats` indicates
+    /// how many pages were cache hits vs fetched.
+    pub async fn list_org_repos_cached(
+        &self,
+        org: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
+        use crate::api_cache;
+        use crate::entity::api_cache::EndpointType;
+        use crate::repository;
+
+        let mut all_repos = Vec::new();
+        let mut page = 1u32;
+        let mut stats = CacheStats::default();
+        let mut known_total_pages: Option<u32> = None;
+        let mut all_cache_hits = true; // Track if ALL pages were cache hits
+
+        // Try to get stored total_pages from the database (from previous sync)
+        if let Some(db) = db
+            && let Ok(Some(stored_total)) =
+                api_cache::get_total_pages(db, CodePlatform::GitHub, EndpointType::OrgRepos, org)
+                    .await
+        {
+            known_total_pages = Some(stored_total as u32);
+        }
+
+        // Get org info to know total repos upfront
+        let org_info = self.get_org_info(org).await.ok();
+        let total_repos = org_info.as_ref().map(|i| i.public_repos);
+
+        // Calculate expected pages from org info if we don't have stored pagination
+        let expected_pages =
+            known_total_pages.or_else(|| total_repos.map(|t| t.div_ceil(100) as u32));
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchingRepos {
+                namespace: org.to_string(),
+                total_repos,
+                expected_pages,
+            });
+        }
+
+        loop {
+            // Check rate limit before making request
+            check_rate_limit(&self.inner)
+                .await
+                .map_err(PlatformError::from)?;
+
+            let route = format!("/orgs/{}/repos?per_page=100&page={}", org, page);
+            let cache_key = format!("{}/page/{}", org, page);
+
+            // Try to get cached ETag
+            let cached_etag = if let Some(db) = db {
+                api_cache::get_etag(db, CodePlatform::GitHub, EndpointType::OrgRepos, &cache_key)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            // Make conditional request
+            let result: FetchResult<Vec<octocrab::models::Repository>> = self
+                .get_conditional(&route, cached_etag.as_deref())
+                .await
+                .map_err(PlatformError::from)?;
+
+            match result {
+                FetchResult::NotModified => {
+                    // Cache hit - data unchanged
+                    stats.cache_hits += 1;
+
+                    if let Some(cb) = on_progress {
+                        cb(SyncProgress::FetchedPage {
+                            page,
+                            count: 0, // Data cached, no new repos from this page
+                            total_so_far: all_repos.len(),
+                            expected_pages: known_total_pages,
+                        });
+                    }
+
+                    // Check if we should continue to the next page
+                    if let Some(total) = known_total_pages
+                        && page < total
+                    {
+                        page += 1;
+                        continue;
+                    }
+                    // If we don't know total pages and hit cache, we're done
+                    // (can't know if there are more pages)
+                    break;
+                }
+                FetchResult::Fetched {
+                    data: repos,
+                    etag,
+                    pagination,
+                } => {
+                    // At least one page had fresh data, so not a full cache hit
+                    all_cache_hits = false;
+                    stats.pages_fetched += 1;
+                    let count = repos.len();
+
+                    // Update known total pages from Link header
+                    if let Some(total) = pagination.total_pages() {
+                        known_total_pages = Some(total);
+                    }
+
+                    // Store new ETag and pagination info if we have a database connection
+                    if let Some(db) = db {
+                        // For page 1, store total_pages along with ETag
+                        let total_pages_to_store = if page == 1 {
+                            known_total_pages.map(|t| t as i32)
+                        } else {
+                            None
+                        };
+
+                        let _ = api_cache::upsert_with_pagination(
+                            db,
+                            CodePlatform::GitHub,
+                            EndpointType::OrgRepos,
+                            &cache_key,
+                            etag,
+                            total_pages_to_store,
+                        )
+                        .await;
+                    }
+
+                    // Convert to PlatformRepo
+                    let platform_repos: Vec<PlatformRepo> =
+                        repos.iter().map(to_platform_repo).collect();
+                    all_repos.extend(platform_repos);
+
+                    if let Some(cb) = on_progress {
+                        cb(SyncProgress::FetchedPage {
+                            page,
+                            count,
+                            total_so_far: all_repos.len(),
+                            expected_pages: known_total_pages,
+                        });
+                    }
+
+                    // Check if we should continue
+                    if let Some(total) = known_total_pages {
+                        if page < total {
+                            page += 1;
+                            continue;
+                        }
+                        // Reached known last page
+                        break;
+                    }
+
+                    // No pagination info - use count-based heuristic
+                    if count < 100 {
+                        break;
+                    }
+
+                    page += 1;
+                }
+            }
+        }
+
+        // If ALL pages were cache hits and we have no repos, load from database
+        if all_cache_hits
+            && all_repos.is_empty()
+            && stats.cache_hits > 0
+            && let Some(db) = db
+        {
+            let cached_repos =
+                repository::find_all_by_platform_and_owner(db, CodePlatform::GitHub, org)
+                    .await
+                    .map_err(|e| PlatformError::internal(e.to_string()))?;
+
+            if !cached_repos.is_empty() {
+                let cached_count = cached_repos.len();
+
+                // Emit cache hit event
+                if let Some(cb) = on_progress {
+                    cb(SyncProgress::CacheHit {
+                        namespace: org.to_string(),
+                        cached_count,
+                    });
+                }
+
+                // Convert cached models to PlatformRepo
+                let repos: Vec<PlatformRepo> =
+                    cached_repos.iter().map(PlatformRepo::from_model).collect();
+
+                if let Some(cb) = on_progress {
+                    cb(SyncProgress::FetchComplete { total: repos.len() });
+                }
+
+                return Ok((repos, stats));
+            }
+        }
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchComplete {
+                total: all_repos.len(),
+            });
+        }
+
+        Ok((all_repos, stats))
+    }
+
+    /// List starred repositories with ETag caching support.
+    ///
+    /// This method supports conditional requests using ETags to avoid
+    /// refetching unchanged data. When a database connection is provided,
+    /// it will:
+    /// - Check for cached ETags before each page fetch
+    /// - Skip fetching if the server returns 304 Not Modified
+    /// - Store new ETags and pagination info after successful fetches
+    /// - Continue checking all pages using stored pagination metadata
+    ///
+    /// # Arguments
+    ///
+    /// * `username` - The username whose starred repos to fetch (used as cache key)
+    /// * `db` - Optional database connection for ETag caching
+    /// * `on_progress` - Optional progress callback
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(repos, cache_stats)` where `cache_stats` indicates
+    /// how many pages were cache hits vs fetched.
+    pub async fn list_starred_repos_cached(
+        &self,
+        username: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
+        use crate::api_cache;
+        use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
+
+        let mut all_repos = Vec::new();
+        let mut page = 1u32;
+        let mut stats = CacheStats::default();
+        let mut known_total_pages: Option<u32> = None;
+
+        // Try to get stored total_pages from the database (from previous sync)
+        if let Some(db) = db
+            && let Ok(Some(stored_total)) = api_cache::get_total_pages(
+                db,
+                CodePlatform::GitHub,
+                EndpointType::Starred,
+                username,
+            )
+            .await
+        {
+            known_total_pages = Some(stored_total as u32);
+        }
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchingRepos {
+                namespace: "starred".to_string(),
+                total_repos: None,
+                expected_pages: known_total_pages,
+            });
+        }
+
+        loop {
+            // Check rate limit before making request
+            check_rate_limit(&self.inner)
+                .await
+                .map_err(PlatformError::from)?;
+
+            let route = format!("/user/starred?per_page=100&page={}", page);
+            let cache_key = ApiCacheModel::starred_key(username, page);
+
+            // Try to get cached ETag
+            let cached_etag = if let Some(db) = db {
+                api_cache::get_etag(db, CodePlatform::GitHub, EndpointType::Starred, &cache_key)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            // Make conditional request
+            let result: FetchResult<Vec<octocrab::models::Repository>> = self
+                .get_conditional(&route, cached_etag.as_deref())
+                .await
+                .map_err(PlatformError::from)?;
+
+            match result {
+                FetchResult::NotModified => {
+                    // Cache hit - data unchanged
+                    stats.cache_hits += 1;
+
+                    if let Some(cb) = on_progress {
+                        cb(SyncProgress::FetchedPage {
+                            page,
+                            count: 0, // Data cached, no new repos from this page
+                            total_so_far: all_repos.len(),
+                            expected_pages: known_total_pages,
+                        });
+                    }
+
+                    // Check if we should continue to the next page
+                    if let Some(total) = known_total_pages
+                        && page < total
+                    {
+                        page += 1;
+                        continue;
+                    }
+                    // If we don't know total pages and hit cache, we're done
+                    // (can't know if there are more pages)
+                    break;
+                }
+                FetchResult::Fetched {
+                    data: repos,
+                    etag,
+                    pagination,
+                } => {
+                    stats.pages_fetched += 1;
+                    let count = repos.len();
+
+                    // Update known total pages from Link header
+                    if let Some(total) = pagination.total_pages() {
+                        known_total_pages = Some(total);
+                    }
+
+                    // Store new ETag and pagination info if we have a database connection
+                    if let Some(db) = db {
+                        // For page 1, store total_pages along with ETag
+                        let total_pages_to_store = if page == 1 {
+                            known_total_pages.map(|t| t as i32)
+                        } else {
+                            None
+                        };
+
+                        let _ = api_cache::upsert_with_pagination(
+                            db,
+                            CodePlatform::GitHub,
+                            EndpointType::Starred,
+                            &cache_key,
+                            etag,
+                            total_pages_to_store,
+                        )
+                        .await;
+                    }
+
+                    // Convert to PlatformRepo
+                    let platform_repos: Vec<PlatformRepo> =
+                        repos.iter().map(to_platform_repo).collect();
+                    all_repos.extend(platform_repos);
+
+                    if let Some(cb) = on_progress {
+                        cb(SyncProgress::FetchedPage {
+                            page,
+                            count,
+                            total_so_far: all_repos.len(),
+                            expected_pages: known_total_pages,
+                        });
+                    }
+
+                    // Check if we should continue
+                    if let Some(total) = known_total_pages {
+                        if page < total {
+                            page += 1;
+                            continue;
+                        }
+                        // Reached known last page
+                        break;
+                    }
+
+                    // No pagination info - use count-based heuristic
+                    if count < 100 {
+                        break;
+                    }
+
+                    page += 1;
+                }
+            }
+        }
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchComplete {
+                total: all_repos.len(),
+            });
+        }
+
+        Ok((all_repos, stats))
+    }
+}
+
+/// Statistics about cache usage during a fetch operation.
+#[derive(Debug, Clone, Default)]
+pub struct CacheStats {
+    /// Number of pages that were cache hits (304 Not Modified).
+    pub cache_hits: u32,
+    /// Number of pages that were actually fetched.
+    pub pages_fetched: u32,
+}
+
+impl CacheStats {
+    /// Returns true if all requests were cache hits.
+    pub fn all_cached(&self) -> bool {
+        self.pages_fetched == 0 && self.cache_hits > 0
+    }
+
+    /// Returns the cache hit ratio (0.0 to 1.0).
+    pub fn hit_ratio(&self) -> f64 {
+        let total = self.cache_hits + self.pages_fetched;
+        if total == 0 {
+            0.0
+        } else {
+            self.cache_hits as f64 / total as f64
+        }
+    }
+}
+
+impl From<GitHubError> for PlatformError {
+    fn from(err: GitHubError) -> Self {
+        match err {
+            GitHubError::RateLimited { reset_at } => PlatformError::RateLimited { reset_at },
+            GitHubError::AuthRequired => PlatformError::AuthRequired,
+            GitHubError::OrgNotFound(org) => PlatformError::not_found(format!("org: {}", org)),
+            GitHubError::Api(e) => PlatformError::api(e.to_string()),
+            GitHubError::Internal(msg) => PlatformError::internal(msg),
+        }
+    }
+}
+
+#[async_trait]
+impl PlatformClient for GitHubClient {
+    fn platform(&self) -> CodePlatform {
+        CodePlatform::GitHub
+    }
+
+    async fn get_rate_limit(&self) -> platform::Result<RateLimitInfo> {
+        get_rate_limit(&self.inner)
+            .await
+            .map_err(PlatformError::from)
+    }
+
+    async fn get_org_info(&self, org: &str) -> platform::Result<OrgInfo> {
+        get_org_info(&self.inner, org)
+            .await
+            .map_err(PlatformError::from)
+    }
+
+    async fn get_authenticated_user(&self) -> platform::Result<UserInfo> {
+        // GET /user
+        let user: serde_json::Value = self
+            .inner
+            .get("/user", None::<&()>)
+            .await
+            .map_err(|e| PlatformError::api(e.to_string()))?;
+
+        Ok(UserInfo {
+            username: user
+                .get("login")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: user.get("name").and_then(|v| v.as_str()).map(String::from),
+            email: user.get("email").and_then(|v| v.as_str()).map(String::from),
+            bio: user.get("bio").and_then(|v| v.as_str()).map(String::from),
+            public_repos: user
+                .get("public_repos")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
+            followers: user.get("followers").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        })
+    }
+
+    async fn list_org_repos(
+        &self,
+        org: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<Vec<PlatformRepo>> {
+        // Use cached version if database connection is provided
+        if let Some(db) = db {
+            let (repos, _stats) = self
+                .list_org_repos_cached(org, Some(db), on_progress)
+                .await?;
+            return Ok(repos);
+        }
+
+        // Non-cached fallback
+        let mut all_repos = Vec::new();
+        let mut page = 1u32;
+
+        // Get org info to know total repos upfront
+        let org_info = self.get_org_info(org).await.ok();
+        let total_repos = org_info.as_ref().map(|i| i.public_repos);
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchingRepos {
+                namespace: org.to_string(),
+                total_repos,
+                expected_pages: total_repos.map(|t| t.div_ceil(100) as u32),
+            });
+        }
+
+        loop {
+            // Check rate limit before making request
+            check_rate_limit(&self.inner)
+                .await
+                .map_err(PlatformError::from)?;
+
+            let page_result = self
+                .inner
+                .orgs(org)
+                .list_repos()
+                .per_page(100)
+                .page(page)
+                .send()
+                .await
+                .map_err(|e| PlatformError::api(e.to_string()))?;
+
+            let repos: Vec<_> = page_result.items;
+            let count = repos.len();
+
+            // Convert to PlatformRepo
+            let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
+            all_repos.extend(platform_repos);
+
+            if let Some(cb) = on_progress {
+                cb(SyncProgress::FetchedPage {
+                    page,
+                    count,
+                    total_so_far: all_repos.len(),
+                    expected_pages: None,
+                });
+            }
+
+            // If we got fewer than 100, we've reached the end
+            if count < 100 {
+                break;
+            }
+
+            page += 1;
+        }
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchComplete {
+                total: all_repos.len(),
+            });
+        }
+
+        Ok(all_repos)
+    }
+
+    async fn list_user_repos(
+        &self,
+        username: &str,
+        _db: Option<&sea_orm::DatabaseConnection>,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<Vec<PlatformRepo>> {
+        // TODO: Implement caching for user repos similar to org repos (see beads issue curator-1tx)
+        let mut all_repos = Vec::new();
+        let mut page = 1u32;
+
+        // Get user info to know total repos upfront
+        let user_info: Option<serde_json::Value> = self
+            .inner
+            .get(format!("/users/{}", username), None::<&()>)
+            .await
+            .ok();
+        let total_repos = user_info
+            .as_ref()
+            .and_then(|u| u.get("public_repos"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchingRepos {
+                namespace: username.to_string(),
+                total_repos,
+                expected_pages: total_repos.map(|t| t.div_ceil(100) as u32),
+            });
+        }
+
+        loop {
+            // Check rate limit before making request
+            check_rate_limit(&self.inner)
+                .await
+                .map_err(PlatformError::from)?;
+
+            // GET /users/{username}/repos - lists public repos for the user
+            let route = format!("/users/{}/repos?per_page=100&page={}", username, page);
+            let repos: Vec<octocrab::models::Repository> = self
+                .inner
+                .get(&route, None::<&()>)
+                .await
+                .map_err(|e| PlatformError::api(e.to_string()))?;
+
+            let count = repos.len();
+
+            // Convert to PlatformRepo
+            let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
+            all_repos.extend(platform_repos);
+
+            if let Some(cb) = on_progress {
+                cb(SyncProgress::FetchedPage {
+                    page,
+                    count,
+                    total_so_far: all_repos.len(),
+                    expected_pages: None,
+                });
+            }
+
+            // If we got fewer than 100, we've reached the end
+            if count < 100 {
+                break;
+            }
+
+            page += 1;
+        }
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchComplete {
+                total: all_repos.len(),
+            });
+        }
+
+        Ok(all_repos)
+    }
+
+    async fn is_repo_starred(&self, owner: &str, name: &str) -> platform::Result<bool> {
+        // GET /user/starred/{owner}/{repo} returns 204 if starred, 404 if not
+        // We use _get instead of get because 204 returns an empty body which
+        // causes JSON deserialization to fail
+        let route = format!("/user/starred/{}/{}", owner, name);
+        let response = self
+            .inner
+            ._get(&route)
+            .await
+            .map_err(|e| PlatformError::api(e.to_string()))?;
+
+        match response.status().as_u16() {
+            204 => Ok(true),
+            404 => Ok(false),
+            status => Err(PlatformError::api(format!(
+                "Unexpected status {} checking starred status for {}/{}",
+                status, owner, name
+            ))),
+        }
+    }
+
+    async fn star_repo(&self, owner: &str, name: &str) -> platform::Result<bool> {
+        // Check if already starred
+        if self.is_repo_starred(owner, name).await? {
+            return Ok(false);
+        }
+
+        // PUT /user/starred/{owner}/{repo}
+        let route = format!("/user/starred/{}/{}", owner, name);
+        self.inner
+            ._put(&route, None::<&()>)
+            .await
+            .map_err(|e| PlatformError::api(e.to_string()))?;
+
+        Ok(true)
+    }
+
+    async fn star_repo_with_retry(
+        &self,
+        owner: &str,
+        name: &str,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<bool> {
+        // Check if already starred first (before any delays)
+        match self.is_repo_starred(owner, name).await {
+            Ok(true) => return Ok(false),
+            Ok(false) => {}
+            Err(PlatformError::RateLimited { .. }) => {
+                // Will retry below
+            }
+            Err(e) => return Err(e),
+        }
+
+        let owner_str = owner.to_string();
+        let name_str = name.to_string();
+        let client = self.inner.clone();
+
+        // Track attempt number for progress reporting
+        let attempt = std::sync::atomic::AtomicU32::new(0);
+
+        let star_op = || async {
+            attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            // PUT /user/starred/{owner}/{repo}
+            let route = format!("/user/starred/{}/{}", owner_str, name_str);
+            client
+                ._put(&route, None::<&()>)
+                .await
+                .map_err(GitHubError::Api)
+        };
+
+        let result = star_op
+            .retry(default_backoff())
+            .notify(|err, dur| {
+                let current_attempt = attempt.load(std::sync::atomic::Ordering::SeqCst);
+                if let Some(cb) = on_progress {
+                    cb(SyncProgress::RateLimitBackoff {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                        retry_after_ms: dur.as_millis() as u64,
+                        attempt: current_attempt,
+                    });
+                }
+                tracing::debug!(
+                    "Rate limited on {}/{}, retrying in {:?} (attempt {}): {}",
+                    owner_str,
+                    name_str,
+                    dur,
+                    current_attempt,
+                    short_error_message(err)
+                );
+            })
+            .when(is_rate_limit_error_from_github)
+            .await;
+
+        result.map(|_| true).map_err(PlatformError::from)
+    }
+
+    async fn unstar_repo(&self, owner: &str, name: &str) -> platform::Result<bool> {
+        // Check if starred first
+        if !self.is_repo_starred(owner, name).await? {
+            return Ok(false);
+        }
+
+        // DELETE /user/starred/{owner}/{repo}
+        let route = format!("/user/starred/{}/{}", owner, name);
+        self.inner
+            ._delete(&route, None::<&()>)
+            .await
+            .map_err(|e| PlatformError::api(e.to_string()))?;
+
+        Ok(true)
+    }
+
+    async fn list_starred_repos(
+        &self,
+        db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
+        skip_rate_checks: bool,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<Vec<PlatformRepo>> {
+        // Use cached version if database connection is provided
+        if let Some(db) = db {
+            // Get username for cache key
+            let user = self.get_authenticated_user().await?;
+            let (repos, _stats) = self
+                .list_starred_repos_cached(&user.username, Some(db), on_progress)
+                .await?;
+            return Ok(repos);
+        }
+
+        // Non-cached fallback
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchingRepos {
+                namespace: "starred".to_string(),
+                total_repos: None,
+                expected_pages: None,
+            });
+        }
+
+        // Fetch first page
+        if !skip_rate_checks {
+            check_rate_limit(&self.inner)
+                .await
+                .map_err(PlatformError::from)?;
+        }
+
+        let first_page_route = "/user/starred?per_page=100&page=1";
+        let first_page_repos: Vec<octocrab::models::Repository> = self
+            .inner
+            .get(first_page_route, None::<&()>)
+            .await
+            .map_err(|e| PlatformError::api(e.to_string()))?;
+
+        let first_page_count = first_page_repos.len();
+        let mut all_repos: Vec<PlatformRepo> =
+            first_page_repos.iter().map(to_platform_repo).collect();
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchedPage {
+                page: 1,
+                count: first_page_count,
+                total_so_far: all_repos.len(),
+                expected_pages: None,
+            });
+        }
+
+        // If first page is not full, we're done
+        if first_page_count < 100 {
+            if let Some(cb) = on_progress {
+                cb(SyncProgress::FetchComplete {
+                    total: all_repos.len(),
+                });
+            }
+            return Ok(all_repos);
+        }
+
+        // Fetch remaining pages concurrently using semaphore for rate control
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let client = self.inner.clone();
+
+        let mut page = 2u32;
+        let mut handles = Vec::new();
+
+        // Spawn page fetches - semaphore limits concurrency, no artificial caps
+        loop {
+            let task_semaphore = Arc::clone(&semaphore);
+            let task_client = client.clone();
+            let current_page = page;
+
+            let handle = tokio::spawn(async move {
+                let _permit = task_semaphore.acquire().await.ok()?;
+
+                // Check rate limit unless skipping
+                if !skip_rate_checks && check_rate_limit(&task_client).await.is_err() {
+                    return None;
+                }
+
+                let route = format!("/user/starred?per_page=100&page={}", current_page);
+                let repos: Result<Vec<octocrab::models::Repository>, _> =
+                    task_client.get(&route, None::<&()>).await;
+
+                match repos {
+                    Ok(repos) => Some((current_page, repos)),
+                    Err(_) => None,
+                }
+            });
+
+            handles.push(handle);
+            page += 1;
+
+            // Process in batches to detect early termination
+            if handles.len() >= concurrency {
+                let mut got_partial = false;
+                for handle in handles.drain(..) {
+                    if let Ok(Some((page_num, repos))) = handle.await {
+                        let count = repos.len();
+                        let platform_repos: Vec<PlatformRepo> =
+                            repos.iter().map(to_platform_repo).collect();
+                        all_repos.extend(platform_repos);
+
+                        if let Some(cb) = on_progress {
+                            cb(SyncProgress::FetchedPage {
+                                page: page_num,
+                                count,
+                                total_so_far: all_repos.len(),
+                                expected_pages: None,
+                            });
+                        }
+
+                        if count < 100 {
+                            got_partial = true;
+                        }
+                    }
+                }
+                if got_partial {
+                    break;
+                }
+            }
+        }
+
+        // Collect any remaining results
+        for handle in handles {
+            if let Ok(Some((page_num, repos))) = handle.await {
+                let count = repos.len();
+                let platform_repos: Vec<PlatformRepo> =
+                    repos.iter().map(to_platform_repo).collect();
+                all_repos.extend(platform_repos);
+
+                if let Some(cb) = on_progress {
+                    cb(SyncProgress::FetchedPage {
+                        page: page_num,
+                        count,
+                        total_so_far: all_repos.len(),
+                        expected_pages: None,
+                    });
+                }
+            }
+        }
+
+        if let Some(cb) = on_progress {
+            cb(SyncProgress::FetchComplete {
+                total: all_repos.len(),
+            });
+        }
+
+        Ok(all_repos)
+    }
+
+    async fn list_starred_repos_streaming(
+        &self,
+        repo_tx: tokio::sync::mpsc::Sender<PlatformRepo>,
+        db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
+        skip_rate_checks: bool,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<usize> {
+        use crate::api_cache;
+        use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
+        use crate::repository;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let total_sent = Arc::new(AtomicUsize::new(0));
+
+        // Get username for cache key (needed for ETag lookup)
+        let username = self.get_authenticated_user().await?.username;
+
+        // Try to get cached ETag for page 1 and known total pages
+        let (cached_etag, known_total_pages) = if let Some(db) = db {
+            let cache_key = ApiCacheModel::starred_key(&username, 1);
+            let etag =
+                api_cache::get_etag(db, CodePlatform::GitHub, EndpointType::Starred, &cache_key)
+                    .await
+                    .ok()
+                    .flatten();
+            let total = api_cache::get_starred_total_pages(db, CodePlatform::GitHub, &username)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t as u32);
+            (etag, total)
+        } else {
+            (None, None)
+        };
+
+        // Fetch first page using conditional request with cached ETag
+        if !skip_rate_checks {
+            check_rate_limit(&self.inner)
+                .await
+                .map_err(PlatformError::from)?;
+        }
+
+        let first_page_route = "/user/starred?per_page=100&page=1";
+        let first_page_result: FetchResult<Vec<octocrab::models::Repository>> = self
+            .get_conditional(first_page_route, cached_etag.as_deref())
+            .await
+            .map_err(|e| PlatformError::api(e.to_string()))?;
+
+        match first_page_result {
+            FetchResult::NotModified => {
+                // Cache hit! The starred list hasn't changed.
+                // Load all repos from the database and stream them.
+                if let Some(db) = db {
+                    let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitHub)
+                        .await
+                        .map_err(|e| PlatformError::internal(e.to_string()))?;
+
+                    let total_repos = cached_repos.len();
+
+                    // Emit cache hit event to show the user we're using cached data
+                    if let Some(cb) = on_progress {
+                        cb(SyncProgress::CacheHit {
+                            namespace: "starred".to_string(),
+                            cached_count: total_repos,
+                        });
+                    }
+
+                    // Stream cached repos through the channel
+                    for model in &cached_repos {
+                        let platform_repo = PlatformRepo::from_model(model);
+                        if repo_tx.send(platform_repo).await.is_ok() {
+                            total_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    return Ok(total_sent.load(Ordering::Relaxed));
+                }
+
+                // No database - can't use cache, fall through to normal fetch
+                // This shouldn't happen since we got 304 with an ETag, but handle gracefully
+                return Ok(0);
+            }
+            FetchResult::Fetched {
+                data: first_page_repos,
+                etag: new_etag,
+                pagination,
+            } => {
+                // Data changed - fetch everything and update ETags
+                let expected_pages = pagination.last_page.or(known_total_pages);
+                let first_page_count = first_page_repos.len();
+
+                // Store new ETag for page 1
+                if let Some(db) = db {
+                    let cache_key = ApiCacheModel::starred_key(&username, 1);
+                    let _ = api_cache::upsert_with_pagination(
+                        db,
+                        CodePlatform::GitHub,
+                        EndpointType::Starred,
+                        &cache_key,
+                        new_etag,
+                        expected_pages.map(|p| p as i32),
+                    )
+                    .await;
+                }
+
+                // Emit FetchingRepos with expected_pages from Link header
+                if let Some(cb) = on_progress {
+                    cb(SyncProgress::FetchingRepos {
+                        namespace: "starred".to_string(),
+                        total_repos: expected_pages.map(|p| (p * 100) as usize),
+                        expected_pages,
+                    });
+                }
+
+                // Send first page repos immediately
+                for repo in &first_page_repos {
+                    let platform_repo = to_platform_repo(repo);
+                    if repo_tx.send(platform_repo).await.is_ok() {
+                        total_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                if let Some(cb) = on_progress {
+                    cb(SyncProgress::FetchedPage {
+                        page: 1,
+                        count: first_page_count,
+                        total_so_far: total_sent.load(Ordering::Relaxed),
+                        expected_pages,
+                    });
+                }
+
+                // If first page is not full, we're done
+                if first_page_count < 100 {
+                    if let Some(cb) = on_progress {
+                        cb(SyncProgress::FetchComplete {
+                            total: total_sent.load(Ordering::Relaxed),
+                        });
+                    }
+                    return Ok(total_sent.load(Ordering::Relaxed));
+                }
+
+                // Fetch remaining pages concurrently using semaphore for rate control
+                let semaphore = Arc::new(Semaphore::new(concurrency));
+                let client = self.inner.clone();
+                let known_last_page = expected_pages;
+
+                let mut page = 2u32;
+                let mut handles = Vec::new();
+
+                // Spawn page fetches - stop when we reach known last page or detect partial page
+                loop {
+                    // Stop if we've reached the known last page
+                    if let Some(last) = known_last_page
+                        && page > last
+                    {
+                        break;
+                    }
+
+                    let task_semaphore = Arc::clone(&semaphore);
+                    let task_client = client.clone();
+                    let task_repo_tx = repo_tx.clone();
+                    let task_total_sent = Arc::clone(&total_sent);
+                    let current_page = page;
+
+                    let handle = tokio::spawn(async move {
+                        let _permit = task_semaphore.acquire().await.ok()?;
+
+                        // Check rate limit unless skipping
+                        if !skip_rate_checks && check_rate_limit(&task_client).await.is_err() {
+                            return None;
+                        }
+
+                        let route = format!("/user/starred?per_page=100&page={}", current_page);
+                        let repos: Result<Vec<octocrab::models::Repository>, _> =
+                            task_client.get(&route, None::<&()>).await;
+
+                        match repos {
+                            Ok(repos) => {
+                                let count = repos.len();
+                                // Send repos as they arrive
+                                for repo in &repos {
+                                    let platform_repo = to_platform_repo(repo);
+                                    if task_repo_tx.send(platform_repo).await.is_ok() {
+                                        task_total_sent.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Some((current_page, count))
+                            }
+                            Err(_) => None,
+                        }
+                    });
+
+                    handles.push(handle);
+                    page += 1;
+
+                    // Process in batches to detect early termination (fallback if no Link header)
+                    if handles.len() >= concurrency {
+                        let mut got_partial = false;
+                        for handle in handles.drain(..) {
+                            if let Ok(Some((page_num, count))) = handle.await {
+                                if let Some(cb) = on_progress {
+                                    cb(SyncProgress::FetchedPage {
+                                        page: page_num,
+                                        count,
+                                        total_so_far: total_sent.load(Ordering::Relaxed),
+                                        expected_pages,
+                                    });
+                                }
+                                if count < 100 {
+                                    got_partial = true;
+                                }
+                            }
+                        }
+                        if got_partial {
+                            break;
+                        }
+                    }
+                }
+
+                // Collect any remaining results
+                for handle in handles {
+                    if let Ok(Some((page_num, count))) = handle.await
+                        && let Some(cb) = on_progress
+                    {
+                        cb(SyncProgress::FetchedPage {
+                            page: page_num,
+                            count,
+                            total_so_far: total_sent.load(Ordering::Relaxed),
+                            expected_pages,
+                        });
+                    }
+                }
+
+                if let Some(cb) = on_progress {
+                    cb(SyncProgress::FetchComplete {
+                        total: total_sent.load(Ordering::Relaxed),
+                    });
+                }
+
+                Ok(total_sent.load(Ordering::Relaxed))
+            }
+        }
+    }
+
+    fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
+        repo.to_active_model(self.platform())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_github_error_to_platform_error() {
+        let rate_limited = GitHubError::RateLimited {
+            reset_at: Utc::now(),
+        };
+        let platform_err: PlatformError = rate_limited.into();
+        assert!(matches!(platform_err, PlatformError::RateLimited { .. }));
+
+        let auth_required = GitHubError::AuthRequired;
+        let platform_err: PlatformError = auth_required.into();
+        assert!(matches!(platform_err, PlatformError::AuthRequired));
+
+        let not_found = GitHubError::OrgNotFound("test-org".to_string());
+        let platform_err: PlatformError = not_found.into();
+        assert!(matches!(platform_err, PlatformError::NotFound { .. }));
+    }
+
+    #[test]
+    fn test_github_client_platform() {
+        // We can't easily test the full client without a token,
+        // but we can verify the trait implementation compiles
+        fn assert_platform_client<T: PlatformClient>() {}
+        assert_platform_client::<GitHubClient>();
+    }
+
+    #[test]
+    fn test_parse_link_header_full() {
+        // Real GitHub Link header format
+        let header = r#"<https://api.github.com/organizations/5430905/repos?per_page=100&page=2>; rel="next", <https://api.github.com/organizations/5430905/repos?per_page=100&page=3>; rel="last""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, Some(2));
+        assert_eq!(info.last_page, Some(3));
+        assert_eq!(info.total_pages(), Some(3));
+    }
+
+    #[test]
+    fn test_parse_link_header_only_next() {
+        let header =
+            r#"<https://api.github.com/organizations/123/repos?per_page=100&page=2>; rel="next""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, Some(2));
+        assert_eq!(info.last_page, None);
+        assert_eq!(info.total_pages(), None);
+    }
+
+    #[test]
+    fn test_parse_link_header_only_last() {
+        let header =
+            r#"<https://api.github.com/organizations/123/repos?per_page=100&page=5>; rel="last""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, None);
+        assert_eq!(info.last_page, Some(5));
+        assert_eq!(info.total_pages(), Some(5));
+    }
+
+    #[test]
+    fn test_parse_link_header_empty() {
+        let info = parse_link_header("");
+        assert_eq!(info.next_page, None);
+        assert_eq!(info.last_page, None);
+    }
+
+    #[test]
+    fn test_extract_page_from_url() {
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?page=5"),
+            Some(5)
+        );
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?per_page=100&page=3"),
+            Some(3)
+        );
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?per_page=100"),
+            None
+        );
+        assert_eq!(extract_page_from_url("https://api.github.com/repos"), None);
+    }
+
+    #[test]
+    fn test_pagination_info_total_pages() {
+        let info = PaginationInfo {
+            last_page: Some(10),
+            next_page: Some(2),
+        };
+        assert_eq!(info.total_pages(), Some(10));
+
+        let info = PaginationInfo {
+            last_page: None,
+            next_page: Some(2),
+        };
+        assert_eq!(info.total_pages(), None);
+    }
+}

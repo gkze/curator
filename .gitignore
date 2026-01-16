@@ -1,0 +1,10 @@
+.DS_Store
+.claude/settings.local.json
+.env
+.pre-commit-config.yaml
+/.direnv
+/.idea
+/.tmp
+/result
+/target
+curator.db

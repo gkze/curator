@@ -1,0 +1,28 @@
+---
+# Build setup for cargo-dist: Install Nix and configure build environment
+# This ensures parity between local dev (nix develop) and CI builds
+
+- name: Install Nix
+  uses: DeterminateSystems/nix-installer-action@v21
+
+- name: Setup Cachix
+  uses: cachix/cachix-action@v16
+  with:
+    name: ${{ vars.CACHIX_CACHE_NAME }}
+    authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+- name: Setup Nix build environment
+  run: |-
+    # Export environment variables from Nix devshell for cargo to use
+    # This gives us the same dependencies as `nix develop`
+    nix develop --command printenv > /tmp/nix-env
+
+    # Extract and export relevant variables for the build
+    # NOTE: We intentionally exclude LD_LIBRARY_PATH as it breaks system tools
+    # (like curl) that expect system GLIBC. LIBRARY_PATH is sufficient for linking.
+    for var in PKG_CONFIG_PATH LIBRARY_PATH C_INCLUDE_PATH CPATH; do
+      value=$(grep "^${var}=" /tmp/nix-env | cut -d= -f2- || true)
+      if [ -n "$value" ]; then
+        echo "${var}=${value}" >> "$GITHUB_ENV"
+      fi
+    done
