@@ -1,5 +1,9 @@
 # Curator
 
+[![CI](https://github.com/gkze/curator/actions/workflows/ci.yml/badge.svg)](https://github.com/gkze/curator/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.92.0-orange.svg)](https://www.rust-lang.org/)
+
 A multi-platform repository tracker and manager that provides a unified interface for discovering, tracking, and managing repositories across multiple code hosting platforms.
 
 ## Supported Platforms
