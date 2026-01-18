@@ -36,6 +36,8 @@
 //! ```
 
 use std::path::PathBuf;
+#[cfg(feature = "github")]
+use std::{fs, io};
 
 use config::{Config as ConfigBuilder, Environment, File, FileFormat};
 use directories::ProjectDirs;
@@ -283,6 +285,50 @@ impl Config {
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| dirs.data_dir().to_path_buf())
         })
+    }
+
+    /// Save a GitHub token to the config file.
+    ///
+    /// Creates the config file and parent directories if they don't exist.
+    /// If a config file already exists, it updates only the `[github]` section,
+    /// preserving formatting, comments, and other settings.
+    #[cfg(feature = "github")]
+    pub fn save_github_token(token: &str) -> io::Result<PathBuf> {
+        use toml_edit::{DocumentMut, value};
+
+        let config_path = Self::default_config_path().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not determine config directory",
+            )
+        })?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Read existing config or start fresh
+        let content = if config_path.exists() {
+            fs::read_to_string(&config_path)?
+        } else {
+            String::new()
+        };
+
+        // Parse as TOML document (preserves formatting and comments)
+        let mut doc: DocumentMut = content.parse().map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid TOML: {}", e))
+        })?;
+
+        // Ensure [github] table exists and set the token
+        if !doc.contains_key("github") {
+            doc["github"] = toml_edit::table();
+        }
+        doc["github"]["token"] = value(token);
+
+        // Write back to file
+        fs::write(&config_path, doc.to_string())?;
+        Ok(config_path)
     }
 }
 
