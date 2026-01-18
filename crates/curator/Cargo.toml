@@ -18,9 +18,9 @@ all-databases = ["postgres", "sqlite"]
 # Migration support (combine with database backend(s))
 migrate = ["dep:sea-orm-migration"]
 # Platform clients
-github = ["dep:octocrab", "dep:backon", "dep:tracing", "dep:reqwest"]
-gitlab = ["dep:gitlab", "dep:backon", "dep:tracing"]
-gitea = ["dep:reqwest", "dep:backon", "dep:tracing"]
+github = ["dep:octocrab", "dep:backon", "dep:reqwest"]
+gitlab = ["dep:gitlab", "dep:backon"]
+gitea = ["dep:reqwest", "dep:backon"]
 
 [dependencies]
 sea-orm = { version = "1.1", default-features = false, features = [
@@ -41,7 +41,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
 ], optional = true }
 backon = { version = "1.6", optional = true }
-tracing = { version = "0.1", optional = true }
+tracing = "0.1"
 governor = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
