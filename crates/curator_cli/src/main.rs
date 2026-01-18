@@ -621,29 +621,112 @@ enum GiteaAction {
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 const PERSIST_BATCH_SIZE: usize = 100;
 
+/// Number of retry attempts for database writes.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+const PERSIST_RETRY_ATTEMPTS: u32 = 3;
+
+/// Initial backoff delay in milliseconds for database write retries.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+const PERSIST_RETRY_BACKOFF_MS: u64 = 100;
+
+/// Result of a persist task, including saved count and any errors encountered.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+#[derive(Debug, Default)]
+pub struct PersistTaskResult {
+    /// Number of repositories successfully saved to database.
+    pub saved_count: usize,
+    /// Accumulated errors: (owner, name, error_message).
+    pub errors: Vec<(String, String, String)>,
+    /// Panic message if the task panicked.
+    pub panic_info: Option<String>,
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+impl PersistTaskResult {
+    /// Check if there were any errors during persistence.
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty() || self.panic_info.is_some()
+    }
+
+    /// Get the total number of failed items.
+    pub fn failed_count(&self) -> usize {
+        self.errors.len() + usize::from(self.panic_info.is_some())
+    }
+}
+
 /// Spawn a task that persists repository models from a channel using batch upserts.
 ///
 /// Models are collected into batches and persisted using bulk upsert with ON CONFLICT,
 /// which is significantly faster than individual upserts (1 query per batch vs 2n queries).
 ///
+/// Features:
+/// - Automatic retry with exponential backoff for transient database errors
+/// - Accumulates all errors for reporting after sync completes
+/// - Captures panics and includes them in the result
+///
 /// The task respects the global shutdown flag:
 /// - On shutdown, it flushes any pending batch before exiting
 /// - This ensures no data loss during graceful shutdown
 ///
-/// Returns the task handle and a counter for tracking saved count.
+/// Returns the task handle and a counter for tracking saved count in real-time.
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 fn spawn_persist_task(
     db: Arc<DatabaseConnection>,
     mut rx: mpsc::Receiver<CodeRepositoryActiveModel>,
     on_progress: Option<Arc<ProgressCallback>>,
-) -> (tokio::task::JoinHandle<usize>, Arc<AtomicUsize>) {
+) -> (tokio::task::JoinHandle<PersistTaskResult>, Arc<AtomicUsize>) {
     let saved_count = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&saved_count);
 
     let handle = tokio::spawn(async move {
-        let mut total = 0usize;
+        let mut result = PersistTaskResult::default();
         let mut batch: Vec<CodeRepositoryActiveModel> = Vec::with_capacity(PERSIST_BATCH_SIZE);
         let mut batch_names: Vec<(String, String)> = Vec::with_capacity(PERSIST_BATCH_SIZE);
+
+        // Macro to flush a batch with retry logic (avoids lifetime issues with closures)
+        macro_rules! flush_batch {
+            ($models:expr, $names:expr) => {{
+                match repository::bulk_upsert_with_retry(
+                    &db,
+                    $models,
+                    PERSIST_RETRY_ATTEMPTS,
+                    PERSIST_RETRY_BACKOFF_MS,
+                )
+                .await
+                {
+                    Ok(rows_affected) => {
+                        let count = rows_affected as usize;
+                        result.saved_count += count;
+                        saved_count.fetch_add(count, Ordering::Relaxed);
+                        // Report progress for actually persisted items
+                        if let Some(cb) = &on_progress {
+                            for (owner, name) in $names.into_iter().take(count) {
+                                cb(SyncProgress::Persisted { owner, name });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let error = e.to_string();
+                        // Accumulate errors for later reporting
+                        for (owner, name) in &$names {
+                            result
+                                .errors
+                                .push((owner.clone(), name.clone(), error.clone()));
+                        }
+                        // Also emit progress events for real-time feedback
+                        if let Some(cb) = &on_progress {
+                            for (owner, name) in $names {
+                                cb(SyncProgress::PersistError {
+                                    owner,
+                                    name,
+                                    error: error.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }};
+        }
 
         loop {
             // Check for shutdown - if requested, drain remaining items and exit
@@ -660,32 +743,7 @@ fn spawn_persist_task(
                 if !batch.is_empty() {
                     let names = std::mem::take(&mut batch_names);
                     let models = std::mem::take(&mut batch);
-
-                    match repository::bulk_upsert(&db, models).await {
-                        Ok(rows_affected) => {
-                            let count = rows_affected as usize;
-                            total += count;
-                            saved_count.fetch_add(count, Ordering::Relaxed);
-                            // Report progress for actually persisted items
-                            if let Some(ref cb) = on_progress {
-                                for (owner, name) in names.into_iter().take(count) {
-                                    cb(SyncProgress::Persisted { owner, name });
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(ref cb) = on_progress {
-                                let error = e.to_string();
-                                for (owner, name) in names {
-                                    cb(SyncProgress::PersistError {
-                                        owner,
-                                        name,
-                                        error: error.clone(),
-                                    });
-                                }
-                            }
-                        }
-                    }
+                    flush_batch!(models, names);
                 }
                 break;
             }
@@ -708,33 +766,7 @@ fn spawn_persist_task(
             if should_flush && !batch.is_empty() {
                 let names = std::mem::take(&mut batch_names);
                 let models = std::mem::take(&mut batch);
-
-                match repository::bulk_upsert(&db, models).await {
-                    Ok(rows_affected) => {
-                        let count = rows_affected as usize;
-                        total += count;
-                        saved_count.fetch_add(count, Ordering::Relaxed);
-                        // Report progress for actually persisted items
-                        if let Some(ref cb) = on_progress {
-                            for (owner, name) in names.into_iter().take(count) {
-                                cb(SyncProgress::Persisted { owner, name });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Report error for each item in the batch
-                        if let Some(ref cb) = on_progress {
-                            let error = e.to_string();
-                            for (owner, name) in names {
-                                cb(SyncProgress::PersistError {
-                                    owner,
-                                    name,
-                                    error: error.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
+                flush_batch!(models, names);
             }
 
             // Exit loop when channel is closed
@@ -743,10 +775,102 @@ fn spawn_persist_task(
             }
         }
 
-        total
+        result
     });
 
     (handle, counter)
+}
+
+/// Await the persist task handle and capture any panic information.
+///
+/// If the task panicked, returns a PersistTaskResult with panic_info set.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+async fn await_persist_task(
+    handle: tokio::task::JoinHandle<PersistTaskResult>,
+) -> PersistTaskResult {
+    match handle.await {
+        Ok(result) => result,
+        Err(e) => {
+            // Task panicked or was cancelled
+            let panic_info = if e.is_panic() {
+                // Try to extract panic message
+                let panic_payload = e.into_panic();
+                if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    Some((*s).to_string())
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    Some(s.clone())
+                } else {
+                    Some("Unknown panic".to_string())
+                }
+            } else if e.is_cancelled() {
+                Some("Task was cancelled".to_string())
+            } else {
+                Some(format!("Task failed: {}", e))
+            };
+
+            PersistTaskResult {
+                saved_count: 0,
+                errors: Vec::new(),
+                panic_info,
+            }
+        }
+    }
+}
+
+/// Display persist errors and panic info to the user.
+///
+/// This function outputs accumulated errors in a visible way so users
+/// know exactly what failed to save to the database.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+fn display_persist_errors(result: &PersistTaskResult, is_tty: bool) {
+    if result.panic_info.is_some() || !result.errors.is_empty() {
+        if is_tty {
+            println!();
+        }
+
+        // Display panic info first (most severe)
+        if let Some(ref panic) = result.panic_info {
+            if is_tty {
+                eprintln!("\x1b[1;31mPersist task crashed: {}\x1b[0m", panic);
+                eprintln!("  Some repositories may not have been saved to the database.");
+            } else {
+                tracing::error!(panic = %panic, "Persist task crashed - some repos may not be saved");
+            }
+        }
+
+        // Display individual errors (limited to first 10 to avoid flooding)
+        if !result.errors.is_empty() {
+            let total_errors = result.errors.len();
+            let display_count = std::cmp::min(10, total_errors);
+
+            if is_tty {
+                eprintln!(
+                    "\x1b[1;33mDatabase write errors ({} total):\x1b[0m",
+                    total_errors
+                );
+                for (owner, name, error) in result.errors.iter().take(display_count) {
+                    eprintln!("  - {}/{}: {}", owner, name, error);
+                }
+                if total_errors > display_count {
+                    eprintln!("  ... and {} more errors", total_errors - display_count);
+                }
+            } else {
+                for (owner, name, error) in result.errors.iter().take(display_count) {
+                    tracing::error!(
+                        repo = %format!("{}/{}", owner, name),
+                        error = %error,
+                        "Failed to save to database"
+                    );
+                }
+                if total_errors > display_count {
+                    tracing::error!(
+                        additional_errors = total_errors - display_count,
+                        "Additional database write errors occurred"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Create a rate limiter if rate limiting is enabled.
@@ -816,11 +940,12 @@ async fn run_gitea_sync(
         .await?;
 
         // Wait for persistence to complete
-        let saved = if let Some(handle) = persist_handle {
-            handle.await.unwrap_or(0)
+        let persist_result = if let Some(handle) = persist_handle {
+            await_persist_task(handle).await
         } else {
-            0
+            PersistTaskResult::default()
         };
+        let saved = persist_result.saved_count;
 
         // Finish progress bars before printing summary
         reporter.finish();
@@ -851,17 +976,23 @@ async fn run_gitea_sync(
 
             if !options.dry_run {
                 println!("  Saved to database:     {}", saved);
+                if persist_result.has_errors() {
+                    println!("  Failed to save:        {}", persist_result.failed_count());
+                }
             } else {
                 println!("  Would save:            {}", result.matched);
             }
 
-            // Report errors
+            // Report sync errors
             if !result.errors.is_empty() {
-                println!("\nErrors:");
+                println!("\nSync errors:");
                 for err in &result.errors {
                     println!("  - {}", err);
                 }
             }
+
+            // Report persist errors
+            display_persist_errors(&persist_result, is_tty);
         } else {
             tracing::info!(
                 org = %org,
@@ -901,11 +1032,12 @@ async fn run_gitea_sync(
         .await;
 
         // Wait for persistence to complete
-        let total_saved = if let Some(handle) = persist_handle {
-            handle.await.unwrap_or(0)
+        let persist_result = if let Some(handle) = persist_handle {
+            await_persist_task(handle).await
         } else {
-            0
+            PersistTaskResult::default()
         };
+        let total_saved = persist_result.saved_count;
 
         // Finish progress bars before printing summary
         reporter.finish();
@@ -959,17 +1091,26 @@ async fn run_gitea_sync(
             }
             if !options.dry_run {
                 println!("Total saved to database:      {}", total_saved);
+                if persist_result.has_errors() {
+                    println!(
+                        "Total failed to save:         {}",
+                        persist_result.failed_count()
+                    );
+                }
             } else {
                 println!("Total would save:             {}", total_matched);
             }
 
-            // Report all errors
+            // Report sync errors
             if !all_errors.is_empty() {
-                println!("\nErrors ({}):", all_errors.len());
+                println!("\nSync errors ({}):", all_errors.len());
                 for err in &all_errors {
                     println!("  - {}", err);
                 }
             }
+
+            // Report persist errors
+            display_persist_errors(&persist_result, is_tty);
         } else {
             tracing::info!(
                 orgs = orgs.len(),
@@ -979,9 +1120,11 @@ async fn run_gitea_sync(
                 starred = total_starred,
                 skipped = total_skipped,
                 saved = total_saved,
+                persist_errors = persist_result.failed_count(),
                 errors = all_errors.len(),
                 "Sync complete"
             );
+            display_persist_errors(&persist_result, is_tty);
         }
     }
 
@@ -1258,11 +1401,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await?;
 
                         // Wait for persistence to complete
-                        let saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let saved = persist_result.saved_count;
 
                         // Finish progress bars before printing summary
                         reporter.finish();
@@ -1293,17 +1437,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if !options.dry_run {
                                 println!("  Saved to database:     {}", saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "  Failed to save:        {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("  Would save:            {}", result.matched);
                             }
 
-                            // Report errors
+                            // Report sync errors
                             if !result.errors.is_empty() {
-                                println!("\nErrors:");
+                                println!("\nSync errors:");
                                 for err in &result.errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 org = %org,
@@ -1312,9 +1465,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = result.starred,
                                 skipped = result.skipped,
                                 saved = saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = result.errors.len(),
                                 "Sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     } else {
                         // Multiple orgs - sync concurrently with streaming persistence
@@ -1345,11 +1500,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await;
 
                         // Wait for persistence to complete
-                        let total_saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let total_saved = persist_result.saved_count;
 
                         // Finish progress bars before printing summary
                         reporter.finish();
@@ -1403,17 +1559,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if !options.dry_run {
                                 println!("Total saved to database:      {}", total_saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "Total failed to save:         {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("Total would save:             {}", total_matched);
                             }
 
-                            // Report all errors
+                            // Report sync errors
                             if !all_errors.is_empty() {
-                                println!("\nErrors ({}):", all_errors.len());
+                                println!("\nSync errors ({}):", all_errors.len());
                                 for err in &all_errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 orgs = orgs.len(),
@@ -1422,9 +1587,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = total_starred,
                                 skipped = total_skipped,
                                 saved = total_saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = all_errors.len(),
                                 "Sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     }
 
@@ -1532,11 +1699,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await?;
 
                         // Wait for persistence to complete
-                        let saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let saved = persist_result.saved_count;
 
                         // Finish progress bars before printing summary
                         reporter.finish();
@@ -1561,16 +1729,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if !options.dry_run {
                                 println!("  Saved to database:     {}", saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "  Failed to save:        {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("  Would save:            {}", result.matched);
                             }
 
                             if !result.errors.is_empty() {
-                                println!("\nErrors:");
+                                println!("\nSync errors:");
                                 for err in &result.errors {
                                     println!("  - {}", err);
                                 }
                             }
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 user = %user,
@@ -1579,9 +1754,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = result.starred,
                                 skipped = result.skipped,
                                 saved = saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = result.errors.len(),
                                 "User sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     } else {
                         // Multiple users - sync concurrently with streaming persistence
@@ -1615,11 +1792,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await;
 
                         // Wait for persistence to complete
-                        let total_saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let total_saved = persist_result.saved_count;
 
                         // Finish progress bars before printing summary
                         reporter.finish();
@@ -1671,16 +1849,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if !options.dry_run {
                                 println!("Total saved to database:      {}", total_saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "Total failed to save:         {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("Total would save:             {}", total_matched);
                             }
 
                             if !all_errors.is_empty() {
-                                println!("\nErrors ({}):", all_errors.len());
+                                println!("\nSync errors ({}):", all_errors.len());
                                 for err in &all_errors {
                                     println!("  - {}", err);
                                 }
                             }
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 users = users.len(),
@@ -1689,9 +1874,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = total_starred,
                                 skipped = total_skipped,
                                 saved = total_saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = all_errors.len(),
                                 "User sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     }
 
@@ -1780,11 +1967,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
 
                     // Wait for persistence to complete
-                    let saved = if let Some(handle) = persist_handle {
-                        handle.await.unwrap_or(0)
+                    let persist_result = if let Some(handle) = persist_handle {
+                        await_persist_task(handle).await
                     } else {
-                        0
+                        PersistTaskResult::default()
                     };
+                    let saved = persist_result.saved_count;
 
                     // Delete pruned repos from database (unless dry-run)
                     let deleted = if !options.dry_run && !result.pruned_repos.is_empty() {
@@ -1817,6 +2005,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         } else {
                             println!("  Saved to database:     {}", saved);
+                            if persist_result.has_errors() {
+                                println!(
+                                    "  Failed to save:        {}",
+                                    persist_result.failed_count()
+                                );
+                            }
                             if prune {
                                 println!("  Pruned (unstarred):    {}", result.pruned);
                                 if deleted > 0 {
@@ -1826,21 +2020,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         if !result.errors.is_empty() {
-                            println!("\nErrors:");
+                            println!("\nSync errors:");
                             for err in &result.errors {
                                 println!("  - {}", err);
                             }
                         }
+                        display_persist_errors(&persist_result, is_tty);
                     } else {
                         tracing::info!(
                             processed = result.processed,
                             matched = result.matched,
                             saved = saved,
+                            persist_errors = persist_result.failed_count(),
                             pruned = result.pruned,
                             deleted = deleted,
                             errors = result.errors.len(),
                             "Starred sync complete"
                         );
+                        display_persist_errors(&persist_result, is_tty);
                     }
 
                     // Final rate limit
@@ -1959,11 +2156,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await?;
 
                         // Wait for persistence to complete
-                        let saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let saved = persist_result.saved_count;
 
                         // Finish progress bars before printing summary
                         reporter.finish();
@@ -1994,17 +2192,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if !options.dry_run {
                                 println!("  Saved to database:     {}", saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "  Failed to save:        {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("  Would save:            {}", result.matched);
                             }
 
-                            // Report errors
+                            // Report sync errors
                             if !result.errors.is_empty() {
-                                println!("\nErrors:");
+                                println!("\nSync errors:");
                                 for err in &result.errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 group = %group,
@@ -2013,9 +2220,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = result.starred,
                                 skipped = result.skipped,
                                 saved = saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = result.errors.len(),
                                 "Sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     } else {
                         // Multiple groups - sync sequentially with streaming persistence
@@ -2093,11 +2302,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         drop(tx);
 
                         // Wait for persistence to complete
-                        let total_saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let total_saved = persist_result.saved_count;
 
                         // Finish progress bars before printing summary
                         reporter.finish();
@@ -2127,17 +2337,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if !options.dry_run {
                                 println!("Total saved to database:      {}", total_saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "Total failed to save:         {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("Total would save:             {}", total_matched);
                             }
 
-                            // Report all errors
+                            // Report sync errors
                             if !all_errors.is_empty() {
-                                println!("\nErrors ({}):", all_errors.len());
+                                println!("\nSync errors ({}):", all_errors.len());
                                 for err in &all_errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 groups = groups.len(),
@@ -2146,9 +2365,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = total_starred,
                                 skipped = total_skipped,
                                 saved = total_saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = all_errors.len(),
                                 "Sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     }
                 }
@@ -2239,11 +2460,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await?;
 
                         // Wait for persistence to complete
-                        let saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let saved = persist_result.saved_count;
 
                         // Finish progress bars before printing summary
                         reporter.finish();
@@ -2268,16 +2490,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if !options.dry_run {
                                 println!("  Saved to database:     {}", saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "  Failed to save:        {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("  Would save:            {}", result.matched);
                             }
 
+                            // Report sync errors
                             if !result.errors.is_empty() {
-                                println!("\nErrors:");
+                                println!("\nSync errors:");
                                 for err in &result.errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 user = %user,
@@ -2286,9 +2518,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = result.starred,
                                 skipped = result.skipped,
                                 saved = saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = result.errors.len(),
                                 "User sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     } else {
                         // Multiple users
@@ -2320,11 +2554,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await;
 
-                        let total_saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let total_saved = persist_result.saved_count;
 
                         reporter.finish();
 
@@ -2369,16 +2604,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if !options.dry_run {
                                 println!("Total saved to database:      {}", total_saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "Total failed to save:         {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("Total would save:             {}", total_matched);
                             }
 
+                            // Report sync errors
                             if !all_errors.is_empty() {
-                                println!("\nErrors ({}):", all_errors.len());
+                                println!("\nSync errors ({}):", all_errors.len());
                                 for err in &all_errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 users = users.len(),
@@ -2387,9 +2632,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = total_starred,
                                 skipped = total_skipped,
                                 saved = total_saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = all_errors.len(),
                                 "User sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     }
                 }
@@ -2467,11 +2714,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
 
                     // Wait for persistence to complete
-                    let saved = if let Some(handle) = persist_handle {
-                        handle.await.unwrap_or(0)
+                    let persist_result = if let Some(handle) = persist_handle {
+                        await_persist_task(handle).await
                     } else {
-                        0
+                        PersistTaskResult::default()
                     };
+                    let saved = persist_result.saved_count;
 
                     // Delete pruned repos from database (unless dry-run)
                     let deleted = if !options.dry_run && !result.pruned_repos.is_empty() {
@@ -2504,6 +2752,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         } else {
                             println!("  Saved to database:     {}", saved);
+                            if persist_result.has_errors() {
+                                println!(
+                                    "  Failed to save:        {}",
+                                    persist_result.failed_count()
+                                );
+                            }
                             if prune {
                                 println!("  Pruned (unstarred):    {}", result.pruned);
                                 if deleted > 0 {
@@ -2512,22 +2766,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
+                        // Report sync errors
                         if !result.errors.is_empty() {
-                            println!("\nErrors:");
+                            println!("\nSync errors:");
                             for err in &result.errors {
                                 println!("  - {}", err);
                             }
                         }
+
+                        // Report persist errors
+                        display_persist_errors(&persist_result, is_tty);
                     } else {
                         tracing::info!(
                             processed = result.processed,
                             matched = result.matched,
                             saved = saved,
+                            persist_errors = persist_result.failed_count(),
                             pruned = result.pruned,
                             deleted = deleted,
                             errors = result.errors.len(),
                             "Starred sync complete"
                         );
+                        display_persist_errors(&persist_result, is_tty);
                     }
                 }
                 GitlabAction::Limits { output } => {
@@ -2682,11 +2942,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await?;
 
-                        let saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let saved = persist_result.saved_count;
 
                         reporter.finish();
 
@@ -2710,16 +2971,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if !options.dry_run {
                                 println!("  Saved to database:     {}", saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "  Failed to save:        {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("  Would save:            {}", result.matched);
                             }
 
+                            // Report sync errors
                             if !result.errors.is_empty() {
-                                println!("\nErrors:");
+                                println!("\nSync errors:");
                                 for err in &result.errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 user = %user,
@@ -2728,9 +2999,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = result.starred,
                                 skipped = result.skipped,
                                 saved = saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = result.errors.len(),
                                 "User sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     } else {
                         // Multiple users
@@ -2762,11 +3035,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await;
 
-                        let total_saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let total_saved = persist_result.saved_count;
 
                         reporter.finish();
 
@@ -2811,16 +3085,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if !options.dry_run {
                                 println!("Total saved to database:      {}", total_saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "Total failed to save:         {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("Total would save:             {}", total_matched);
                             }
 
+                            // Report sync errors
                             if !all_errors.is_empty() {
-                                println!("\nErrors ({}):", all_errors.len());
+                                println!("\nSync errors ({}):", all_errors.len());
                                 for err in &all_errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 users = users.len(),
@@ -2829,9 +3113,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = total_starred,
                                 skipped = total_skipped,
                                 saved = total_saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = all_errors.len(),
                                 "User sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     }
                 }
@@ -2910,11 +3196,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
 
                     // Wait for persistence to complete
-                    let saved = if let Some(handle) = persist_handle {
-                        handle.await.unwrap_or(0)
+                    let persist_result = if let Some(handle) = persist_handle {
+                        await_persist_task(handle).await
                     } else {
-                        0
+                        PersistTaskResult::default()
                     };
+                    let saved = persist_result.saved_count;
 
                     // Delete pruned repos from database (unless dry-run)
                     let deleted = if !options.dry_run && !result.pruned_repos.is_empty() {
@@ -2947,6 +3234,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         } else {
                             println!("  Saved to database:     {}", saved);
+                            if persist_result.has_errors() {
+                                println!(
+                                    "  Failed to save:        {}",
+                                    persist_result.failed_count()
+                                );
+                            }
                             if prune {
                                 println!("  Pruned (unstarred):    {}", result.pruned);
                                 if deleted > 0 {
@@ -2955,22 +3248,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
+                        // Report sync errors
                         if !result.errors.is_empty() {
-                            println!("\nErrors:");
+                            println!("\nSync errors:");
                             for err in &result.errors {
                                 println!("  - {}", err);
                             }
                         }
+
+                        // Report persist errors
+                        display_persist_errors(&persist_result, is_tty);
                     } else {
                         tracing::info!(
                             processed = result.processed,
                             matched = result.matched,
                             saved = saved,
+                            persist_errors = persist_result.failed_count(),
                             pruned = result.pruned,
                             deleted = deleted,
                             errors = result.errors.len(),
                             "Starred sync complete"
                         );
+                        display_persist_errors(&persist_result, is_tty);
                     }
                 }
                 CodebergAction::Limits { output } => {
@@ -3137,11 +3436,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await?;
 
-                        let saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let saved = persist_result.saved_count;
 
                         reporter.finish();
 
@@ -3163,13 +3463,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if !options.dry_run {
                                 println!("  Saved to database:     {}", saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "  Failed to save:        {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             }
+
+                            // Report sync errors
                             if !result.errors.is_empty() {
-                                println!("\nErrors ({}):", result.errors.len());
+                                println!("\nSync errors ({}):", result.errors.len());
                                 for err in &result.errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 user = %user,
@@ -3178,9 +3489,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = result.starred,
                                 skipped = result.skipped,
                                 saved = saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = result.errors.len(),
                                 "User sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     } else {
                         // Multiple users
@@ -3216,11 +3529,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await;
 
-                        let total_saved = if let Some(handle) = persist_handle {
-                            handle.await.unwrap_or(0)
+                        let persist_result = if let Some(handle) = persist_handle {
+                            await_persist_task(handle).await
                         } else {
-                            0
+                            PersistTaskResult::default()
                         };
+                        let total_saved = persist_result.saved_count;
 
                         reporter.finish();
 
@@ -3265,16 +3579,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if !options.dry_run {
                                 println!("Total saved to database:      {}", total_saved);
+                                if persist_result.has_errors() {
+                                    println!(
+                                        "Total failed to save:         {}",
+                                        persist_result.failed_count()
+                                    );
+                                }
                             } else {
                                 println!("Total would save:             {}", total_matched);
                             }
 
+                            // Report sync errors
                             if !all_errors.is_empty() {
-                                println!("\nErrors ({}):", all_errors.len());
+                                println!("\nSync errors ({}):", all_errors.len());
                                 for err in &all_errors {
                                     println!("  - {}", err);
                                 }
                             }
+
+                            // Report persist errors
+                            display_persist_errors(&persist_result, is_tty);
                         } else {
                             tracing::info!(
                                 users = users.len(),
@@ -3283,9 +3607,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 starred = total_starred,
                                 skipped = total_skipped,
                                 saved = total_saved,
+                                persist_errors = persist_result.failed_count(),
                                 errors = all_errors.len(),
                                 "User sync complete"
                             );
+                            display_persist_errors(&persist_result, is_tty);
                         }
                     }
                 }
@@ -3365,11 +3691,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
 
                     // Wait for persistence to complete
-                    let saved = if let Some(handle) = persist_handle {
-                        handle.await.unwrap_or(0)
+                    let persist_result = if let Some(handle) = persist_handle {
+                        await_persist_task(handle).await
                     } else {
-                        0
+                        PersistTaskResult::default()
                     };
+                    let saved = persist_result.saved_count;
 
                     // Delete pruned repos from database (unless dry-run)
                     // Note: Gitea platform type depends on the host
@@ -3400,6 +3727,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         } else {
                             println!("  Saved to database:     {}", saved);
+                            if persist_result.has_errors() {
+                                println!(
+                                    "  Failed to save:        {}",
+                                    persist_result.failed_count()
+                                );
+                            }
                             if prune {
                                 println!("  Pruned (unstarred):    {}", result.pruned);
                                 if deleted > 0 {
@@ -3408,22 +3741,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
+                        // Report sync errors
                         if !result.errors.is_empty() {
-                            println!("\nErrors:");
+                            println!("\nSync errors:");
                             for err in &result.errors {
                                 println!("  - {}", err);
                             }
                         }
+
+                        // Report persist errors
+                        display_persist_errors(&persist_result, is_tty);
                     } else {
                         tracing::info!(
                             processed = result.processed,
                             matched = result.matched,
                             saved = saved,
+                            persist_errors = persist_result.failed_count(),
                             pruned = result.pruned,
                             deleted = deleted,
                             errors = result.errors.len(),
                             "Starred sync complete"
                         );
+                        display_persist_errors(&persist_result, is_tty);
                     }
                 }
                 GiteaAction::Limits { output } => {

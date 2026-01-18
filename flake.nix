@@ -176,6 +176,7 @@
                 pkg-config
                 rustToolchain
               ]
+              ++ [ self.packages.${pkgs.system}.default ]
               ++ mkBuildInputs pkgs;
 
             env = [
