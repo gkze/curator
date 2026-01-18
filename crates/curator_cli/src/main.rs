@@ -450,6 +450,11 @@ struct StarredSyncOptions {
 #[cfg(feature = "github")]
 #[derive(Subcommand)]
 enum GithubAction {
+    /// Authenticate with GitHub using OAuth Device Flow
+    ///
+    /// Opens your browser to authorize Curator with GitHub.
+    /// The token is saved to your config file for future use.
+    Login,
     /// Sync repositories from a GitHub organization
     Org {
         /// Organization name(s) - can specify multiple
@@ -1077,14 +1082,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(feature = "github")]
         Commands::Github { action } => {
-            let github_token = config.github_token().expect(
-                "CURATOR_GITHUB_TOKEN must be set in environment, .env file, or config file",
-            );
-
-            let client = GitHubClient::new(&github_token)?;
-
             match action {
+                GithubAction::Login => {
+                    use curator::github::oauth::{poll_for_token, request_device_code_default};
+
+                    let is_tty = Term::stdout().is_term();
+
+                    if is_tty {
+                        println!("Authenticating with GitHub...\n");
+                    }
+
+                    // Request device code
+                    let device_code = request_device_code_default().await.map_err(|e| {
+                        Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error>
+                    })?;
+
+                    // Try to copy code to clipboard
+                    let clipboard_success = match arboard::Clipboard::new() {
+                        Ok(mut clipboard) => clipboard.set_text(&device_code.user_code).is_ok(),
+                        Err(_) => false,
+                    };
+
+                    // Display instructions
+                    if is_tty {
+                        println!("Please visit: {}", device_code.verification_uri);
+                        println!();
+                        if clipboard_success {
+                            println!("Your code: {} (copied to clipboard)", device_code.user_code);
+                        } else {
+                            println!("Your code: {}", device_code.user_code);
+                        }
+                        println!();
+                        println!(
+                            "Waiting for authorization (expires in {} seconds)...",
+                            device_code.expires_in
+                        );
+                    } else {
+                        tracing::info!(
+                            verification_uri = %device_code.verification_uri,
+                            user_code = %device_code.user_code,
+                            "Please authorize the application"
+                        );
+                    }
+
+                    // Try to open browser
+                    let _ = open::that(&device_code.verification_uri);
+
+                    // Poll for token
+                    let token_response = poll_for_token(&device_code).await.map_err(|e| {
+                        Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error>
+                    })?;
+
+                    // Save token to config
+                    let config_path =
+                        config::Config::save_github_token(&token_response.access_token)?;
+
+                    if is_tty {
+                        println!();
+                        println!("Success! GitHub token saved to: {}", config_path.display());
+                        println!();
+                        println!("You can now use curator commands like:");
+                        println!("  curator github stars");
+                        println!("  curator github org <org-name>");
+                    } else {
+                        tracing::info!(
+                            config_path = %config_path.display(),
+                            "GitHub authentication successful"
+                        );
+                    }
+                }
                 GithubAction::Org { orgs, sync_opts } => {
+                    let github_token = config.github_token().expect(
+                        "No GitHub token configured. Run 'curator github login' to authenticate, or set CURATOR_GITHUB_TOKEN.",
+                    );
+                    let client = GitHubClient::new(&github_token)?;
                     // Merge CLI args with config defaults
                     let active_within_days = sync_opts
                         .active_within_days
@@ -1358,6 +1429,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 GithubAction::User { users, sync_opts } => {
+                    let github_token = config.github_token().expect(
+                        "No GitHub token configured. Run 'curator github login' to authenticate, or set CURATOR_GITHUB_TOKEN.",
+                    );
+                    let client = GitHubClient::new(&github_token)?;
+
                     // Merge CLI args with config defaults
                     let active_within_days = sync_opts
                         .active_within_days
@@ -1614,6 +1690,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 GithubAction::Stars { sync_opts } => {
+                    let github_token = config.github_token().expect(
+                        "No GitHub token configured. Run 'curator github login' to authenticate, or set CURATOR_GITHUB_TOKEN.",
+                    );
+                    let client = GitHubClient::new(&github_token)?;
+
                     // Merge CLI args with config defaults
                     let active_within_days = sync_opts
                         .active_within_days
@@ -1757,6 +1838,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 GithubAction::Limits { output } => {
+                    let github_token = config.github_token().expect(
+                        "No GitHub token configured. Run 'curator github login' to authenticate, or set CURATOR_GITHUB_TOKEN.",
+                    );
+                    let client = GitHubClient::new(&github_token)?;
+
                     let rate_limits = curator::github::get_rate_limits(client.inner()).await?;
                     let items = github_rate_limits_to_display(&rate_limits.resources);
                     RateLimitDisplay::print_many(items, output);

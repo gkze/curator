@@ -27,6 +27,7 @@
 mod client;
 mod convert;
 mod error;
+pub mod oauth;
 mod repo;
 mod types;
 
