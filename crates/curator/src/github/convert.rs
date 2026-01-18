@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
-use crate::platform::PlatformRepo;
+use crate::platform::{PlatformRepo, strip_null_values};
 
 /// Determine visibility from a GitHub repository.
 ///
@@ -46,7 +46,7 @@ pub fn to_code_repository(repo: &GitHubRepo) -> CodeRepositoryActiveModel {
 
     let license_spdx = repo.license.as_ref().map(|l| l.spdx_id.clone());
 
-    let platform_metadata = serde_json::json!({
+    let platform_metadata = strip_null_values(serde_json::json!({
         "node_id": repo.node_id,
         "private": repo.private,
         "allow_squash_merge": repo.allow_squash_merge,
@@ -54,7 +54,7 @@ pub fn to_code_repository(repo: &GitHubRepo) -> CodeRepositoryActiveModel {
         "allow_rebase_merge": repo.allow_rebase_merge,
         "allow_auto_merge": repo.allow_auto_merge,
         "delete_branch_on_merge": repo.delete_branch_on_merge,
-    });
+    }));
 
     CodeRepositoryActiveModel {
         id: Set(Uuid::new_v4()),
@@ -109,7 +109,7 @@ pub fn to_platform_repo(repo: &GitHubRepo) -> PlatformRepo {
 
     let license_spdx = repo.license.as_ref().map(|l| l.spdx_id.clone());
 
-    let platform_metadata = serde_json::json!({
+    let platform_metadata = strip_null_values(serde_json::json!({
         "node_id": repo.node_id,
         "private": repo.private,
         "allow_squash_merge": repo.allow_squash_merge,
@@ -117,7 +117,7 @@ pub fn to_platform_repo(repo: &GitHubRepo) -> PlatformRepo {
         "allow_rebase_merge": repo.allow_rebase_merge,
         "allow_auto_merge": repo.allow_auto_merge,
         "delete_branch_on_merge": repo.delete_branch_on_merge,
-    });
+    }));
 
     PlatformRepo {
         platform_id: repo.id.0 as i64,

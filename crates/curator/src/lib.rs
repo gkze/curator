@@ -50,6 +50,6 @@ pub use db::connect_and_migrate;
 pub use entity::prelude::*;
 pub use platform::{
     ApiRateLimiter, PlatformClient, PlatformError, PlatformRepo,
-    RateLimitInfo as PlatformRateLimitInfo, RateLimitedClient, rate_limits,
+    RateLimitInfo as PlatformRateLimitInfo, RateLimitedClient, rate_limits, strip_null_values,
 };
 pub use repository::RepositoryError;
