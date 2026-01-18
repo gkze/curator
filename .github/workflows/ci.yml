@@ -92,7 +92,7 @@ jobs:
             echo "No crate changes detected"
           fi
       - name: Test with features (affected only for PRs)
-        run: |
+        run: |-
           FEATURES="${{ matrix.features }}"
           CHANGED="${{ steps.changes.outputs.crates }}"
 
