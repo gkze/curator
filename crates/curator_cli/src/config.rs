@@ -212,13 +212,14 @@ impl Config {
 
     /// Get the database URL, falling back to the default state directory path.
     ///
-    /// If no database URL is configured, defaults to `sqlite://~/.local/state/curator/curator.db`
+    /// If no database URL is configured, defaults to `sqlite://~/.local/state/curator/curator.db?mode=rwc`
     /// on Linux (using XDG state directory) or the platform-appropriate equivalent.
+    /// The `mode=rwc` parameter enables read-write access and creates the file if it doesn't exist.
     pub fn database_url(&self) -> Option<String> {
         self.database.url.clone().or_else(|| {
             Self::default_state_dir().map(|state_dir| {
                 let db_path = state_dir.join("curator.db");
-                format!("sqlite://{}", db_path.display())
+                format!("sqlite://{}?mode=rwc", db_path.display())
             })
         })
     }
@@ -536,6 +537,7 @@ mod tests {
         let url = db_url.unwrap();
         assert!(url.starts_with("sqlite://"));
         assert!(url.contains("curator.db"));
+        assert!(url.ends_with("?mode=rwc"));
     }
 
     #[test]
