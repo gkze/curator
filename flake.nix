@@ -112,6 +112,10 @@
                   --bash <($out/bin/curator completions bash) \
                   --zsh <($out/bin/curator completions zsh) \
                   --fish <($out/bin/curator completions fish)
+
+                # Generate and install man page
+                $out/bin/curator man > curator.1
+                installManPage curator.1
               '';
               meta.mainProgram = "curator";
             }
