@@ -53,6 +53,8 @@ jobs:
         run: nix build
 
   # Test feature combinations (uses devShell for flexibility)
+  # Uses cargo-nextest for faster parallel test execution
+  # On PRs, only runs tests for changed crates and their dependents
   test-features:
     name: Test Features (${{ matrix.features || 'no features' }})
     needs: checks
@@ -71,11 +73,40 @@ jobs:
           - "postgres,github,gitlab,gitea"
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: DeterminateSystems/nix-installer-action@v21
       - uses: cachix/cachix-action@v16
         with:
           name: ${{ vars.CACHIX_CACHE_NAME }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - name: Test with features
-        run: nix develop --command cargo test -p curator --no-default-features --features
-          "${{ matrix.features }}"
+      - name: Detect changed crates
+        id: changes
+        if: github.event_name == 'pull_request'
+        run: |
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E "^crates/" | cut -d'/' -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+          echo "crates=$CHANGED" >> $GITHUB_OUTPUT
+          if [ -n "$CHANGED" ]; then
+            echo "Detected changes in crates: $CHANGED"
+          else
+            echo "No crate changes detected"
+          fi
+      - name: Test with features (affected only for PRs)
+        run: |-
+          FEATURES="${{ matrix.features }}"
+          CHANGED="${{ steps.changes.outputs.crates }}"
+
+          # Build nextest filter for affected crates
+          if [ -n "$CHANGED" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Convert comma-separated crates to nextest filter expression
+            # e.g., "curator,curator_cli" -> "rdeps(curator) | rdeps(curator_cli)"
+            FILTER=$(echo "$CHANGED" | tr ',' '\n' | sed 's/.*/rdeps(&)/' | tr '\n' '|' | sed 's/|$//')
+            echo "Running affected tests with filter: $FILTER"
+            nix develop --command cargo nextest run -p curator --no-default-features \
+              --features "$FEATURES" -E "$FILTER"
+          else
+            # On push to main or no crate changes, run full test suite
+            echo "Running full test suite"
+            nix develop --command cargo nextest run -p curator --no-default-features \
+              --features "$FEATURES"
+          fi
