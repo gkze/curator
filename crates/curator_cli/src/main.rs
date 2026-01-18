@@ -1049,7 +1049,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure the database directory exists for SQLite
     if database_url.starts_with("sqlite://") {
         let db_path = database_url.trim_start_matches("sqlite://");
-        if let Some(parent) = std::path::Path::new(db_path).parent() {
+        // Strip query parameters (e.g., ?mode=rwc) before path operations
+        let db_path = db_path.split('?').next().unwrap_or(db_path);
+        let db_path = std::path::Path::new(db_path);
+
+        // Warn if using a relative path (can cause issues depending on cwd)
+        if db_path.is_relative() && !db_path.as_os_str().is_empty() {
+            tracing::warn!(
+                "Database path '{}' is relative - behavior depends on current directory. \
+                 Consider using an absolute path.",
+                db_path.display()
+            );
+        }
+
+        if let Some(parent) = db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
             std::fs::create_dir_all(parent)?;
         }
     }

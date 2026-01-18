@@ -245,9 +245,10 @@ pub async fn bulk_upsert(db: &DatabaseConnection, models: Vec<ActiveModel>) -> R
         return Ok(0);
     }
 
-    let on_conflict = OnConflict::columns([Column::Platform, Column::Owner, Column::Name])
+    let on_conflict = OnConflict::columns([Column::Platform, Column::PlatformId])
         .update_columns([
-            Column::PlatformId,
+            Column::Owner,
+            Column::Name,
             Column::Description,
             Column::DefaultBranch,
             Column::Topics,

@@ -5,7 +5,8 @@
 
 #![cfg(all(feature = "sqlite", feature = "migrate"))]
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use chrono::Utc;
 use curator::connect_and_migrate;
@@ -16,8 +17,15 @@ use curator::repository::{self, find_all_by_platform_and_owner};
 use sea_orm::{DatabaseConnection, Set};
 use uuid::Uuid;
 
-/// Atomic counter for generating unique platform IDs in tests.
-static PLATFORM_ID_COUNTER: AtomicI64 = AtomicI64::new(1);
+/// Generate a deterministic platform_id from owner/name.
+/// This ensures the same repo always gets the same platform_id,
+/// which is required since bulk_upsert uses (platform, platform_id) as conflict key.
+fn platform_id_from_name(owner: &str, name: &str) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    owner.hash(&mut hasher);
+    name.hash(&mut hasher);
+    hasher.finish() as i64
+}
 
 /// Create an in-memory SQLite database with migrations applied.
 async fn setup_test_db() -> DatabaseConnection {
@@ -31,7 +39,7 @@ fn create_test_model(owner: &str, name: &str, updated_at: chrono::DateTime<Utc>)
     ActiveModel {
         id: Set(Uuid::new_v4()),
         platform: Set(CodePlatform::GitHub),
-        platform_id: Set(PLATFORM_ID_COUNTER.fetch_add(1, Ordering::Relaxed)),
+        platform_id: Set(platform_id_from_name(owner, name)),
         owner: Set(owner.to_string()),
         name: Set(name.to_string()),
         description: Set(Some(format!("Test repo {}/{}", owner, name))),
