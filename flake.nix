@@ -165,6 +165,7 @@
                 act
                 cargo-hack
                 cargo-llvm-cov
+                cargo-nextest
                 cargo-release
                 litecli
                 nixd
@@ -247,12 +248,18 @@
               }
             );
 
-          curator-test =
+          curator-nextest =
             pkgs:
             let
               c = mkCraneLib pkgs;
             in
-            c.craneLib.cargoTest (c.commonArgs // { inherit (c) cargoArtifacts; });
+            c.craneLib.cargoNextest (
+              c.commonArgs
+              // {
+                inherit (c) cargoArtifacts;
+                nativeBuildInputs = c.commonArgs.nativeBuildInputs ++ [ pkgs.cargo-nextest ];
+              }
+            );
         };
       }
     );
