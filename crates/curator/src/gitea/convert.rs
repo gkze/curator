@@ -8,7 +8,7 @@ use super::types::GiteaRepo;
 use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
-use crate::platform::PlatformRepo;
+use crate::platform::{PlatformRepo, strip_null_values};
 
 /// Determine visibility from a Gitea repository.
 ///
@@ -45,7 +45,7 @@ pub fn to_platform_repo(repo: &GiteaRepo) -> PlatformRepo {
         license: None, // Gitea doesn't include license in repo list response
         homepage: repo.website.clone(),
         size_kb: Some(repo.size),
-        metadata: serde_json::json!({
+        metadata: strip_null_values(serde_json::json!({
             "mirror": repo.mirror,
             "empty": repo.empty,
             "template": repo.template,
@@ -57,7 +57,7 @@ pub fn to_platform_repo(repo: &GiteaRepo) -> PlatformRepo {
             "has_issues": repo.has_issues,
             "has_wiki": repo.has_wiki,
             "has_pull_requests": repo.has_pull_requests,
-        }),
+        })),
     }
 }
 
@@ -79,8 +79,8 @@ pub fn to_code_repository_with_platform(
     // Serialize topics to JSON
     let topics_json = serde_json::json!(repo.topics);
 
-    // Build platform-specific metadata
-    let metadata = serde_json::json!({
+    // Build platform-specific metadata (strip nulls to reduce storage)
+    let metadata = strip_null_values(serde_json::json!({
         "mirror": repo.mirror,
         "empty": repo.empty,
         "template": repo.template,
@@ -92,7 +92,7 @@ pub fn to_code_repository_with_platform(
         "has_issues": repo.has_issues,
         "has_wiki": repo.has_wiki,
         "has_pull_requests": repo.has_pull_requests,
-    });
+    }));
 
     CodeRepositoryActiveModel {
         id: Set(Uuid::new_v4()),

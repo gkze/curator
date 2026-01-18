@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
-use crate::platform::PlatformRepo;
+use crate::platform::{PlatformRepo, strip_null_values};
 
 use super::types::GitLabProject;
 
@@ -44,8 +44,8 @@ pub fn to_code_repository(project: &GitLabProject) -> CodeRepositoryActiveModel 
     // License is also not included in the list projects response
     let license_spdx: Option<String> = None;
 
-    // Build platform-specific metadata
-    let platform_metadata = serde_json::json!({
+    // Build platform-specific metadata (strip nulls to reduce storage)
+    let platform_metadata = strip_null_values(serde_json::json!({
         "web_url": project.web_url,
         "ssh_url_to_repo": project.ssh_url_to_repo,
         "http_url_to_repo": project.http_url_to_repo,
@@ -54,7 +54,7 @@ pub fn to_code_repository(project: &GitLabProject) -> CodeRepositoryActiveModel 
         "namespace_path": project.namespace.path,
         "mirror": project.mirror,
         "path": project.path,
-    });
+    }));
 
     CodeRepositoryActiveModel {
         id: Set(Uuid::new_v4()),
@@ -103,8 +103,8 @@ pub fn to_platform_repo(project: &GitLabProject) -> PlatformRepo {
         .map(|(ns, _)| ns.to_string())
         .unwrap_or_else(|| project.namespace.full_path.clone());
 
-    // Build platform-specific metadata
-    let platform_metadata = serde_json::json!({
+    // Build platform-specific metadata (strip nulls to reduce storage)
+    let platform_metadata = strip_null_values(serde_json::json!({
         "web_url": project.web_url,
         "ssh_url_to_repo": project.ssh_url_to_repo,
         "http_url_to_repo": project.http_url_to_repo,
@@ -113,7 +113,7 @@ pub fn to_platform_repo(project: &GitLabProject) -> PlatformRepo {
         "namespace_path": project.namespace.path,
         "mirror": project.mirror,
         "path": project.path,
-    });
+    }));
 
     PlatformRepo {
         platform_id: project.id as i64,

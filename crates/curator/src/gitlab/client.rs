@@ -1,5 +1,6 @@
 //! GitLab API client creation and management.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,6 +35,13 @@ use crate::sync::SyncProgress;
 pub struct GitLabClient {
     inner: Arc<Mutex<AsyncGitlab>>,
     host: String,
+    starred_projects_cache: Arc<Mutex<Option<StarredProjectsCache>>>,
+}
+
+#[derive(Debug, Clone)]
+struct StarredProjectsCache {
+    user_id: u64,
+    paths: HashSet<String>,
 }
 
 impl GitLabClient {
@@ -68,12 +76,40 @@ impl GitLabClient {
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             host: normalized_host,
+            starred_projects_cache: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Get the host URL.
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    fn build_starred_paths(projects: &[GitLabProject]) -> HashSet<String> {
+        projects
+            .iter()
+            .map(|project| project.path_with_namespace.clone())
+            .collect()
+    }
+
+    async fn cached_starred_status(&self, user_id: u64, full_path: &str) -> Option<bool> {
+        let cache = self.starred_projects_cache.lock().await;
+        let cached = cache.as_ref()?;
+        if cached.user_id != user_id {
+            return None;
+        }
+        Some(cached.paths.contains(full_path))
+    }
+
+    async fn update_starred_cache(&self, user_id: u64, projects: &[GitLabProject]) {
+        let paths = Self::build_starred_paths(projects);
+        let mut cache = self.starred_projects_cache.lock().await;
+        *cache = Some(StarredProjectsCache { user_id, paths });
+    }
+
+    async fn clear_starred_cache(&self) {
+        let mut cache = self.starred_projects_cache.lock().await;
+        *cache = None;
     }
 
     /// Get rate limit information.
@@ -336,38 +372,26 @@ impl PlatformClient for GitLabClient {
     }
 
     async fn is_repo_starred(&self, owner: &str, name: &str) -> platform::Result<bool> {
-        // GitLab doesn't have a direct "is starred" endpoint.
-        // We check by attempting to star - if it returns 304 Not Modified,
-        // the project is already starred. If it succeeds, we immediately unstar
-        // to restore the original state.
+        // GitLab doesn't provide a direct "is starred" endpoint. We fetch the
+        // authenticated user's starred projects and cache the list.
         let full_path = format!("{}/{}", owner, name);
+        let user = self.get_user_info().await?;
 
-        // Look up project to get ID
-        let endpoint = gitlab::api::projects::Project::builder()
-            .project(&full_path)
-            .build()
-            .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-        let client = self.inner.lock().await;
-        let project: GitLabProject = endpoint
-            .query_async(&*client)
-            .await
-            .map_err(|e| PlatformError::api(e.to_string()))?;
-        drop(client); // Release lock
-
-        // Try to star - 304 means already starred
-        match self.star_project(project.id).await {
-            Ok(true) => {
-                // Was not starred, we just starred it - unstar to restore state
-                let _ = self.unstar_project(project.id).await;
-                Ok(false)
-            }
-            Ok(false) => {
-                // 304 Not Modified - already starred
-                Ok(true)
-            }
-            Err(e) => Err(PlatformError::api(e.to_string())),
+        if let Some(cached) = self.cached_starred_status(user.id, &full_path).await {
+            return Ok(cached);
         }
+
+        let projects = self.list_starred_projects(user.id).await?;
+        let paths = Self::build_starred_paths(&projects);
+        let is_starred = paths.contains(&full_path);
+
+        let mut cache = self.starred_projects_cache.lock().await;
+        *cache = Some(StarredProjectsCache {
+            user_id: user.id,
+            paths,
+        });
+
+        Ok(is_starred)
     }
 
     async fn star_repo(&self, owner: &str, name: &str) -> platform::Result<bool> {
@@ -388,9 +412,12 @@ impl PlatformClient for GitLabClient {
             .map_err(|e| PlatformError::api(e.to_string()))?;
         drop(client); // Release lock before starring
 
-        self.star_project(project.id)
+        let result = self
+            .star_project(project.id)
             .await
-            .map_err(PlatformError::from)
+            .map_err(PlatformError::from)?;
+        self.clear_starred_cache().await;
+        Ok(result)
     }
 
     async fn star_repo_with_retry(
@@ -448,7 +475,9 @@ impl PlatformClient for GitLabClient {
             .when(is_rate_limit_error)
             .await;
 
-        result.map_err(PlatformError::from)
+        let result = result.map_err(PlatformError::from)?;
+        self.clear_starred_cache().await;
+        Ok(result)
     }
 
     async fn unstar_repo(&self, owner: &str, name: &str) -> platform::Result<bool> {
@@ -468,9 +497,12 @@ impl PlatformClient for GitLabClient {
             .map_err(|e| PlatformError::api(e.to_string()))?;
         drop(client); // Release lock before unstarring
 
-        self.unstar_project(project.id)
+        let result = self
+            .unstar_project(project.id)
             .await
-            .map_err(PlatformError::from)
+            .map_err(PlatformError::from)?;
+        self.clear_starred_cache().await;
+        Ok(result)
     }
 
     async fn list_starred_repos(
@@ -501,6 +533,8 @@ impl PlatformClient for GitLabClient {
                 total: projects.len(),
             });
         }
+
+        self.update_starred_cache(user.id, &projects).await;
 
         // Convert to PlatformRepo
         let repos: Vec<PlatformRepo> = projects.iter().map(to_platform_repo).collect();
@@ -533,6 +567,8 @@ impl PlatformClient for GitLabClient {
 
         // Fetch starred projects (uses library pagination internally)
         let projects = self.list_starred_projects(user.id).await?;
+
+        self.update_starred_cache(user.id, &projects).await;
 
         // Stream repos as we convert them
         let mut sent = 0usize;

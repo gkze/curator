@@ -35,6 +35,39 @@ use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
 use crate::sync::SyncProgress;
 
+/// Strip null values from a JSON object to reduce storage size.
+///
+/// This recursively removes null values from objects, which can significantly
+/// reduce database storage for platform_metadata fields where most values are null.
+///
+/// # Example
+///
+/// ```ignore
+/// let json = serde_json::json!({
+///     "node_id": "abc123",
+///     "private": false,
+///     "allow_squash_merge": null,
+/// });
+/// let stripped = strip_null_values(json);
+/// // Result: {"node_id": "abc123", "private": false}
+/// ```
+pub fn strip_null_values(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let filtered: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, strip_null_values(v)))
+                .collect();
+            serde_json::Value::Object(filtered)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(strip_null_values).collect())
+        }
+        other => other,
+    }
+}
+
 /// Type alias for the governor rate limiter.
 type GovernorRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
