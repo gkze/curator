@@ -8,32 +8,14 @@ on:
     branches: [main]
 
 jobs:
-  # Fast formatting check - runs first
-  format:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@v21
-      - uses: cachix/cachix-action@v16
-        with:
-          name: ${{ vars.CACHIX_CACHE_NAME }}
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - name: Check formatting (treefmt)
-        run: nix fmt -- --fail-on-change
-
   # Run all Crane-based checks
   checks:
     name: Nix Checks
-    needs: format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@v21
-      - uses: cachix/cachix-action@v16
-        with:
-          name: ${{ vars.CACHIX_CACHE_NAME }}
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
       - name: Run all checks (build, clippy, fmt, test, audit)
         run: nix flake check
 
@@ -45,10 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@v21
-      - uses: cachix/cachix-action@v16
-        with:
-          name: ${{ vars.CACHIX_CACHE_NAME }}
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
       - name: Build Nix package
         run: nix build
 
@@ -76,10 +55,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: DeterminateSystems/nix-installer-action@v21
-      - uses: cachix/cachix-action@v16
-        with:
-          name: ${{ vars.CACHIX_CACHE_NAME }}
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
       - name: Detect changed crates
         id: changes
         if: github.event_name == 'pull_request'

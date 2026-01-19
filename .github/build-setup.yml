@@ -5,11 +5,8 @@
 - name: Install Nix
   uses: DeterminateSystems/nix-installer-action@v21
 
-- name: Setup Cachix
-  uses: cachix/cachix-action@v16
-  with:
-    name: ${{ vars.CACHIX_CACHE_NAME }}
-    authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+- name: Setup Magic Nix Cache
+  uses: DeterminateSystems/magic-nix-cache-action@v13
 
 - name: Setup Nix build environment
   run: |-
