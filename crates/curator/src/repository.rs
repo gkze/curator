@@ -3,598 +3,37 @@
 //! This module provides functions for creating, reading, updating, and deleting
 //! repository records, including bulk operations for efficient syncing.
 
-use chrono::{DateTime, Utc};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, Set,
-    sea_query::{Alias, Expr, OnConflict},
+mod bulk;
+mod errors;
+mod query;
+mod single;
+
+pub use bulk::{
+    DEFAULT_BULK_UPSERT_BACKOFF_MS, DEFAULT_BULK_UPSERT_RETRIES, bulk_upsert,
+    bulk_upsert_with_retry, delete_by_owner_name, delete_by_platform, delete_many, insert_many,
+    upsert_many,
 };
-use thiserror::Error;
-use uuid::Uuid;
-
-use crate::entity::code_platform::CodePlatform;
-use crate::entity::code_repository::{ActiveModel, Column, Entity as CodeRepository, Model};
-
-/// Errors that can occur during repository operations.
-#[derive(Debug, Error)]
-pub enum RepositoryError {
-    /// Database error from sea-orm.
-    #[error("Database error: {0}")]
-    Database(#[from] DbErr),
-
-    /// Repository not found.
-    #[error("Repository not found: {context}")]
-    NotFound { context: String },
-
-    /// Duplicate repository (natural key conflict).
-    #[error("Repository already exists: {platform}/{owner}/{name}")]
-    Duplicate {
-        platform: CodePlatform,
-        owner: String,
-        name: String,
-    },
-
-    /// Invalid input data.
-    #[error("Invalid input: {message}")]
-    InvalidInput { message: String },
-
-    /// Bulk operation partially failed.
-    #[error("Bulk operation failed: {succeeded} succeeded, {failed} failed")]
-    PartialFailure { succeeded: usize, failed: usize },
-}
-
-impl RepositoryError {
-    /// Create a NotFound error for a UUID lookup.
-    pub fn not_found_by_id(id: Uuid) -> Self {
-        Self::NotFound {
-            context: format!("id={}", id),
-        }
-    }
-
-    /// Create a NotFound error for a natural key lookup.
-    pub fn not_found_by_key(platform: CodePlatform, owner: &str, name: &str) -> Self {
-        Self::NotFound {
-            context: format!("{:?}/{}/{}", platform, owner, name),
-        }
-    }
-
-    /// Create a NotFound error for a platform_id lookup.
-    pub fn not_found_by_platform_id(platform: CodePlatform, platform_id: i64) -> Self {
-        Self::NotFound {
-            context: format!("{:?} platform_id={}", platform, platform_id),
-        }
-    }
-}
-
-/// Result type alias for repository operations.
-pub type Result<T> = std::result::Result<T, RepositoryError>;
-
-/// Pagination parameters for list queries.
-#[derive(Debug, Clone, Default)]
-pub struct Pagination {
-    /// Page number (0-indexed).
-    pub page: u64,
-    /// Items per page.
-    pub per_page: u64,
-}
-
-impl Pagination {
-    /// Create a new pagination with the given page and per_page values.
-    pub fn new(page: u64, per_page: u64) -> Self {
-        Self { page, per_page }
-    }
-}
-
-/// Result of a paginated query.
-#[derive(Debug, Clone)]
-pub struct PaginatedResult<T> {
-    /// The items for the current page.
-    pub items: Vec<T>,
-    /// Total number of items across all pages.
-    pub total: u64,
-    /// Current page number (0-indexed).
-    pub page: u64,
-    /// Items per page.
-    pub per_page: u64,
-    /// Total number of pages.
-    pub total_pages: u64,
-}
-
-// ─── Single Record Operations ────────────────────────────────────────────────
-
-/// Insert a new repository.
-///
-/// # Errors
-/// Returns `RepositoryError::Database` if the insert fails (e.g., duplicate natural key).
-pub async fn insert(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
-    model.insert(db).await.map_err(RepositoryError::from)
-}
-
-/// Find a repository by its UUID.
-pub async fn find_by_id(db: &DatabaseConnection, id: Uuid) -> Result<Option<Model>> {
-    CodeRepository::find_by_id(id)
-        .one(db)
-        .await
-        .map_err(RepositoryError::from)
-}
-
-/// Find a repository by its natural key (platform + owner + name).
-pub async fn find_by_natural_key(
-    db: &DatabaseConnection,
-    platform: CodePlatform,
-    owner: &str,
-    name: &str,
-) -> Result<Option<Model>> {
-    CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
-        .filter(Column::Owner.eq(owner))
-        .filter(Column::Name.eq(name))
-        .one(db)
-        .await
-        .map_err(RepositoryError::from)
-}
-
-/// Find a repository by platform and platform_id (numeric ID from the platform).
-pub async fn find_by_platform_id(
-    db: &DatabaseConnection,
-    platform: CodePlatform,
-    platform_id: i64,
-) -> Result<Option<Model>> {
-    CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
-        .filter(Column::PlatformId.eq(platform_id))
-        .one(db)
-        .await
-        .map_err(RepositoryError::from)
-}
-
-/// Update an existing repository.
-///
-/// # Errors
-/// Returns `RepositoryError::Database` if the update fails.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
-    model.update(db).await.map_err(RepositoryError::from)
-}
-
-/// Insert or update a repository by its natural key (platform + owner + name).
-///
-/// If a repository with the same platform, owner, and name exists, it will be updated.
-/// Otherwise, a new repository will be inserted.
-pub async fn upsert(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
-    // Extract natural key from the active model
-    let platform = model.platform.clone().unwrap();
-    let owner = model.owner.clone().unwrap();
-    let name = model.name.clone().unwrap();
-
-    // Check if exists
-    let existing = find_by_natural_key(db, platform, &owner, &name).await?;
-
-    match existing {
-        Some(existing) => {
-            // Update: set the ID from existing record
-            let mut update_model = model;
-            update_model.id = Set(existing.id);
-            update_model.update(db).await.map_err(RepositoryError::from)
-        }
-        None => {
-            // Insert: ensure ID is set
-            let mut insert_model = model;
-            if insert_model.id.is_not_set() {
-                insert_model.id = Set(Uuid::new_v4());
-            }
-            insert_model.insert(db).await.map_err(RepositoryError::from)
-        }
-    }
-}
-
-/// Delete a repository by its UUID.
-///
-/// Returns the number of rows deleted (0 or 1).
-pub async fn delete(db: &DatabaseConnection, id: Uuid) -> Result<u64> {
-    let result = CodeRepository::delete_by_id(id).exec(db).await?;
-    Ok(result.rows_affected)
-}
-
-// ─── Bulk Operations ─────────────────────────────────────────────────────────
-
-/// Insert multiple repositories in a single transaction.
-///
-/// # Errors
-/// Returns `RepositoryError::Database` if any insert fails. The entire operation is atomic.
-pub async fn insert_many(db: &DatabaseConnection, models: Vec<ActiveModel>) -> Result<u64> {
-    if models.is_empty() {
-        return Ok(0);
-    }
-
-    let count = models.len() as u64;
-    CodeRepository::insert_many(models).exec(db).await?;
-    Ok(count)
-}
-
-/// Upsert multiple repositories by their natural keys.
-///
-/// For each repository, if one with the same platform and platform_id exists,
-/// it will be updated. Otherwise, a new one will be inserted.
-///
-/// Note: This performs individual upserts in sequence. For very large batches,
-/// use `bulk_upsert` instead for better performance.
-pub async fn upsert_many(db: &DatabaseConnection, models: Vec<ActiveModel>) -> Result<u64> {
-    let mut count = 0u64;
-    for model in models {
-        upsert(db, model).await?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-/// Default number of retry attempts for bulk upsert operations.
-pub const DEFAULT_BULK_UPSERT_RETRIES: u32 = 3;
-
-/// Default initial backoff delay in milliseconds for bulk upsert retries.
-pub const DEFAULT_BULK_UPSERT_BACKOFF_MS: u64 = 100;
-
-/// Bulk upsert multiple repositories using SQL ON CONFLICT.
-///
-/// This is significantly faster than `upsert_many` for large batches because it:
-/// - Uses a single INSERT ... ON CONFLICT DO UPDATE statement
-/// - Reduces database round-trips from 2n to 1
-/// - Only updates rows where `updated_at` has changed (content-based deduplication)
-///
-/// The natural key for conflict detection is (platform, owner, name).
-/// The conditional update ensures we only modify rows when the platform's
-/// `updated_at` timestamp has changed, avoiding unnecessary writes.
-///
-/// # Returns
-/// Returns the number of rows actually inserted or updated.
-pub async fn bulk_upsert(db: &DatabaseConnection, models: Vec<ActiveModel>) -> Result<u64> {
-    bulk_upsert_inner(db, models).await
-}
-
-/// Bulk upsert with configurable retry logic.
-///
-/// Retries transient database errors (e.g., database locked, connection issues)
-/// with exponential backoff.
-///
-/// # Arguments
-/// * `db` - Database connection
-/// * `models` - Models to upsert
-/// * `max_retries` - Maximum number of retry attempts (0 = no retries)
-/// * `initial_backoff_ms` - Initial backoff delay in milliseconds (doubles each retry)
-///
-/// # Returns
-/// Returns the number of rows actually inserted or updated, or the last error if all retries fail.
-pub async fn bulk_upsert_with_retry(
-    db: &DatabaseConnection,
-    models: Vec<ActiveModel>,
-    max_retries: u32,
-    initial_backoff_ms: u64,
-) -> Result<u64> {
-    if models.is_empty() {
-        return Ok(0);
-    }
-
-    let mut last_error: Option<RepositoryError> = None;
-    let mut backoff_ms = initial_backoff_ms;
-
-    for attempt in 0..=max_retries {
-        match bulk_upsert_inner(db, models.clone()).await {
-            Ok(count) => return Ok(count),
-            Err(e) => {
-                // Check if the error is retryable
-                if is_retryable_error(&e) && attempt < max_retries {
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max_retries = max_retries,
-                        backoff_ms = backoff_ms,
-                        error = %e,
-                        "Bulk upsert failed, retrying..."
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-                    backoff_ms *= 2; // Exponential backoff
-                    last_error = Some(e);
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    // Should not reach here, but return last error if we do
-    Err(last_error.unwrap_or_else(|| RepositoryError::InvalidInput {
-        message: "Unexpected retry loop exit".to_string(),
-    }))
-}
-
-/// Check if a repository error is retryable (transient).
-fn is_retryable_error(err: &RepositoryError) -> bool {
-    match err {
-        RepositoryError::Database(db_err) => {
-            let err_str = db_err.to_string().to_lowercase();
-            // SQLite: database is locked, busy
-            // PostgreSQL: connection refused, too many connections
-            // General: timeout, connection reset
-            err_str.contains("locked")
-                || err_str.contains("busy")
-                || err_str.contains("timeout")
-                || err_str.contains("connection")
-                || err_str.contains("temporarily unavailable")
-        }
-        _ => false,
-    }
-}
-
-/// Internal bulk upsert implementation.
-async fn bulk_upsert_inner(db: &DatabaseConnection, models: Vec<ActiveModel>) -> Result<u64> {
-    if models.is_empty() {
-        return Ok(0);
-    }
-
-    let on_conflict = OnConflict::columns([Column::Platform, Column::PlatformId])
-        .update_columns([
-            Column::Owner,
-            Column::Name,
-            Column::Description,
-            Column::DefaultBranch,
-            Column::Topics,
-            Column::PrimaryLanguage,
-            Column::LicenseSpdx,
-            Column::Homepage,
-            Column::Visibility,
-            Column::IsFork,
-            Column::IsMirror,
-            Column::IsArchived,
-            Column::IsTemplate,
-            Column::IsEmpty,
-            Column::Stars,
-            Column::Forks,
-            Column::OpenIssues,
-            Column::Watchers,
-            Column::SizeKb,
-            Column::HasIssues,
-            Column::HasWiki,
-            Column::HasPullRequests,
-            Column::CreatedAt,
-            Column::UpdatedAt,
-            Column::PushedAt,
-            Column::PlatformMetadata,
-            Column::SyncedAt,
-        ])
-        // Only update if updated_at has changed (content-based deduplication).
-        // This prevents unnecessary writes when the API returns the same data.
-        // The condition is: existing.updated_at IS NULL OR existing.updated_at != new.updated_at
-        .action_and_where(
-            Condition::any()
-                .add(Expr::col((CodeRepository, Column::UpdatedAt)).is_null())
-                .add(
-                    Expr::col((CodeRepository, Column::UpdatedAt))
-                        .ne(Expr::col((Alias::new("excluded"), Column::UpdatedAt))),
-                )
-                .into(),
-        )
-        .to_owned();
-
-    CodeRepository::insert_many(models)
-        .on_conflict(on_conflict)
-        .exec_without_returning(db)
-        .await
-        .map_err(RepositoryError::from)
-}
-
-/// Delete multiple repositories by their UUIDs.
-///
-/// Returns the total number of rows deleted.
-pub async fn delete_many(db: &DatabaseConnection, ids: Vec<Uuid>) -> Result<u64> {
-    if ids.is_empty() {
-        return Ok(0);
-    }
-
-    let result = CodeRepository::delete_many()
-        .filter(Column::Id.is_in(ids))
-        .exec(db)
-        .await?;
-    Ok(result.rows_affected)
-}
-
-/// Delete all repositories for a given platform.
-///
-/// Returns the number of rows deleted.
-pub async fn delete_by_platform(db: &DatabaseConnection, platform: CodePlatform) -> Result<u64> {
-    let result = CodeRepository::delete_many()
-        .filter(Column::Platform.eq(platform))
-        .exec(db)
-        .await?;
-    Ok(result.rows_affected)
-}
-
-/// Delete repositories by owner/name pairs for a specific platform.
-///
-/// This is used when pruning starred repositories - when a repo is unstarred,
-/// it should also be removed from the database.
-///
-/// Returns the number of rows deleted.
-pub async fn delete_by_owner_name(
-    db: &DatabaseConnection,
-    platform: CodePlatform,
-    repos: &[(String, String)], // (owner, name) pairs
-) -> Result<u64> {
-    if repos.is_empty() {
-        return Ok(0);
-    }
-
-    let mut total_deleted = 0u64;
-
-    // Delete in batches to avoid overly large queries
-    for chunk in repos.chunks(100) {
-        // Build OR conditions for each (owner, name) pair
-        let mut condition = sea_orm::Condition::any();
-        for (owner, name) in chunk {
-            condition = condition.add(
-                sea_orm::Condition::all()
-                    .add(Column::Owner.eq(owner.clone()))
-                    .add(Column::Name.eq(name.clone())),
-            );
-        }
-
-        let result = CodeRepository::delete_many()
-            .filter(Column::Platform.eq(platform.clone()))
-            .filter(condition)
-            .exec(db)
-            .await?;
-
-        total_deleted += result.rows_affected;
-    }
-
-    Ok(total_deleted)
-}
-
-// ─── Query Operations ────────────────────────────────────────────────────────
-
-/// Find all repositories with pagination.
-pub async fn find_all(
-    db: &DatabaseConnection,
-    pagination: Pagination,
-) -> Result<PaginatedResult<Model>> {
-    let paginator = CodeRepository::find()
-        .order_by_asc(Column::Owner)
-        .order_by_asc(Column::Name)
-        .paginate(db, pagination.per_page);
-
-    let total = paginator.num_items().await?;
-    let total_pages = paginator.num_pages().await?;
-    let items = paginator.fetch_page(pagination.page).await?;
-
-    Ok(PaginatedResult {
-        items,
-        total,
-        page: pagination.page,
-        per_page: pagination.per_page,
-        total_pages,
-    })
-}
-
-/// Find all repositories for a given platform with pagination.
-pub async fn find_by_platform(
-    db: &DatabaseConnection,
-    platform: CodePlatform,
-    pagination: Pagination,
-) -> Result<PaginatedResult<Model>> {
-    let paginator = CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
-        .order_by_asc(Column::Owner)
-        .order_by_asc(Column::Name)
-        .paginate(db, pagination.per_page);
-
-    let total = paginator.num_items().await?;
-    let total_pages = paginator.num_pages().await?;
-    let items = paginator.fetch_page(pagination.page).await?;
-
-    Ok(PaginatedResult {
-        items,
-        total,
-        page: pagination.page,
-        per_page: pagination.per_page,
-        total_pages,
-    })
-}
-
-/// Find all repositories for a given owner with pagination.
-pub async fn find_by_owner(
-    db: &DatabaseConnection,
-    owner: &str,
-    pagination: Pagination,
-) -> Result<PaginatedResult<Model>> {
-    let paginator = CodeRepository::find()
-        .filter(Column::Owner.eq(owner))
-        .order_by_asc(Column::Owner)
-        .order_by_asc(Column::Name)
-        .paginate(db, pagination.per_page);
-
-    let total = paginator.num_items().await?;
-    let total_pages = paginator.num_pages().await?;
-    let items = paginator.fetch_page(pagination.page).await?;
-
-    Ok(PaginatedResult {
-        items,
-        total,
-        page: pagination.page,
-        per_page: pagination.per_page,
-        total_pages,
-    })
-}
-
-/// Find repositories that haven't been synced since the given time.
-///
-/// Returns up to `limit` repositories, ordered by oldest sync first.
-pub async fn find_stale(
-    db: &DatabaseConnection,
-    older_than: DateTime<Utc>,
-    limit: u64,
-) -> Result<Vec<Model>> {
-    CodeRepository::find()
-        .filter(Column::SyncedAt.lt(older_than))
-        .order_by_asc(Column::SyncedAt)
-        .paginate(db, limit)
-        .fetch_page(0)
-        .await
-        .map_err(RepositoryError::from)
-}
-
-/// Count total repositories.
-pub async fn count(db: &DatabaseConnection) -> Result<u64> {
-    CodeRepository::find()
-        .count(db)
-        .await
-        .map_err(RepositoryError::from)
-}
-
-/// Count repositories for a given platform.
-pub async fn count_by_platform(db: &DatabaseConnection, platform: CodePlatform) -> Result<u64> {
-    CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
-        .count(db)
-        .await
-        .map_err(RepositoryError::from)
-}
-
-/// Find all repositories for a given platform without pagination.
-///
-/// This returns all repos for the platform in a single query. Use with caution
-/// for platforms with many repos - prefer `find_by_platform` with pagination
-/// for large result sets.
-pub async fn find_all_by_platform(
-    db: &DatabaseConnection,
-    platform: CodePlatform,
-) -> Result<Vec<Model>> {
-    CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
-        .order_by_asc(Column::Owner)
-        .order_by_asc(Column::Name)
-        .all(db)
-        .await
-        .map_err(RepositoryError::from)
-}
-
-/// Find all repositories for a given platform and owner without pagination.
-///
-/// This is used when loading cached repos on a full cache hit, where we need
-/// all repos for a specific org/owner to avoid re-fetching from the API.
-pub async fn find_all_by_platform_and_owner(
-    db: &DatabaseConnection,
-    platform: CodePlatform,
-    owner: &str,
-) -> Result<Vec<Model>> {
-    CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
-        .filter(Column::Owner.eq(owner))
-        .order_by_asc(Column::Name)
-        .all(db)
-        .await
-        .map_err(RepositoryError::from)
-}
+pub use errors::{RepositoryError, Result};
+pub use query::{
+    PaginatedResult, Pagination, count, count_by_platform, find_all, find_all_by_platform,
+    find_all_by_platform_and_owner, find_by_owner, find_by_platform, find_stale,
+};
+pub use single::{
+    delete, find_by_id, find_by_natural_key, find_by_platform_id, insert, update, upsert,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use sea_orm::sea_query::{Alias, Expr, OnConflict};
+    use sea_orm::{Condition, DbErr, EntityTrait, QueryTrait, Set};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::entity::code_platform::CodePlatform;
+    use crate::entity::code_repository::{ActiveModel, Column, Entity as CodeRepository};
+    use crate::entity::code_visibility::CodeVisibility;
 
     #[test]
     fn test_repository_error_not_found_by_id() {
@@ -744,6 +183,9 @@ mod tests {
         let r2 = r1.clone();
         assert_eq!(r1.items, r2.items);
         assert_eq!(r1.total, r2.total);
+        assert_eq!(r1.page, r2.page);
+        assert_eq!(r1.per_page, r2.per_page);
+        assert_eq!(r1.total_pages, r2.total_pages);
     }
 
     #[test]
@@ -775,8 +217,6 @@ mod tests {
     /// our conditional update syntax.
     #[test]
     fn test_bulk_upsert_query_builds() {
-        use sea_orm::QueryTrait;
-
         // Create a minimal active model
         let model = ActiveModel {
             id: Set(Uuid::new_v4()),
@@ -786,11 +226,11 @@ mod tests {
             name: Set("test-repo".to_string()),
             description: Set(Some("A test repo".to_string())),
             default_branch: Set("main".to_string()),
-            topics: Set(serde_json::json!(["rust", "test"])),
+            topics: Set(json!(["rust", "test"])),
             primary_language: Set(Some("Rust".to_string())),
             license_spdx: Set(Some("MIT".to_string())),
             homepage: Set(None),
-            visibility: Set(crate::entity::code_visibility::CodeVisibility::Public),
+            visibility: Set(CodeVisibility::Public),
             is_fork: Set(false),
             is_mirror: Set(false),
             is_archived: Set(false),
@@ -804,11 +244,11 @@ mod tests {
             has_issues: Set(true),
             has_wiki: Set(true),
             has_pull_requests: Set(true),
-            created_at: Set(Some(chrono::Utc::now().fixed_offset())),
-            updated_at: Set(Some(chrono::Utc::now().fixed_offset())),
-            pushed_at: Set(Some(chrono::Utc::now().fixed_offset())),
-            platform_metadata: Set(serde_json::json!({})),
-            synced_at: Set(chrono::Utc::now().fixed_offset()),
+            created_at: Set(Some(Utc::now().fixed_offset())),
+            updated_at: Set(Some(Utc::now().fixed_offset())),
+            pushed_at: Set(Some(Utc::now().fixed_offset())),
+            platform_metadata: Set(json!({})),
+            synced_at: Set(Utc::now().fixed_offset()),
             etag: Set(None),
         };
 

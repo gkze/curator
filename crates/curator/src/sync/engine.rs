@@ -26,6 +26,13 @@
 //! ).await?;
 //! ```
 
+mod fetch;
+mod filter;
+mod persist;
+mod star;
+
+pub use filter::filter_by_activity;
+
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -34,247 +41,121 @@ use tokio::sync::{Semaphore, mpsc};
 use sea_orm::DatabaseConnection;
 
 use super::progress::{ProgressCallback, SyncProgress, emit};
-use super::types::{
-    NamespaceSyncResult, NamespaceSyncResultStreaming, StarringStats, SyncOptions, SyncResult,
-};
+use super::types::{NamespaceSyncResult, NamespaceSyncResultStreaming, SyncOptions, SyncResult};
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{ApiRateLimiter, PlatformClient, PlatformError, PlatformRepo};
 
-/// Filter repositories by recent activity.
-///
-/// Returns repositories that have been updated within the specified duration.
-pub fn filter_by_activity(
-    repos: &[PlatformRepo],
-    active_within: chrono::Duration,
-) -> Vec<&PlatformRepo> {
-    let cutoff = Utc::now() - active_within;
-
-    repos
-        .iter()
-        .filter(|repo| {
-            // Check pushed_at first, then updated_at
-            repo.pushed_at
-                .or(repo.updated_at)
-                .map(|t| t > cutoff)
-                .unwrap_or(false)
-        })
-        .collect()
-}
-
-/// Star repositories sequentially using the platform client.
-///
-/// This is the unified starring implementation for use with the generic sync engine.
-/// Currently unused as platform-specific sync functions use their own starring logic
-/// that operates on platform-specific types before conversion.
-#[allow(dead_code)]
-async fn star_repos_sequential<C: PlatformClient>(
+async fn sync_repos<C: PlatformClient + Clone + 'static>(
     client: &C,
-    repos: &[&PlatformRepo],
-    dry_run: bool,
-    on_progress: Option<&ProgressCallback>,
-) -> StarringStats {
-    let mut stats = StarringStats::default();
-
-    if repos.is_empty() {
-        return stats;
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::StarringRepos {
-            count: repos.len(),
-            concurrency: 1,
-            dry_run,
-        },
-    );
-
-    for repo in repos {
-        let result = if dry_run {
-            Ok(true) // Assume would be starred
-        } else {
-            client
-                .star_repo_with_retry(&repo.owner, &repo.name, on_progress)
-                .await
-        };
-
-        match result {
-            Ok(true) => {
-                stats.starred += 1;
-                emit(
-                    on_progress,
-                    SyncProgress::StarredRepo {
-                        owner: repo.owner.clone(),
-                        name: repo.name.clone(),
-                        already_starred: false,
-                    },
-                );
-            }
-            Ok(false) => {
-                stats.skipped += 1;
-                emit(
-                    on_progress,
-                    SyncProgress::StarredRepo {
-                        owner: repo.owner.clone(),
-                        name: repo.name.clone(),
-                        already_starred: true,
-                    },
-                );
-            }
-            Err(e) => {
-                let err_msg = e.to_string();
-                stats
-                    .errors
-                    .push(format!("{}/{}: {}", repo.owner, repo.name, err_msg));
-                emit(
-                    on_progress,
-                    SyncProgress::StarError {
-                        owner: repo.owner.clone(),
-                        name: repo.name.clone(),
-                        error: err_msg,
-                    },
-                );
-            }
-        }
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::StarringComplete {
-            starred: stats.starred,
-            already_starred: stats.skipped,
-            errors: stats.errors.len(),
-        },
-    );
-
-    stats
-}
-
-/// Star repositories concurrently using the platform client.
-///
-/// Uses a semaphore to limit concurrency. When a rate limiter is provided,
-/// waits for rate limit clearance before each starring operation.
-async fn star_repos_concurrent<C: PlatformClient + Clone + 'static>(
-    client: &C,
-    repos: Vec<(String, String)>, // (owner, name) pairs
-    concurrency: usize,
-    dry_run: bool,
+    repos: Vec<PlatformRepo>,
+    options: &SyncOptions,
     rate_limiter: Option<&ApiRateLimiter>,
     on_progress: Option<&ProgressCallback>,
-) -> StarringStats {
-    let mut stats = StarringStats::default();
-
-    if repos.is_empty() {
-        return stats;
-    }
-
-    let concurrency = std::cmp::min(concurrency, repos.len());
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let limiter = rate_limiter.cloned();
+) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
+    let mut result = SyncResult {
+        processed: repos.len(),
+        ..SyncResult::default()
+    };
 
     emit(
         on_progress,
-        SyncProgress::StarringRepos {
-            count: repos.len(),
-            concurrency,
-            dry_run,
+        SyncProgress::FilteringByActivity {
+            days: options.active_within.num_days(),
         },
     );
-
-    let mut handles = Vec::with_capacity(repos.len());
-
-    for (owner, name) in repos {
-        let client = client.clone();
-        let semaphore = Arc::clone(&semaphore);
-        let limiter = limiter.clone();
-
-        let handle = tokio::spawn(async move {
-            let _permit = match semaphore.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    return (
-                        owner,
-                        name,
-                        Err(PlatformError::internal("Semaphore closed unexpectedly")),
-                    );
-                }
-            };
-
-            // Apply rate limiting if configured
-            if let Some(ref limiter) = limiter {
-                limiter.wait().await;
-            }
-
-            let result = if dry_run {
-                // In dry run, check if already starred to report accurately
-                match client.is_repo_starred(&owner, &name).await {
-                    Ok(true) => Ok(false), // Already starred
-                    Ok(false) => Ok(true), // Would be starred
-                    Err(e) => Err(e),
-                }
-            } else {
-                client.star_repo_with_retry(&owner, &name, None).await
-            };
-
-            (owner, name, result)
-        });
-
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        match handle.await {
-            Ok((owner, name, Ok(true))) => {
-                stats.starred += 1;
-                emit(
-                    on_progress,
-                    SyncProgress::StarredRepo {
-                        owner,
-                        name,
-                        already_starred: false,
-                    },
-                );
-            }
-            Ok((owner, name, Ok(false))) => {
-                stats.skipped += 1;
-                emit(
-                    on_progress,
-                    SyncProgress::StarredRepo {
-                        owner,
-                        name,
-                        already_starred: true,
-                    },
-                );
-            }
-            Ok((owner, name, Err(e))) => {
-                let err_msg = e.to_string();
-                stats
-                    .errors
-                    .push(format!("{}/{}: {}", owner, name, err_msg));
-                emit(
-                    on_progress,
-                    SyncProgress::StarError {
-                        owner,
-                        name,
-                        error: err_msg,
-                    },
-                );
-            }
-            Err(e) => {
-                stats.errors.push(format!("Task panic: {}", e));
-            }
-        }
-    }
 
     emit(
         on_progress,
-        SyncProgress::StarringComplete {
-            starred: stats.starred,
-            already_starred: stats.skipped,
-            errors: stats.errors.len(),
+        SyncProgress::FilteredPage {
+            matched_so_far: 0,
+            processed_so_far: 0,
         },
     );
 
-    stats
+    emit(
+        on_progress,
+        SyncProgress::FilteredPage {
+            matched_so_far: 0,
+            processed_so_far: 0,
+        },
+    );
+
+    let active_repos = filter::filter_by_activity(&repos, options.active_within);
+    result.matched = active_repos.len();
+
+    emit(
+        on_progress,
+        SyncProgress::FilterComplete {
+            matched: result.matched,
+            total: result.processed,
+        },
+    );
+
+    if options.star && !active_repos.is_empty() {
+        let repos_to_star: Vec<(String, String)> = active_repos
+            .iter()
+            .map(|repo| (repo.owner.clone(), repo.name.clone()))
+            .collect();
+
+        let star_stats = star::star_repos_concurrent(
+            client,
+            repos_to_star,
+            options.concurrency,
+            options.dry_run,
+            rate_limiter,
+            on_progress,
+        )
+        .await;
+
+        result.starred = star_stats.starred;
+        result.skipped = star_stats.skipped;
+        result.errors = star_stats.errors;
+    }
+
+    emit(on_progress, SyncProgress::ConvertingModels);
+
+    let models = persist::build_models(client, &active_repos);
+    result.saved = models.len();
+
+    emit(
+        on_progress,
+        SyncProgress::ModelsReady {
+            count: models.len(),
+        },
+    );
+
+    Ok((result, models))
+}
+
+async fn sync_repos_streaming<C: PlatformClient + Clone + 'static>(
+    client: &C,
+    repos: Vec<PlatformRepo>,
+    options: &SyncOptions,
+    rate_limiter: Option<&ApiRateLimiter>,
+    model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<SyncResult, PlatformError> {
+    let streaming_result =
+        persist::process_streaming_repos(client, &repos, options, &model_tx, on_progress).await;
+    let mut result = streaming_result.result;
+
+    if options.star && !streaming_result.repos_to_star.is_empty() {
+        let star_stats = star::star_repos_concurrent(
+            client,
+            streaming_result.repos_to_star,
+            options.concurrency,
+            options.dry_run,
+            rate_limiter,
+            on_progress,
+        )
+        .await;
+
+        result.starred = star_stats.starred;
+        result.skipped = star_stats.skipped;
+        result.errors.extend(star_stats.errors);
+    }
+
+    Ok(result)
 }
 
 /// Sync a namespace (org/group) using a platform client.
@@ -305,77 +186,10 @@ pub async fn sync_namespace<C: PlatformClient + Clone + 'static>(
     db: Option<&DatabaseConnection>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
-    let mut result = SyncResult::default();
+    fetch::wait_for_rate_limit(rate_limiter).await;
+    let repos = client.list_org_repos(namespace, db, on_progress).await?;
 
-    // Apply rate limiting before fetching repos
-    if let Some(limiter) = rate_limiter {
-        limiter.wait().await;
-    }
-
-    // Fetch all repositories
-    let all_repos = client.list_org_repos(namespace, db, on_progress).await?;
-    result.processed = all_repos.len();
-
-    // Filter by activity
-    emit(
-        on_progress,
-        SyncProgress::FilteringByActivity {
-            days: options.active_within.num_days(),
-        },
-    );
-
-    let active_repos = filter_by_activity(&all_repos, options.active_within);
-    result.matched = active_repos.len();
-
-    emit(
-        on_progress,
-        SyncProgress::FilterComplete {
-            matched: result.matched,
-            total: result.processed,
-        },
-    );
-
-    // Star repositories
-    if options.star && !active_repos.is_empty() {
-        // Collect owner/name pairs for concurrent starring
-        let repos_to_star: Vec<(String, String)> = active_repos
-            .iter()
-            .map(|r| (r.owner.clone(), r.name.clone()))
-            .collect();
-
-        let star_stats = star_repos_concurrent(
-            client,
-            repos_to_star,
-            options.concurrency,
-            options.dry_run,
-            rate_limiter,
-            on_progress,
-        )
-        .await;
-
-        result.starred = star_stats.starred;
-        result.skipped = star_stats.skipped;
-        result.errors = star_stats.errors;
-    }
-
-    // Convert to active models
-    emit(on_progress, SyncProgress::ConvertingModels);
-
-    let models: Vec<CodeRepositoryActiveModel> = active_repos
-        .iter()
-        .map(|r| client.to_active_model(r))
-        .collect();
-
-    result.saved = models.len();
-
-    emit(
-        on_progress,
-        SyncProgress::ModelsReady {
-            count: models.len(),
-        },
-    );
-
-    Ok((result, models))
+    sync_repos(client, repos, options, rate_limiter, on_progress).await
 }
 
 /// Sync a namespace with streaming persistence.
@@ -404,83 +218,10 @@ pub async fn sync_namespace_streaming<C: PlatformClient + Clone + 'static>(
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
-    let mut result = SyncResult::default();
-    let cutoff = Utc::now() - options.active_within;
+    fetch::wait_for_rate_limit(rate_limiter).await;
+    let repos = client.list_org_repos(namespace, db, on_progress).await?;
 
-    // Apply rate limiting before fetching repos
-    if let Some(limiter) = rate_limiter {
-        limiter.wait().await;
-    }
-
-    // Fetch all repositories
-    let all_repos = client.list_org_repos(namespace, db, on_progress).await?;
-    result.processed = all_repos.len();
-
-    emit(
-        on_progress,
-        SyncProgress::FilteringByActivity {
-            days: options.active_within.num_days(),
-        },
-    );
-
-    let mut channel_closed = false;
-    let mut repos_to_star: Vec<(String, String)> = Vec::new();
-
-    // Process and filter repositories
-    for repo in &all_repos {
-        let activity_time = repo.pushed_at.or(repo.updated_at);
-        let is_active = activity_time.map(|t| t > cutoff).unwrap_or(false);
-
-        if is_active {
-            result.matched += 1;
-
-            if options.star {
-                repos_to_star.push((repo.owner.clone(), repo.name.clone()));
-            }
-
-            if !options.dry_run && !channel_closed {
-                let model = client.to_active_model(repo);
-                if model_tx.send(model).await.is_err() {
-                    channel_closed = true;
-                    emit(
-                        on_progress,
-                        SyncProgress::Warning {
-                            message: "persistence channel closed".to_string(),
-                        },
-                    );
-                } else {
-                    result.saved += 1;
-                }
-            }
-        }
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::FilterComplete {
-            matched: result.matched,
-            total: result.processed,
-        },
-    );
-
-    // Star repositories concurrently
-    if options.star && !repos_to_star.is_empty() {
-        let star_stats = star_repos_concurrent(
-            client,
-            repos_to_star,
-            options.concurrency,
-            options.dry_run,
-            rate_limiter,
-            on_progress,
-        )
-        .await;
-
-        result.starred = star_stats.starred;
-        result.skipped = star_stats.skipped;
-        result.errors.extend(star_stats.errors);
-    }
-
-    Ok(result)
+    sync_repos_streaming(client, repos, options, rate_limiter, model_tx, on_progress).await
 }
 
 /// Sync multiple namespaces concurrently.
@@ -724,77 +465,10 @@ pub async fn sync_user<C: PlatformClient + Clone + 'static>(
     db: Option<&DatabaseConnection>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
-    let mut result = SyncResult::default();
+    fetch::wait_for_rate_limit(rate_limiter).await;
+    let repos = client.list_user_repos(username, db, on_progress).await?;
 
-    // Apply rate limiting before fetching repos
-    if let Some(limiter) = rate_limiter {
-        limiter.wait().await;
-    }
-
-    // Fetch all user repositories
-    let all_repos = client.list_user_repos(username, db, on_progress).await?;
-    result.processed = all_repos.len();
-
-    // Filter by activity
-    emit(
-        on_progress,
-        SyncProgress::FilteringByActivity {
-            days: options.active_within.num_days(),
-        },
-    );
-
-    let active_repos = filter_by_activity(&all_repos, options.active_within);
-    result.matched = active_repos.len();
-
-    emit(
-        on_progress,
-        SyncProgress::FilterComplete {
-            matched: result.matched,
-            total: result.processed,
-        },
-    );
-
-    // Star repositories
-    if options.star && !active_repos.is_empty() {
-        // Collect owner/name pairs for concurrent starring
-        let repos_to_star: Vec<(String, String)> = active_repos
-            .iter()
-            .map(|r| (r.owner.clone(), r.name.clone()))
-            .collect();
-
-        let star_stats = star_repos_concurrent(
-            client,
-            repos_to_star,
-            options.concurrency,
-            options.dry_run,
-            rate_limiter,
-            on_progress,
-        )
-        .await;
-
-        result.starred = star_stats.starred;
-        result.skipped = star_stats.skipped;
-        result.errors = star_stats.errors;
-    }
-
-    // Convert to active models
-    emit(on_progress, SyncProgress::ConvertingModels);
-
-    let models: Vec<CodeRepositoryActiveModel> = active_repos
-        .iter()
-        .map(|r| client.to_active_model(r))
-        .collect();
-
-    result.saved = models.len();
-
-    emit(
-        on_progress,
-        SyncProgress::ModelsReady {
-            count: models.len(),
-        },
-    );
-
-    Ok((result, models))
+    sync_repos(client, repos, options, rate_limiter, on_progress).await
 }
 
 /// Sync a user's repositories with streaming persistence.
@@ -823,83 +497,10 @@ pub async fn sync_user_streaming<C: PlatformClient + Clone + 'static>(
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
-    let mut result = SyncResult::default();
-    let cutoff = Utc::now() - options.active_within;
+    fetch::wait_for_rate_limit(rate_limiter).await;
+    let repos = client.list_user_repos(username, db, on_progress).await?;
 
-    // Apply rate limiting before fetching repos
-    if let Some(limiter) = rate_limiter {
-        limiter.wait().await;
-    }
-
-    // Fetch all user repositories
-    let all_repos = client.list_user_repos(username, db, on_progress).await?;
-    result.processed = all_repos.len();
-
-    emit(
-        on_progress,
-        SyncProgress::FilteringByActivity {
-            days: options.active_within.num_days(),
-        },
-    );
-
-    let mut channel_closed = false;
-    let mut repos_to_star: Vec<(String, String)> = Vec::new();
-
-    // Process and filter repositories
-    for repo in &all_repos {
-        let activity_time = repo.pushed_at.or(repo.updated_at);
-        let is_active = activity_time.map(|t| t > cutoff).unwrap_or(false);
-
-        if is_active {
-            result.matched += 1;
-
-            if options.star {
-                repos_to_star.push((repo.owner.clone(), repo.name.clone()));
-            }
-
-            if !options.dry_run && !channel_closed {
-                let model = client.to_active_model(repo);
-                if model_tx.send(model).await.is_err() {
-                    channel_closed = true;
-                    emit(
-                        on_progress,
-                        SyncProgress::Warning {
-                            message: "persistence channel closed".to_string(),
-                        },
-                    );
-                } else {
-                    result.saved += 1;
-                }
-            }
-        }
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::FilterComplete {
-            matched: result.matched,
-            total: result.processed,
-        },
-    );
-
-    // Star repositories concurrently
-    if options.star && !repos_to_star.is_empty() {
-        let star_stats = star_repos_concurrent(
-            client,
-            repos_to_star,
-            options.concurrency,
-            options.dry_run,
-            rate_limiter,
-            on_progress,
-        )
-        .await;
-
-        result.starred = star_stats.starred;
-        result.skipped = star_stats.skipped;
-        result.errors.extend(star_stats.errors);
-    }
-
-    Ok(result)
+    sync_repos_streaming(client, repos, options, rate_limiter, model_tx, on_progress).await
 }
 
 /// Sync multiple users' repositories concurrently with streaming persistence.
@@ -1009,107 +610,6 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
     results
 }
 
-/// Result of pruning operation.
-struct PruneResult {
-    /// Number of repos pruned.
-    pruned: usize,
-    /// List of successfully pruned repos (owner, name) for database cleanup.
-    pruned_repos: Vec<(String, String)>,
-    /// Errors encountered.
-    errors: Vec<String>,
-}
-
-/// Prune (unstar) inactive repositories.
-///
-/// Unstars repositories that are outside the activity window.
-/// Returns the list of successfully pruned repos so they can be deleted from the database.
-async fn prune_repos<C: PlatformClient + Clone + 'static>(
-    client: &C,
-    repos: Vec<(String, String)>, // (owner, name) pairs
-    dry_run: bool,
-    rate_limiter: Option<&ApiRateLimiter>,
-    on_progress: Option<&ProgressCallback>,
-) -> PruneResult {
-    let mut result = PruneResult {
-        pruned: 0,
-        pruned_repos: Vec::new(),
-        errors: Vec::new(),
-    };
-
-    if repos.is_empty() {
-        return result;
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::PruningRepos {
-            count: repos.len(),
-            dry_run,
-        },
-    );
-
-    for (owner, name) in repos {
-        // Apply rate limiting if configured
-        if let Some(limiter) = rate_limiter {
-            limiter.wait().await;
-        }
-
-        if dry_run {
-            // In dry run, just count as would-be-pruned
-            result.pruned += 1;
-            result.pruned_repos.push((owner.clone(), name.clone()));
-            emit(
-                on_progress,
-                SyncProgress::PrunedRepo {
-                    owner: owner.clone(),
-                    name: name.clone(),
-                },
-            );
-        } else {
-            match client.unstar_repo(&owner, &name).await {
-                Ok(true) => {
-                    result.pruned += 1;
-                    result.pruned_repos.push((owner.clone(), name.clone()));
-                    emit(
-                        on_progress,
-                        SyncProgress::PrunedRepo {
-                            owner: owner.clone(),
-                            name: name.clone(),
-                        },
-                    );
-                }
-                Ok(false) => {
-                    // Wasn't starred - shouldn't happen but not an error
-                }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    result
-                        .errors
-                        .push(format!("{}/{}: {}", owner, name, err_msg));
-                    emit(
-                        on_progress,
-                        SyncProgress::PruneError {
-                            owner: owner.clone(),
-                            name: name.clone(),
-                            error: err_msg,
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::PruningComplete {
-            pruned: result.pruned,
-            errors: result.errors.len(),
-        },
-    );
-
-    result
-}
-
 /// Sync the authenticated user's starred repositories.
 ///
 /// This function:
@@ -1149,17 +649,12 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     let cutoff = Utc::now() - options.active_within;
 
     // Apply rate limiting before fetching repos
-    if let Some(limiter) = rate_limiter {
-        limiter.wait().await;
-    }
+    fetch::wait_for_rate_limit(rate_limiter).await;
 
-    // Emit filtering activity event - for starred sync, filtering happens during streaming
-    emit(
-        on_progress,
-        SyncProgress::FilteringByActivity {
-            days: options.active_within.num_days(),
-        },
-    );
+    // Note: FilteringByActivity is not emitted here because the client's
+    // list_starred_repos_streaming emits FetchingRepos, and filtering happens
+    // during streaming (not as a separate phase). The FilteredPage events
+    // provide incremental filtering progress.
 
     // Shared state for the streaming processor
     let processed = Arc::new(AtomicUsize::new(0));
@@ -1191,15 +686,17 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
         while let Some(repo) = repo_rx.recv().await {
             let new_processed = processor_processed.fetch_add(1, Ordering::Relaxed) + 1;
 
-            let activity_time = repo.pushed_at.or(repo.updated_at);
-            let is_active = activity_time.map(|t| t > cutoff).unwrap_or(false);
+            let is_active = filter::is_active_repo(&repo, cutoff);
+            let new_matched = if is_active {
+                processor_matched.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                processor_matched.load(Ordering::Relaxed)
+            };
+
+            // Send progress update (ignore errors if receiver dropped)
+            let _ = progress_tx.send((new_matched, new_processed));
 
             if is_active {
-                let new_matched = processor_matched.fetch_add(1, Ordering::Relaxed) + 1;
-
-                // Send progress update (ignore errors if receiver dropped)
-                let _ = progress_tx.send((new_matched, new_processed));
-
                 // Persist active starred repos
                 if !processor_dry_run && !processor_channel_closed.load(Ordering::Relaxed) {
                     let model = processor_client.to_active_model(&repo);
@@ -1220,32 +717,32 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
 
     // Stream starred repos with concurrent progress emission
     // Use pin to allow polling the future while also checking progress
-    let fetch_future = client.list_starred_repos_streaming(
+    let mut fetch_future = Box::pin(client.list_starred_repos_streaming(
         repo_tx,
         db,
         concurrency,
         skip_rate_checks,
         on_progress,
-    );
-    tokio::pin!(fetch_future);
+    ));
 
     let mut fetch_done = false;
     let mut fetch_result: Option<Result<usize, PlatformError>> = None;
+    let mut processor_result: Option<Result<(), tokio::task::JoinError>> = None;
     let mut last_emitted_matched = 0usize;
     let mut last_emitted_processed = 0usize;
+    let mut processor_handle = processor_handle;
 
-    // Poll fetch and progress concurrently, emitting FilteredPage events in real-time
+    // Poll fetch, processor, and progress concurrently, emitting FilteredPage events in real-time
     loop {
         tokio::select! {
             biased;
 
-            // Check for progress updates from processor (non-blocking drain)
-            result = progress_rx.recv(), if !fetch_done => {
+            result = progress_rx.recv(), if processor_result.is_none() => {
                 if let Some((matched_count, processed_count)) = result {
-                    // Emit progress every 25 matched repos or 100 processed for real-time feedback
                     let should_emit = matched_count >= last_emitted_matched + 25
                         || processed_count >= last_emitted_processed + 100
-                        || (matched_count > 0 && last_emitted_matched == 0);
+                        || (matched_count > 0 && last_emitted_matched == 0)
+                        || (processed_count > 0 && last_emitted_processed == 0);
 
                     if should_emit {
                         emit(
@@ -1261,20 +758,22 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
                 }
             }
 
-            // Drive the fetch forward
-            result = &mut fetch_future, if !fetch_done => {
+            result = fetch_future.as_mut(), if !fetch_done => {
                 fetch_done = true;
                 fetch_result = Some(result);
             }
+
+            result = &mut processor_handle, if processor_result.is_none() => {
+                processor_result = Some(result.map(|_| ()));
+            }
         }
 
-        // Exit when fetch is done
-        if fetch_done {
-            // Drain any remaining progress updates
+        if fetch_done && processor_result.is_some() {
             while let Ok((matched_count, processed_count)) = progress_rx.try_recv() {
                 let should_emit = matched_count >= last_emitted_matched + 25
                     || processed_count >= last_emitted_processed + 100
-                    || (matched_count > 0 && last_emitted_matched == 0);
+                    || (matched_count > 0 && last_emitted_matched == 0)
+                    || (processed_count > 0 && last_emitted_processed == 0);
 
                 if should_emit {
                     emit(
@@ -1293,9 +792,9 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     }
 
     let fetch_result = fetch_result.expect("fetch should complete");
+    drop(fetch_future);
 
-    // Wait for processor to finish
-    let _ = processor_handle.await;
+    let _ = processor_result.expect("processor should complete");
 
     // Emit final progress update
     let final_matched = matched.load(Ordering::Relaxed);
@@ -1356,7 +855,7 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     };
 
     if options.prune && !repos_to_prune.is_empty() {
-        let prune_result = prune_repos(
+        let prune_result = star::prune_repos(
             client,
             repos_to_prune,
             options.dry_run,
@@ -1376,6 +875,7 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::StarringStats;
     use chrono::Duration;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

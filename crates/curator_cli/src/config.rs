@@ -215,6 +215,9 @@ impl Config {
     /// If no database URL is configured, defaults to `sqlite://~/.local/state/curator/curator.db?mode=rwc`
     /// on Linux (using XDG state directory) or the platform-appropriate equivalent.
     /// The `mode=rwc` parameter enables read-write access and creates the file if it doesn't exist.
+    ///
+    /// Note: SQLite-specific pragmas (WAL mode, busy timeout) are configured automatically
+    /// when connecting via `curator::db::connect()` or `curator::db::connect_and_migrate()`.
     pub fn database_url(&self) -> Option<String> {
         self.database.url.clone().or_else(|| {
             Self::default_state_dir().map(|state_dir| {

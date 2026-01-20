@@ -1,9 +1,5 @@
 //! Model conversion from GitLab API types to curator entities.
 
-use chrono::Utc;
-use sea_orm::Set;
-use uuid::Uuid;
-
 use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
@@ -24,74 +20,8 @@ fn gitlab_visibility(project: &GitLabProject) -> CodeVisibility {
 
 /// Convert a GitLab project to a CodeRepository active model.
 pub fn to_code_repository(project: &GitLabProject) -> CodeRepositoryActiveModel {
-    let now = Utc::now().fixed_offset();
-
-    // Extract owner from path_with_namespace (e.g., "group/subgroup/project" → "group/subgroup")
-    let owner = project
-        .path_with_namespace
-        .rsplit_once('/')
-        .map(|(ns, _)| ns.to_string())
-        .unwrap_or_else(|| project.namespace.full_path.clone());
-
-    let name = project.name.clone();
-    let visibility = gitlab_visibility(project);
-    let topics = serde_json::json!(project.topics.clone());
-
-    // GitLab doesn't return primary language in the list projects endpoint
-    // Would need a separate API call to get this
-    let primary_language: Option<String> = None;
-
-    // License is also not included in the list projects response
-    let license_spdx: Option<String> = None;
-
-    // Build platform-specific metadata (strip nulls to reduce storage)
-    let platform_metadata = strip_null_values(serde_json::json!({
-        "web_url": project.web_url,
-        "ssh_url_to_repo": project.ssh_url_to_repo,
-        "http_url_to_repo": project.http_url_to_repo,
-        "namespace_id": project.namespace.id,
-        "namespace_kind": project.namespace.kind,
-        "namespace_path": project.namespace.path,
-        "mirror": project.mirror,
-        "path": project.path,
-    }));
-
-    CodeRepositoryActiveModel {
-        id: Set(Uuid::new_v4()),
-        platform: Set(CodePlatform::GitLab),
-        platform_id: Set(project.id as i64),
-        owner: Set(owner),
-        name: Set(name),
-        description: Set(project.description.clone()),
-        default_branch: Set(project
-            .default_branch
-            .clone()
-            .unwrap_or_else(|| "main".to_string())),
-        topics: Set(topics),
-        primary_language: Set(primary_language),
-        license_spdx: Set(license_spdx),
-        homepage: Set(None), // GitLab projects don't have a separate homepage field
-        visibility: Set(visibility),
-        is_fork: Set(project.forked_from_project.is_some()),
-        is_mirror: Set(project.mirror.unwrap_or(false)),
-        is_archived: Set(project.archived),
-        is_template: Set(false), // GitLab templates work differently
-        is_empty: Set(false),    // Not provided in list response
-        stars: Set(Some(project.star_count as i32)),
-        forks: Set(Some(project.forks_count as i32)),
-        open_issues: Set(project.open_issues_count.map(|c| c as i32)),
-        watchers: Set(None), // GitLab doesn't have a watchers concept like GitHub
-        size_kb: Set(None),  // Would need statistics=true parameter
-        has_issues: Set(project.issues_enabled.unwrap_or(true)),
-        has_wiki: Set(project.wiki_enabled.unwrap_or(true)),
-        has_pull_requests: Set(project.merge_requests_enabled.unwrap_or(true)),
-        created_at: Set(Some(project.created_at.fixed_offset())),
-        updated_at: Set(Some(project.last_activity_at.fixed_offset())),
-        pushed_at: Set(None), // GitLab doesn't have pushed_at; last_activity_at is closest
-        platform_metadata: Set(platform_metadata),
-        synced_at: Set(now),
-        etag: Set(None),
-    }
+    let platform_repo = to_platform_repo(project);
+    platform_repo.to_active_model(CodePlatform::GitLab)
 }
 
 /// Convert a GitLab project to a platform-agnostic PlatformRepo.
@@ -113,6 +43,10 @@ pub fn to_platform_repo(project: &GitLabProject) -> PlatformRepo {
         "namespace_path": project.namespace.path,
         "mirror": project.mirror,
         "path": project.path,
+        "open_issues_count": project.open_issues_count,
+        "has_issues": project.issues_enabled,
+        "has_wiki": project.wiki_enabled,
+        "has_pull_requests": project.merge_requests_enabled,
     }));
 
     PlatformRepo {
@@ -143,42 +77,7 @@ pub fn to_platform_repo(project: &GitLabProject) -> PlatformRepo {
 
 /// Convert a PlatformRepo to a CodeRepository active model for GitLab.
 pub fn platform_repo_to_active_model(repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-    let now = Utc::now().fixed_offset();
-    let topics = serde_json::json!(repo.topics);
-
-    CodeRepositoryActiveModel {
-        id: Set(Uuid::new_v4()),
-        platform: Set(CodePlatform::GitLab),
-        platform_id: Set(repo.platform_id),
-        owner: Set(repo.owner.clone()),
-        name: Set(repo.name.clone()),
-        description: Set(repo.description.clone()),
-        default_branch: Set(repo.default_branch.clone()),
-        topics: Set(topics),
-        primary_language: Set(repo.language.clone()),
-        license_spdx: Set(repo.license.clone()),
-        homepage: Set(repo.homepage.clone()),
-        visibility: Set(repo.visibility.clone()),
-        is_fork: Set(repo.is_fork),
-        is_mirror: Set(false), // Would need to extract from metadata
-        is_archived: Set(repo.is_archived),
-        is_template: Set(false),
-        is_empty: Set(false),
-        stars: Set(repo.stars.map(|c| c as i32)),
-        forks: Set(repo.forks.map(|c| c as i32)),
-        open_issues: Set(None),
-        watchers: Set(None),
-        size_kb: Set(repo.size_kb.map(|s| s as i64)),
-        has_issues: Set(true),
-        has_wiki: Set(true),
-        has_pull_requests: Set(true),
-        created_at: Set(repo.created_at.map(|t| t.fixed_offset())),
-        updated_at: Set(repo.updated_at.map(|t| t.fixed_offset())),
-        pushed_at: Set(repo.pushed_at.map(|t| t.fixed_offset())),
-        platform_metadata: Set(repo.metadata.clone()),
-        synced_at: Set(now),
-        etag: Set(None),
-    }
+    repo.to_active_model(CodePlatform::GitLab)
 }
 
 #[cfg(test)]

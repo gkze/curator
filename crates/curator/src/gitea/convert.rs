@@ -1,9 +1,5 @@
 //! Model conversion functions for Gitea repositories.
 
-use chrono::Utc;
-use sea_orm::Set;
-use uuid::Uuid;
-
 use super::types::GiteaRepo;
 use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
@@ -73,63 +69,8 @@ pub fn to_code_repository_with_platform(
     repo: &GiteaRepo,
     platform: CodePlatform,
 ) -> CodeRepositoryActiveModel {
-    let now = Utc::now().fixed_offset();
-    let visibility = gitea_visibility(repo);
-
-    // Serialize topics to JSON
-    let topics_json = serde_json::json!(repo.topics);
-
-    // Build platform-specific metadata (strip nulls to reduce storage)
-    let metadata = strip_null_values(serde_json::json!({
-        "mirror": repo.mirror,
-        "empty": repo.empty,
-        "template": repo.template,
-        "html_url": repo.html_url,
-        "ssh_url": repo.ssh_url,
-        "clone_url": repo.clone_url,
-        "open_issues_count": repo.open_issues_count,
-        "watchers_count": repo.watchers_count,
-        "has_issues": repo.has_issues,
-        "has_wiki": repo.has_wiki,
-        "has_pull_requests": repo.has_pull_requests,
-    }));
-
-    CodeRepositoryActiveModel {
-        id: Set(Uuid::new_v4()),
-        platform: Set(platform),
-        platform_id: Set(repo.id),
-        owner: Set(repo.owner.login.clone()),
-        name: Set(repo.name.clone()),
-        description: Set(repo.description.clone()),
-        default_branch: Set(repo
-            .default_branch
-            .clone()
-            .unwrap_or_else(|| "main".to_string())),
-        topics: Set(topics_json),
-        primary_language: Set(repo.language.clone()),
-        license_spdx: Set(None), // Not available in list endpoint
-        homepage: Set(repo.website.clone()),
-        visibility: Set(visibility),
-        is_fork: Set(repo.fork),
-        is_mirror: Set(repo.mirror),
-        is_archived: Set(repo.archived),
-        is_template: Set(repo.template),
-        is_empty: Set(repo.empty),
-        stars: Set(Some(repo.stars_count as i32)),
-        forks: Set(Some(repo.forks_count as i32)),
-        open_issues: Set(Some(repo.open_issues_count as i32)),
-        watchers: Set(Some(repo.watchers_count as i32)),
-        size_kb: Set(Some(repo.size as i64)),
-        has_issues: Set(repo.has_issues),
-        has_wiki: Set(repo.has_wiki),
-        has_pull_requests: Set(repo.has_pull_requests),
-        created_at: Set(Some(repo.created_at.fixed_offset())),
-        updated_at: Set(Some(repo.updated_at.fixed_offset())),
-        pushed_at: Set(repo.pushed_at.map(|t| t.fixed_offset())),
-        synced_at: Set(now),
-        platform_metadata: Set(metadata),
-        etag: Set(None),
-    }
+    let platform_repo = to_platform_repo(repo);
+    platform_repo.to_active_model(platform)
 }
 
 /// Convert a PlatformRepo to a CodeRepository active model.
@@ -139,86 +80,15 @@ pub fn platform_repo_to_active_model(
     repo: &PlatformRepo,
     platform: CodePlatform,
 ) -> CodeRepositoryActiveModel {
-    let now = Utc::now().fixed_offset();
-
-    // Serialize topics to JSON
-    let topics_json = serde_json::json!(repo.topics);
-
-    // Extract metadata fields
-    let metadata = &repo.metadata;
-    let is_mirror = metadata
-        .get("mirror")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let is_template = metadata
-        .get("template")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let is_empty = metadata
-        .get("empty")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let open_issues = metadata
-        .get("open_issues_count")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
-    let watchers = metadata
-        .get("watchers_count")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
-    let has_issues = metadata
-        .get("has_issues")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let has_wiki = metadata
-        .get("has_wiki")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let has_pull_requests = metadata
-        .get("has_pull_requests")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-
-    CodeRepositoryActiveModel {
-        id: Set(Uuid::new_v4()),
-        platform: Set(platform),
-        platform_id: Set(repo.platform_id),
-        owner: Set(repo.owner.clone()),
-        name: Set(repo.name.clone()),
-        description: Set(repo.description.clone()),
-        default_branch: Set(repo.default_branch.clone()),
-        topics: Set(topics_json),
-        primary_language: Set(repo.language.clone()),
-        license_spdx: Set(repo.license.clone()),
-        homepage: Set(repo.homepage.clone()),
-        visibility: Set(repo.visibility.clone()),
-        is_fork: Set(repo.is_fork),
-        is_mirror: Set(is_mirror),
-        is_archived: Set(repo.is_archived),
-        is_template: Set(is_template),
-        is_empty: Set(is_empty),
-        stars: Set(repo.stars.map(|v| v as i32)),
-        forks: Set(repo.forks.map(|v| v as i32)),
-        open_issues: Set(open_issues),
-        watchers: Set(watchers),
-        size_kb: Set(repo.size_kb.map(|v| v as i64)),
-        has_issues: Set(has_issues),
-        has_wiki: Set(has_wiki),
-        has_pull_requests: Set(has_pull_requests),
-        created_at: Set(repo.created_at.map(|t| t.fixed_offset())),
-        updated_at: Set(repo.updated_at.map(|t| t.fixed_offset())),
-        pushed_at: Set(repo.pushed_at.map(|t| t.fixed_offset())),
-        synced_at: Set(now),
-        platform_metadata: Set(repo.metadata.clone()),
-        etag: Set(None),
-    }
+    repo.to_active_model(platform)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gitea::types::GiteaUser;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
+    use sea_orm::Set;
 
     fn mock_gitea_repo() -> GiteaRepo {
         GiteaRepo {

@@ -110,6 +110,14 @@ pub enum SyncProgress {
         count: usize,
     },
 
+    /// Flushing a batch of models to the database.
+    PersistingBatch {
+        /// Number of models in the batch.
+        count: usize,
+        /// Whether this is the final batch after the channel closed.
+        final_batch: bool,
+    },
+
     /// A repository was persisted to DB.
     Persisted {
         /// Repository owner.
@@ -536,6 +544,10 @@ mod tests {
             },
             SyncProgress::ConvertingModels,
             SyncProgress::ModelsReady { count: 5 },
+            SyncProgress::PersistingBatch {
+                count: 10,
+                final_batch: false,
+            },
             SyncProgress::Persisted {
                 owner: "o".to_string(),
                 name: "n".to_string(),
