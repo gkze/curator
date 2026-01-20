@@ -167,6 +167,10 @@ pub(crate) fn spawn_persist_task(
             let model = rx.recv().await;
             let channel_closed = model.is_none();
 
+            if channel_closed {
+                tracing::debug!("Persist channel closed, flushing final batch");
+            }
+
             // Add to batch if we received a model
             if let Some(model) = model {
                 // SAFETY: ActiveModel always has owner/name set by to_active_model()

@@ -187,7 +187,6 @@ impl InteractiveReporter {
                 // Convert save spinner to progress bar in-place (preserves position in MultiProgress)
                 if matched > 0
                     && let Some(ref pb) = state.save_bar
-                    && (pb.length().is_none() || pb.length() == Some(0))
                 {
                     pb.set_length(matched as u64);
                     pb.set_style(Self::bar_style());
@@ -343,7 +342,8 @@ impl InteractiveReporter {
 
                     // Convert spinner to progress bar in-place if filter is now complete
                     if state.filter_complete && state.save_total > 0 {
-                        if pb.length().is_none() || pb.length() == Some(0) {
+                        // Set length if not already set to the correct value
+                        if pb.length() != Some(state.save_total as u64) {
                             pb.set_length(state.save_total as u64);
                             pb.set_style(Self::bar_style());
                             pb.disable_steady_tick();

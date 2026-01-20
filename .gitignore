@@ -8,3 +8,5 @@
 /result
 /target
 curator.db
+curator.db-shm
+curator.db-wal

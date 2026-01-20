@@ -838,7 +838,9 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     // (processor_model_tx was already dropped when the processor task finished)
     // The persist task will flush its final batch after this, but FilterComplete
     // has already been emitted so the save bar will use progress bar style
+    tracing::debug!("Dropping model_tx to signal persist task completion");
     drop(model_tx);
+    tracing::debug!("model_tx dropped, persist task should now see channel close");
 
     // Build result
     let mut result = SyncResult {
