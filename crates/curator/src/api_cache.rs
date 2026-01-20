@@ -117,6 +117,44 @@ pub async fn upsert_with_pagination(
     Ok(())
 }
 
+/// Get ETags for multiple cache keys in a single query.
+///
+/// Returns a HashMap mapping cache_key -> Option<etag>.
+/// Keys not found in the database will have None values.
+pub async fn get_etags_batch(
+    db: &DatabaseConnection,
+    platform: CodePlatform,
+    endpoint_type: EndpointType,
+    cache_keys: &[String],
+) -> Result<std::collections::HashMap<String, Option<String>>> {
+    use std::collections::HashMap;
+
+    if cache_keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let entries = ApiCache::find()
+        .filter(Column::Platform.eq(platform.clone()))
+        .filter(Column::EndpointType.eq(endpoint_type.clone()))
+        .filter(Column::CacheKey.is_in(cache_keys.iter().map(|s| s.as_str())))
+        .all(db)
+        .await?;
+
+    let mut result: HashMap<String, Option<String>> = HashMap::new();
+
+    // Initialize all keys with None
+    for key in cache_keys {
+        result.insert(key.clone(), None);
+    }
+
+    // Fill in ETags for entries that exist
+    for entry in entries {
+        result.insert(entry.cache_key, entry.etag);
+    }
+
+    Ok(result)
+}
+
 /// Get the total pages for a namespace from page 1's cache entry.
 ///
 /// Note: This uses the format `{namespace}/page/1` for the cache key.

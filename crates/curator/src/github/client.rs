@@ -1437,52 +1437,83 @@ impl PlatformClient for GitHubClient {
 
             let last_page = expected_pages.unwrap_or(1);
             if last_page > 1 {
+                // Pre-fetch ETags for all pages 2..=last_page
+                let page_cache_keys: Vec<String> = (2..=last_page)
+                    .map(|p| ApiCacheModel::starred_key(&username, p))
+                    .collect();
+
+                let etags_map = api_cache::get_etags_batch(
+                    db,
+                    CodePlatform::GitHub,
+                    EndpointType::Starred,
+                    &page_cache_keys,
+                )
+                .await
+                .unwrap_or_default();
+
                 let semaphore = Arc::new(Semaphore::new(concurrency));
                 let mut handles = Vec::new();
-                // Note: We don't use ETag caching in spawned tasks because DatabaseConnection
-                // doesn't implement Clone. First page already checks ETags; subsequent pages
-                // fetch directly for simplicity.
-                let client = self.inner.clone();
+                let client = self.clone(); // Clone GitHubClient for spawned tasks
+
+                // Result type: (page, count, new_etag, was_modified)
+                type PageResult = (u32, usize, Option<String>, bool);
 
                 for page in 2..=last_page {
                     let task_semaphore = Arc::clone(&semaphore);
                     let task_client = client.clone();
                     let task_repo_tx = repo_tx.clone();
                     let task_total_sent = Arc::clone(&total_sent);
+                    let cache_key = ApiCacheModel::starred_key(&username, page);
+                    let page_etag = etags_map.get(&cache_key).cloned().flatten();
 
-                    let handle = tokio::spawn(async move {
-                        let _permit = task_semaphore.acquire().await.ok()?;
+                    let handle: tokio::task::JoinHandle<Option<PageResult>> =
+                        tokio::spawn(async move {
+                            let _permit = task_semaphore.acquire().await.ok()?;
 
-                        if !skip_rate_checks && check_rate_limit(&task_client).await.is_err() {
-                            return None;
-                        }
+                            let route = format!("/user/starred?per_page=100&page={}", page);
+                            let result: Result<FetchResult<Vec<octocrab::models::Repository>>, _> =
+                                task_client
+                                    .get_conditional(&route, page_etag.as_deref())
+                                    .await;
 
-                        let route = format!("/user/starred?per_page=100&page={}", page);
-                        let repos: Result<Vec<octocrab::models::Repository>, _> =
-                            task_client.get(&route, None::<&()>).await;
-
-                        match repos {
-                            Ok(repos) => {
-                                let count = repos.len();
-                                for repo in &repos {
-                                    let platform_repo = to_platform_repo(repo);
-                                    if task_repo_tx.send(platform_repo).await.is_ok() {
-                                        task_total_sent.fetch_add(1, Ordering::Relaxed);
-                                    }
+                            match result {
+                                Ok(FetchResult::NotModified) => {
+                                    // 304 - data unchanged, no repos to send
+                                    Some((page, 0, None, false))
                                 }
-                                Some((page, count))
+                                Ok(FetchResult::Fetched {
+                                    data: repos, etag, ..
+                                }) => {
+                                    let count = repos.len();
+                                    for repo in &repos {
+                                        let platform_repo = to_platform_repo(repo);
+                                        if task_repo_tx.send(platform_repo).await.is_ok() {
+                                            task_total_sent.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    Some((page, count, etag, true))
+                                }
+                                Err(_) => None,
                             }
-                            Err(_) => None,
-                        }
-                    });
+                        });
 
-                    handles.push(handle);
+                    handles.push((page, handle));
                 }
 
-                for handle in handles {
-                    if let Ok(Some((page_num, count))) = handle.await {
-                        // Since we don't use ETags in spawned tasks, mark as not all cache hits
-                        all_cache_hits = false;
+                // Collect results and track which pages need ETag updates
+                let mut etag_updates: Vec<(String, Option<String>)> = Vec::new();
+
+                for (_page, handle) in handles {
+                    if let Ok(Some((page_num, count, new_etag, was_modified))) = handle.await {
+                        if was_modified {
+                            all_cache_hits = false;
+                            // Queue ETag update for this page
+                            let cache_key = ApiCacheModel::starred_key(&username, page_num);
+                            etag_updates.push((cache_key, new_etag));
+                        } else {
+                            // 304 Not Modified - this page was a cache hit
+                            cache_hits += 1;
+                        }
 
                         if let Some(cb) = on_progress {
                             cb(SyncProgress::FetchedPage {
@@ -1493,6 +1524,18 @@ impl PlatformClient for GitHubClient {
                             });
                         }
                     }
+                }
+
+                // Batch update ETags for modified pages
+                for (cache_key, etag) in etag_updates {
+                    let _ = api_cache::upsert(
+                        db,
+                        CodePlatform::GitHub,
+                        EndpointType::Starred,
+                        &cache_key,
+                        etag,
+                    )
+                    .await;
                 }
             }
 
