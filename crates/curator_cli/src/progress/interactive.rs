@@ -50,19 +50,57 @@ impl InteractiveReporter {
     }
 
     /// Create the save bar with proper styling.
+    /// Positions it after the filter bar if one exists.
     fn create_save_bar(&self, state: &ProgressState) -> ProgressBar {
-        if state.filter_complete && state.save_total > 0 {
+        let pb = if state.filter_complete && state.save_total > 0 {
             // Progress bar with known total
-            let bar = self.multi.add(ProgressBar::new(state.save_total as u64));
-            bar.set_style(Self::bar_style());
-            bar
+            ProgressBar::new(state.save_total as u64)
         } else {
             // Spinner with counter (total not known yet)
-            let bar = self.multi.add(ProgressBar::new_spinner());
-            bar.set_style(Self::counter_style());
+            let bar = ProgressBar::new_spinner();
             bar.enable_steady_tick(std::time::Duration::from_millis(100));
             bar
+        };
+
+        // Insert after filter bar to maintain correct visual order
+        let pb = if let Some(ref filter_bar) = state.filter_bar {
+            self.multi.insert_after(filter_bar, pb)
+        } else {
+            self.multi.add(pb)
+        };
+
+        if state.filter_complete && state.save_total > 0 {
+            pb.set_style(Self::bar_style());
+        } else {
+            pb.set_style(Self::counter_style());
         }
+
+        pb
+    }
+
+    /// Create the filter bar with proper styling.
+    /// Positions it before the save bar if one already exists.
+    fn create_filter_bar(&self, state: &ProgressState, use_spinner: bool) -> ProgressBar {
+        let pb = if use_spinner {
+            let bar = ProgressBar::new_spinner();
+            bar.enable_steady_tick(std::time::Duration::from_millis(100));
+            bar
+        } else {
+            ProgressBar::new_spinner()
+        };
+
+        // Insert before save bar if it exists, to maintain correct visual order
+        let pb = if let Some(ref save_bar) = state.save_bar {
+            self.multi.insert_before(save_bar, pb)
+        } else {
+            self.multi.add(pb)
+        };
+
+        if use_spinner {
+            pb.set_style(Self::filter_style());
+        }
+
+        pb
     }
 
     pub fn handle(&self, event: SyncProgress) {
@@ -146,10 +184,8 @@ impl InteractiveReporter {
 
             SyncProgress::FilteringByActivity { days } => {
                 if state.filter_bar.is_none() {
-                    let pb = self.multi.add(ProgressBar::new_spinner());
-                    pb.set_style(Self::filter_style());
+                    let pb = self.create_filter_bar(&state, true);
                     pb.set_prefix(format!("{:12}", "Filtering"));
-                    pb.enable_steady_tick(std::time::Duration::from_millis(100));
                     state.filter_bar = Some(pb);
                 }
                 for fetch_state in state.fetch_bars.values() {
@@ -218,14 +254,17 @@ impl InteractiveReporter {
                         });
 
                     let pb = if let Some(total) = fetch_total {
-                        let bar = self.multi.add(ProgressBar::new(total as u64));
+                        // Create progress bar with known total, insert before save bar if exists
+                        let bar = ProgressBar::new(total as u64);
+                        let bar = if let Some(ref save_bar) = state.save_bar {
+                            self.multi.insert_before(save_bar, bar)
+                        } else {
+                            self.multi.add(bar)
+                        };
                         bar.set_style(Self::bar_style());
                         bar
                     } else {
-                        let bar = self.multi.add(ProgressBar::new_spinner());
-                        bar.set_style(Self::filter_style());
-                        bar.enable_steady_tick(std::time::Duration::from_millis(100));
-                        bar
+                        self.create_filter_bar(&state, true)
                     };
                     pb.set_prefix(format!("{:12}", "Filtering"));
                     state.filter_bar = Some(pb);
@@ -300,7 +339,13 @@ impl InteractiveReporter {
             SyncProgress::ModelsReady { count } => {
                 // Create save bar with known count
                 if state.save_bar.is_none() && count > 0 {
-                    let pb = self.multi.add(ProgressBar::new(count as u64));
+                    // Insert after filter bar if it exists
+                    let pb = ProgressBar::new(count as u64);
+                    let pb = if let Some(ref filter_bar) = state.filter_bar {
+                        self.multi.insert_after(filter_bar, pb)
+                    } else {
+                        self.multi.add(pb)
+                    };
                     pb.set_style(Self::bar_style());
                     pb.set_prefix(format!("{:12}", "Saving"));
                     pb.set_message("Saving to database...");
