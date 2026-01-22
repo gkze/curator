@@ -4,4 +4,5 @@ pub mod api_cache;
 pub mod code_platform;
 pub mod code_repository;
 pub mod code_visibility;
+pub mod platform_metadata;
 pub mod prelude;

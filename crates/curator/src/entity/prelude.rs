@@ -10,3 +10,6 @@ pub use super::code_repository::{
     Entity as CodeRepository, Model as CodeRepositoryModel,
 };
 pub use super::code_visibility::CodeVisibility;
+pub use super::platform_metadata::{
+    GitHubMetadata, GitLabMetadata, GiteaMetadata, PlatformMetadata,
+};
