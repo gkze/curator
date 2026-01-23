@@ -16,11 +16,22 @@ use crate::shutdown::is_shutdown_requested;
 /// Balances memory usage with database round-trip efficiency.
 const PERSIST_BATCH_SIZE: usize = 100;
 
+/// Maximum time to wait before flushing a partial batch.
+/// This prevents deadlocks when the upstream pipeline blocks waiting for channel capacity.
+/// A partial batch blocking for too long can cause backpressure that blocks the fetch task,
+/// which prevents channels from closing, which prevents the persist task from flushing.
+const PERSIST_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Number of retry attempts for database writes.
 const PERSIST_RETRY_ATTEMPTS: u32 = 3;
 
 /// Initial backoff delay in milliseconds for database write retries.
 const PERSIST_RETRY_BACKOFF_MS: u64 = 100;
+
+/// Channel buffer size for streaming repository models.
+/// Larger buffers reduce backpressure likelihood. The time-based flushing in the persist
+/// task is the primary deadlock prevention, but larger buffers help avoid the situation.
+pub const MODEL_CHANNEL_BUFFER_SIZE: usize = 500;
 
 /// Result of a persist task, including saved count and any errors encountered.
 #[derive(Debug, Default)]
@@ -144,6 +155,11 @@ pub(crate) fn spawn_persist_task(
             }};
         }
 
+        // Track when we last received an item to implement time-based flushing.
+        // This prevents deadlocks: if the upstream pipeline blocks waiting for channel
+        // capacity, we need to flush partial batches to relieve backpressure.
+        let mut last_item_time = std::time::Instant::now();
+
         loop {
             // Check for shutdown - if requested, drain remaining items and exit
             if is_shutdown_requested() {
@@ -164,33 +180,64 @@ pub(crate) fn spawn_persist_task(
                 break;
             }
 
-            let model = rx.recv().await;
-            let channel_closed = model.is_none();
+            // Use select! to either receive a model OR timeout for time-based flushing.
+            // This prevents deadlocks where a partial batch blocks forever waiting for
+            // more items that can never arrive because the upstream is blocked.
+            let recv_result = if batch.is_empty() {
+                // No pending items, just wait for the next model
+                rx.recv().await
+            } else {
+                // Have pending items - use timeout to ensure we flush eventually
+                let timeout_duration =
+                    PERSIST_FLUSH_TIMEOUT.saturating_sub(last_item_time.elapsed());
+                tokio::select! {
+                    biased;
+                    model = rx.recv() => model,
+                    _ = tokio::time::sleep(timeout_duration) => {
+                        tracing::debug!(
+                            batch_len = batch.len(),
+                            elapsed_ms = last_item_time.elapsed().as_millis(),
+                            "Time-based flush triggered to prevent backpressure deadlock"
+                        );
+                        None // Signal timeout - will trigger flush below
+                    }
+                }
+            };
+
+            let channel_closed = recv_result.is_none() && rx.is_closed();
+            let timeout_flush = recv_result.is_none() && !rx.is_closed();
 
             if channel_closed {
                 tracing::debug!("Persist channel closed, flushing final batch");
             }
 
             // Add to batch if we received a model
-            if let Some(model) = model {
+            if let Some(model) = recv_result {
                 // SAFETY: ActiveModel always has owner/name set by to_active_model()
                 let owner = model.owner.clone().unwrap();
                 let name = model.name.clone().unwrap();
                 tracing::trace!(owner = %owner, name = %name, batch_len = batch.len(), "Received model");
                 batch_names.push((owner, name));
                 batch.push(model);
+                last_item_time = std::time::Instant::now();
             }
 
-            // Flush when batch is full OR channel is closed
-            let should_flush = batch.len() >= PERSIST_BATCH_SIZE || channel_closed;
+            // Flush when batch is full OR channel is closed OR timeout triggered
+            let should_flush = batch.len() >= PERSIST_BATCH_SIZE || channel_closed || timeout_flush;
             if should_flush && !batch.is_empty() {
-                tracing::debug!(batch_len = batch.len(), channel_closed, "Flushing batch");
+                tracing::debug!(
+                    batch_len = batch.len(),
+                    channel_closed,
+                    timeout_flush,
+                    "Flushing batch"
+                );
             }
 
             if should_flush && !batch.is_empty() {
                 let names = std::mem::take(&mut batch_names);
                 let models = std::mem::take(&mut batch);
                 flush_batch!(models, names, channel_closed);
+                last_item_time = std::time::Instant::now(); // Reset timer after flush
             }
 
             // Exit loop when channel is closed

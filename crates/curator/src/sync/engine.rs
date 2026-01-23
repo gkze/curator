@@ -663,8 +663,11 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     let channel_closed = Arc::new(AtomicBool::new(false));
     let repos_to_prune = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
 
-    // Create channel for receiving repos from the streaming fetch
-    let (repo_tx, mut repo_rx) = mpsc::channel::<PlatformRepo>(100);
+    // Create channel for receiving repos from the streaming fetch.
+    // Buffer of 500 provides headroom to reduce backpressure likelihood.
+    // The time-based flushing in the persist task is the primary deadlock prevention,
+    // but larger buffers reduce the frequency of backpressure situations.
+    let (repo_tx, mut repo_rx) = mpsc::channel::<PlatformRepo>(500);
 
     // Create channel for progress events from processor task
     // Sends (matched_count, processed_count) tuples

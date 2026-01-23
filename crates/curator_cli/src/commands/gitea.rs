@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 
 use crate::commands::limits::RateLimitInfoMessage;
 use crate::commands::shared::{
-    PersistTaskResult, await_persist_task, display_persist_errors, maybe_rate_limiter,
-    spawn_persist_task, warn_no_rate_limit,
+    MODEL_CHANNEL_BUFFER_SIZE, PersistTaskResult, await_persist_task, display_persist_errors,
+    maybe_rate_limiter, spawn_persist_task, warn_no_rate_limit,
 };
 use crate::config;
 use crate::progress::ProgressReporter;
@@ -49,7 +49,7 @@ async fn run_gitea_sync(
         let org = &orgs[0];
 
         // Set up streaming persistence (unless dry-run)
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
         let persist_handle = if !options.dry_run {
             let (handle, _counter) =
                 spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -141,7 +141,7 @@ async fn run_gitea_sync(
         // Multiple orgs - sync concurrently with streaming persistence
 
         // Set up streaming persistence (unless dry-run)
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
         let persist_handle = if !options.dry_run {
             let (handle, _counter) =
                 spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -376,7 +376,8 @@ pub(crate) async fn handle_codeberg(
                     println!("Syncing repositories for user '{}'...\n", user);
                 }
 
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -463,7 +464,8 @@ pub(crate) async fn handle_codeberg(
                     println!("Syncing repositories for {} users...\n", users.len());
                 }
 
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -620,7 +622,7 @@ pub(crate) async fn handle_codeberg(
             }
 
             // Set up streaming persistence (unless dry-run)
-            let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+            let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
             let persist_handle = if !options.dry_run {
                 let (handle, _counter) =
                     spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -856,7 +858,8 @@ pub(crate) async fn handle_gitea(
                     );
                 }
 
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -943,7 +946,8 @@ pub(crate) async fn handle_gitea(
                     );
                 }
 
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -1102,7 +1106,7 @@ pub(crate) async fn handle_gitea(
             }
 
             // Set up streaming persistence (unless dry-run)
-            let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+            let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
             let persist_handle = if !options.dry_run {
                 let (handle, _counter) =
                     spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));

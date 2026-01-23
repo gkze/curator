@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 use crate::GithubAction;
 use crate::commands::limits::{RateLimitDisplay, github_rate_limits_to_display};
 use crate::commands::shared::{
-    PersistTaskResult, await_persist_task, display_final_rate_limit, display_persist_errors,
-    maybe_rate_limiter, spawn_persist_task, warn_no_rate_limit,
+    MODEL_CHANNEL_BUFFER_SIZE, PersistTaskResult, await_persist_task, display_final_rate_limit,
+    display_persist_errors, maybe_rate_limiter, spawn_persist_task, warn_no_rate_limit,
 };
 use crate::config;
 use crate::progress::ProgressReporter;
@@ -163,7 +163,8 @@ pub(crate) async fn handle_github(
                 let org = &orgs[0];
 
                 // Set up streaming persistence (unless dry-run)
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -256,7 +257,8 @@ pub(crate) async fn handle_github(
                 // Multiple orgs - sync concurrently with streaming persistence
 
                 // Set up streaming persistence (unless dry-run)
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -439,7 +441,8 @@ pub(crate) async fn handle_github(
                 }
 
                 // Set up streaming persistence (unless dry-run)
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -526,7 +529,8 @@ pub(crate) async fn handle_github(
                 }
 
                 // Set up streaming persistence (unless dry-run)
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -693,7 +697,7 @@ pub(crate) async fn handle_github(
             }
 
             // Set up streaming persistence (unless dry-run)
-            let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+            let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
             let persist_handle = if !options.dry_run {
                 let (handle, _counter) =
                     spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));

@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use crate::GitlabAction;
 use crate::commands::limits::RateLimitInfoMessage;
 use crate::commands::shared::{
-    PersistTaskResult, await_persist_task, display_persist_errors, maybe_rate_limiter,
-    spawn_persist_task, warn_no_rate_limit,
+    MODEL_CHANNEL_BUFFER_SIZE, PersistTaskResult, await_persist_task, display_persist_errors,
+    maybe_rate_limiter, spawn_persist_task, warn_no_rate_limit,
 };
 use crate::config;
 use crate::progress::ProgressReporter;
@@ -93,7 +93,8 @@ pub(crate) async fn handle_gitlab(
                 let group = &groups[0];
 
                 // Set up streaming persistence (unless dry-run)
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -187,7 +188,8 @@ pub(crate) async fn handle_gitlab(
                 // (GitLab client doesn't implement Clone, so we can't easily parallelize)
 
                 // Set up streaming persistence (unless dry-run)
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -204,7 +206,8 @@ pub(crate) async fn handle_gitlab(
                 let mut all_errors: Vec<String> = Vec::new();
 
                 for group in &groups {
-                    let (group_tx, mut group_rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                    let (group_tx, mut group_rx) =
+                        mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
 
                     // Forward models to the main persistence channel
                     let tx_clone = tx.clone();
@@ -386,7 +389,8 @@ pub(crate) async fn handle_gitlab(
                 }
 
                 // Set up streaming persistence (unless dry-run)
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -475,7 +479,8 @@ pub(crate) async fn handle_gitlab(
                     println!("Syncing projects for {} users...\n", users.len());
                 }
 
-                let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+                let (tx, rx) =
+                    mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
                 let persist_handle = if !options.dry_run {
                     let (handle, _counter) =
                         spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
@@ -632,7 +637,7 @@ pub(crate) async fn handle_gitlab(
             }
 
             // Set up streaming persistence (unless dry-run)
-            let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(100);
+            let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
             let persist_handle = if !options.dry_run {
                 let (handle, _counter) =
                     spawn_persist_task(Arc::clone(&db), rx, Some(Arc::clone(&progress)));
