@@ -686,8 +686,12 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     let processor_prune = options.prune;
 
     let processor_handle = tokio::spawn(async move {
+        tracing::debug!("Processor task started");
         while let Some(repo) = repo_rx.recv().await {
             let new_processed = processor_processed.fetch_add(1, Ordering::Relaxed) + 1;
+            if new_processed.is_multiple_of(1000) {
+                tracing::debug!(processed = new_processed, "Processor progress");
+            }
 
             let is_active = filter::is_active_repo(&repo, cutoff);
             let new_matched = if is_active {
@@ -716,6 +720,12 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
                 }
             }
         }
+        tracing::debug!(
+            processed = processor_processed.load(Ordering::Relaxed),
+            matched = processor_matched.load(Ordering::Relaxed),
+            saved = processor_saved.load(Ordering::Relaxed),
+            "Processor task finished"
+        );
     });
 
     // Stream starred repos with concurrent progress emission
@@ -736,27 +746,36 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     let mut processor_handle = processor_handle;
 
     // Poll fetch, processor, and progress concurrently, emitting FilteredPage events in real-time
+    // Track whether progress channel is still open
+    let mut progress_channel_open = true;
+
     loop {
         tokio::select! {
             biased;
 
-            result = progress_rx.recv(), if processor_result.is_none() => {
-                if let Some((matched_count, processed_count)) = result {
-                    let should_emit = matched_count >= last_emitted_matched + 25
-                        || processed_count >= last_emitted_processed + 100
-                        || (matched_count > 0 && last_emitted_matched == 0)
-                        || (processed_count > 0 && last_emitted_processed == 0);
+            result = progress_rx.recv(), if progress_channel_open && processor_result.is_none() => {
+                match result {
+                    Some((matched_count, processed_count)) => {
+                        let should_emit = matched_count >= last_emitted_matched + 25
+                            || processed_count >= last_emitted_processed + 100
+                            || (matched_count > 0 && last_emitted_matched == 0)
+                            || (processed_count > 0 && last_emitted_processed == 0);
 
-                    if should_emit {
-                        emit(
-                            on_progress,
-                            SyncProgress::FilteredPage {
-                                matched_so_far: matched_count,
-                                processed_so_far: processed_count,
-                            },
-                        );
-                        last_emitted_matched = matched_count;
-                        last_emitted_processed = processed_count;
+                        if should_emit {
+                            emit(
+                                on_progress,
+                                SyncProgress::FilteredPage {
+                                    matched_so_far: matched_count,
+                                    processed_so_far: processed_count,
+                                },
+                            );
+                            last_emitted_matched = matched_count;
+                            last_emitted_processed = processed_count;
+                        }
+                    }
+                    None => {
+                        // Channel closed, stop polling it
+                        progress_channel_open = false;
                     }
                 }
             }
