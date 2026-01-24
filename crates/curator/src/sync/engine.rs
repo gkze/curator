@@ -37,6 +37,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use tokio::sync::{Semaphore, mpsc};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use sea_orm::DatabaseConnection;
 
@@ -672,7 +674,7 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     // Create channel for progress events from processor task
     // Sends (matched_count, processed_count) tuples
     // Use unbounded to avoid blocking processor
-    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<(usize, usize)>();
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel::<(usize, usize)>();
 
     // Spawn task to process repos as they stream in
     let processor_client = client.clone();
@@ -746,38 +748,33 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     let mut processor_handle = processor_handle;
 
     // Poll fetch, processor, and progress concurrently, emitting FilteredPage events in real-time
-    // Track whether progress channel is still open
-    let mut progress_channel_open = true;
+    // Wrap receiver in a stream for idiomatic async handling
+    let mut progress_stream = UnboundedReceiverStream::new(progress_rx).fuse();
 
     loop {
         tokio::select! {
             biased;
 
-            result = progress_rx.recv(), if progress_channel_open && processor_result.is_none() => {
-                match result {
-                    Some((matched_count, processed_count)) => {
-                        let should_emit = matched_count >= last_emitted_matched + 25
-                            || processed_count >= last_emitted_processed + 100
-                            || (matched_count > 0 && last_emitted_matched == 0)
-                            || (processed_count > 0 && last_emitted_processed == 0);
+            result = progress_stream.next(), if processor_result.is_none() => {
+                if let Some((matched_count, processed_count)) = result {
+                    let should_emit = matched_count >= last_emitted_matched + 25
+                        || processed_count >= last_emitted_processed + 100
+                        || (matched_count > 0 && last_emitted_matched == 0)
+                        || (processed_count > 0 && last_emitted_processed == 0);
 
-                        if should_emit {
-                            emit(
-                                on_progress,
-                                SyncProgress::FilteredPage {
-                                    matched_so_far: matched_count,
-                                    processed_so_far: processed_count,
-                                },
-                            );
-                            last_emitted_matched = matched_count;
-                            last_emitted_processed = processed_count;
-                        }
-                    }
-                    None => {
-                        // Channel closed, stop polling it
-                        progress_channel_open = false;
+                    if should_emit {
+                        emit(
+                            on_progress,
+                            SyncProgress::FilteredPage {
+                                matched_so_far: matched_count,
+                                processed_so_far: processed_count,
+                            },
+                        );
+                        last_emitted_matched = matched_count;
+                        last_emitted_processed = processed_count;
                     }
                 }
+                // When result is None, stream is exhausted - fuse() prevents re-polling
             }
 
             result = fetch_future.as_mut(), if !fetch_done => {
@@ -791,7 +788,9 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
         }
 
         if fetch_done && processor_result.is_some() {
-            while let Ok((matched_count, processed_count)) = progress_rx.try_recv() {
+            // Drain any remaining buffered progress messages.
+            // Since processor finished, the sender is dropped and stream won't block.
+            while let Some((matched_count, processed_count)) = progress_stream.next().await {
                 let should_emit = matched_count >= last_emitted_matched + 25
                     || processed_count >= last_emitted_processed + 100
                     || (matched_count > 0 && last_emitted_matched == 0)
