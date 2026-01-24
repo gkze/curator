@@ -352,164 +352,26 @@ impl GitHubClient {
         db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
-        use crate::api_cache;
-        use crate::entity::api_cache::EndpointType;
+        use super::pagination::PaginatedFetchConfig;
         use crate::repository;
-
-        let mut all_repos = Vec::new();
-        let mut page = 1u32;
-        let mut stats = CacheStats::default();
-        let mut known_total_pages: Option<u32> = None;
-        let mut all_cache_hits = true; // Track if ALL pages were cache hits
-
-        // Try to get stored total_pages from the database (from previous sync)
-        if let Some(db) = db
-            && let Ok(Some(stored_total)) =
-                api_cache::get_total_pages(db, CodePlatform::GitHub, EndpointType::OrgRepos, org)
-                    .await
-        {
-            known_total_pages = Some(stored_total as u32);
-        }
 
         // Get org info to know total repos upfront
         let org_info = self.get_org_info(org).await.ok();
         let total_repos = org_info.as_ref().map(|i| i.public_repos);
 
-        // Calculate expected pages from org info if we don't have stored pagination
-        let expected_pages =
-            known_total_pages.or_else(|| total_repos.map(|t| t.div_ceil(100) as u32));
+        let config = PaginatedFetchConfig::org_repos(org, total_repos);
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
-                namespace: org.to_string(),
-                total_repos,
-                expected_pages,
-            });
-        }
+        let result = self
+            .fetch_pages::<octocrab::models::Repository>(&config, db, on_progress)
+            .await?;
 
-        loop {
-            // Check rate limit before making request
-            check_rate_limit(&self.inner)
-                .await
-                .map_err(PlatformError::from)?;
+        // Convert to PlatformRepo
+        let repos: Vec<PlatformRepo> = result.items.iter().map(to_platform_repo).collect();
 
-            let route = format!("/orgs/{}/repos?per_page=100&page={}", org, page);
-            let cache_key = format!("{}/page/{}", org, page);
-
-            // Try to get cached ETag
-            let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(db, CodePlatform::GitHub, EndpointType::OrgRepos, &cache_key)
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
-
-            // Make conditional request
-            let result: FetchResult<Vec<octocrab::models::Repository>> = self
-                .get_conditional(&route, cached_etag.as_deref())
-                .await
-                .map_err(PlatformError::from)?;
-
-            match result {
-                FetchResult::NotModified => {
-                    // Cache hit - data unchanged
-                    stats.cache_hits += 1;
-
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchedPage {
-                            page,
-                            count: 0, // Data cached, no new repos from this page
-                            total_so_far: all_repos.len(),
-                            expected_pages: known_total_pages,
-                        });
-                    }
-
-                    // Check if we should continue to the next page
-                    if let Some(total) = known_total_pages
-                        && page < total
-                    {
-                        page += 1;
-                        continue;
-                    }
-                    // If we don't know total pages and hit cache, we're done
-                    // (can't know if there are more pages)
-                    break;
-                }
-                FetchResult::Fetched {
-                    data: repos,
-                    etag,
-                    pagination,
-                } => {
-                    // At least one page had fresh data, so not a full cache hit
-                    all_cache_hits = false;
-                    stats.pages_fetched += 1;
-                    let count = repos.len();
-
-                    // Update known total pages from Link header
-                    if let Some(total) = pagination.total_pages() {
-                        known_total_pages = Some(total);
-                    }
-
-                    // Store new ETag and pagination info if we have a database connection
-                    if let Some(db) = db {
-                        // For page 1, store total_pages along with ETag
-                        let total_pages_to_store = if page == 1 {
-                            known_total_pages.map(|t| t as i32)
-                        } else {
-                            None
-                        };
-
-                        let _ = api_cache::upsert_with_pagination(
-                            db,
-                            CodePlatform::GitHub,
-                            EndpointType::OrgRepos,
-                            &cache_key,
-                            etag,
-                            total_pages_to_store,
-                        )
-                        .await;
-                    }
-
-                    // Convert to PlatformRepo
-                    let platform_repos: Vec<PlatformRepo> =
-                        repos.iter().map(to_platform_repo).collect();
-                    all_repos.extend(platform_repos);
-
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchedPage {
-                            page,
-                            count,
-                            total_so_far: all_repos.len(),
-                            expected_pages: known_total_pages,
-                        });
-                    }
-
-                    // Check if we should continue
-                    if let Some(total) = known_total_pages {
-                        if page < total {
-                            page += 1;
-                            continue;
-                        }
-                        // Reached known last page
-                        break;
-                    }
-
-                    // No pagination info - use count-based heuristic
-                    if count < 100 {
-                        break;
-                    }
-
-                    page += 1;
-                }
-            }
-        }
-
-        // If ALL pages were cache hits and we have no repos, load from database
-        if all_cache_hits
-            && all_repos.is_empty()
-            && stats.cache_hits > 0
+        // If all pages were cache hits and we got no repos, load from database
+        if result.all_cache_hits
+            && repos.is_empty()
+            && result.stats.cache_hits > 0
             && let Some(db) = db
         {
             let cached_repos =
@@ -518,35 +380,23 @@ impl GitHubClient {
                     .map_err(|e| PlatformError::internal(e.to_string()))?;
 
             if !cached_repos.is_empty() {
-                let cached_count = cached_repos.len();
-
-                // Emit cache hit event
                 if let Some(cb) = on_progress {
                     cb(SyncProgress::CacheHit {
                         namespace: org.to_string(),
-                        cached_count,
+                        cached_count: cached_repos.len(),
+                    });
+                    cb(SyncProgress::FetchComplete {
+                        total: cached_repos.len(),
                     });
                 }
 
-                // Convert cached models to PlatformRepo
                 let repos: Vec<PlatformRepo> =
                     cached_repos.iter().map(PlatformRepo::from_model).collect();
-
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::FetchComplete { total: repos.len() });
-                }
-
-                return Ok((repos, stats));
+                return Ok((repos, result.stats));
             }
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
-                total: all_repos.len(),
-            });
-        }
-
-        Ok((all_repos, stats))
+        Ok((repos, result.stats))
     }
 
     /// List starred repositories with ETag caching support.
@@ -577,160 +427,23 @@ impl GitHubClient {
         skip_rate_checks: bool,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
-        use crate::api_cache;
-        use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
+        use super::pagination::PaginatedFetchConfig;
         use crate::repository;
 
-        let mut all_repos = Vec::new();
-        let mut page = 1u32;
-        let mut stats = CacheStats::default();
-        let mut known_total_pages: Option<u32> = None;
-        let mut all_cache_hits = true;
+        let config =
+            PaginatedFetchConfig::starred(username).with_skip_rate_checks(skip_rate_checks);
 
-        // Try to get stored total_pages from the database (from previous sync)
-        if let Some(db) = db
-            && let Ok(Some(stored_total)) = api_cache::get_total_pages(
-                db,
-                CodePlatform::GitHub,
-                EndpointType::Starred,
-                username,
-            )
-            .await
-        {
-            known_total_pages = Some(stored_total as u32);
-        }
+        let result = self
+            .fetch_pages::<octocrab::models::Repository>(&config, db, on_progress)
+            .await?;
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
-                namespace: "starred".to_string(),
-                total_repos: None,
-                expected_pages: known_total_pages,
-            });
-        }
+        // Convert to PlatformRepo
+        let repos: Vec<PlatformRepo> = result.items.iter().map(to_platform_repo).collect();
 
-        loop {
-            // Check rate limit before making request
-            if !skip_rate_checks {
-                check_rate_limit(&self.inner)
-                    .await
-                    .map_err(PlatformError::from)?;
-            }
-
-            let route = format!("/user/starred?per_page=100&page={}", page);
-            let cache_key = ApiCacheModel::starred_key(username, page);
-
-            // Try to get cached ETag
-            let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(db, CodePlatform::GitHub, EndpointType::Starred, &cache_key)
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
-
-            // Make conditional request
-            let result: FetchResult<Vec<octocrab::models::Repository>> = self
-                .get_conditional(&route, cached_etag.as_deref())
-                .await
-                .map_err(PlatformError::from)?;
-
-            match result {
-                FetchResult::NotModified => {
-                    // Cache hit - data unchanged
-                    stats.cache_hits += 1;
-
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchedPage {
-                            page,
-                            count: 0, // Data cached, no new repos from this page
-                            total_so_far: all_repos.len(),
-                            expected_pages: known_total_pages,
-                        });
-                    }
-
-                    // Check if we should continue to the next page
-                    if let Some(total) = known_total_pages
-                        && page < total
-                    {
-                        page += 1;
-                        continue;
-                    }
-                    // If we don't know total pages and hit cache, we're done
-                    // (can't know if there are more pages)
-                    break;
-                }
-                FetchResult::Fetched {
-                    data: repos,
-                    etag,
-                    pagination,
-                } => {
-                    all_cache_hits = false;
-                    stats.pages_fetched += 1;
-                    let count = repos.len();
-
-                    // Update known total pages from Link header
-                    if let Some(total) = pagination.total_pages() {
-                        known_total_pages = Some(total);
-                    }
-
-                    // Store new ETag and pagination info if we have a database connection
-                    if let Some(db) = db {
-                        // For page 1, store total_pages along with ETag
-                        let total_pages_to_store = if page == 1 {
-                            known_total_pages.map(|t| t as i32)
-                        } else {
-                            None
-                        };
-
-                        let _ = api_cache::upsert_with_pagination(
-                            db,
-                            CodePlatform::GitHub,
-                            EndpointType::Starred,
-                            &cache_key,
-                            etag,
-                            total_pages_to_store,
-                        )
-                        .await;
-                    }
-
-                    // Convert to PlatformRepo
-                    let platform_repos: Vec<PlatformRepo> =
-                        repos.iter().map(to_platform_repo).collect();
-                    all_repos.extend(platform_repos);
-
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchedPage {
-                            page,
-                            count,
-                            total_so_far: all_repos.len(),
-                            expected_pages: known_total_pages,
-                        });
-                    }
-
-                    // Check if we should continue
-                    if let Some(total) = known_total_pages {
-                        if page < total {
-                            page += 1;
-                            continue;
-                        }
-                        // Reached known last page
-                        break;
-                    }
-
-                    // No pagination info - use count-based heuristic
-                    if count < 100 {
-                        break;
-                    }
-
-                    page += 1;
-                }
-            }
-        }
-
-        if all_cache_hits
-            && all_repos.is_empty()
-            && stats.cache_hits > 0
+        // If all pages were cache hits and we got no repos, load from database
+        if result.all_cache_hits
+            && repos.is_empty()
+            && result.stats.cache_hits > 0
             && let Some(db) = db
         {
             let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitHub)
@@ -738,33 +451,23 @@ impl GitHubClient {
                 .map_err(|e| PlatformError::internal(e.to_string()))?;
 
             if !cached_repos.is_empty() {
-                let cached_count = cached_repos.len();
-
                 if let Some(cb) = on_progress {
                     cb(SyncProgress::CacheHit {
                         namespace: "starred".to_string(),
-                        cached_count,
+                        cached_count: cached_repos.len(),
+                    });
+                    cb(SyncProgress::FetchComplete {
+                        total: cached_repos.len(),
                     });
                 }
 
                 let repos: Vec<PlatformRepo> =
                     cached_repos.iter().map(PlatformRepo::from_model).collect();
-
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::FetchComplete { total: repos.len() });
-                }
-
-                return Ok((repos, stats));
+                return Ok((repos, result.stats));
             }
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
-                total: all_repos.len(),
-            });
-        }
-
-        Ok((all_repos, stats))
+        Ok((repos, result.stats))
     }
 }
 
