@@ -44,3 +44,6 @@ directories = "6"
 open = "5.3"
 arboard = "3.4"
 toml_edit = "0.22"
+
+[lints]
+workspace = true

@@ -8,7 +8,8 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        self.create_code_repositories(manager).await?;
+        // Box::pin to avoid large future on the stack (30KB+)
+        Box::pin(self.create_code_repositories(manager)).await?;
         self.create_api_cache(manager).await?;
         Ok(())
     }

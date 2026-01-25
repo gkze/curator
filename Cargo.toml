@@ -8,6 +8,23 @@ version = "0.1.7"
 [workspace.metadata.crane]
 name = "curator"
 
+# Workspace-wide lints for async safety and code quality
+[workspace.lints.rust]
+# Ensure critical types are not silently ignored
+unused_must_use = "warn"
+
+[workspace.lints.clippy]
+# Async-specific lints to catch common issues
+async_yields_async = "warn"    # Warn when async block yields another future
+large_futures = "warn"         # Warn when futures are too large (stack overflow risk)
+redundant_async_block = "warn" # Unnecessary async blocks
+
+# General code quality - these are aspirational, allow for now to avoid noise
+# TODO: Enable and fix these incrementally
+must_use_candidate = "allow" # Suggest #[must_use] where appropriate (many hits)
+missing_errors_doc = "allow" # Document error conditions (79+ functions need docs)
+missing_panics_doc = "allow" # Document panic conditions
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

@@ -72,7 +72,11 @@ pub const PERSIST_RETRY_BACKOFF_MS: u64 = 100;
 pub const MODEL_CHANNEL_BUFFER_SIZE: usize = 500;
 
 /// Result of a persist task, including saved count and any errors encountered.
+///
+/// This type should not be silently ignored as it contains error information
+/// that may need to be displayed or logged.
 #[derive(Debug, Default)]
+#[must_use = "PersistTaskResult may contain errors that should be checked"]
 pub struct PersistTaskResult {
     /// Number of repositories successfully saved to database.
     pub saved_count: usize,

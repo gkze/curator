@@ -25,7 +25,11 @@ pub const INITIAL_BACKOFF_MS: u64 = 1_000;
 pub const MAX_STAR_RETRIES: u32 = 5;
 
 /// Result of a sync operation.
+///
+/// This type should not be silently ignored as it contains error information
+/// and important statistics about the sync operation.
 #[derive(Debug, Default)]
+#[must_use = "SyncResult may contain errors that should be checked"]
 pub struct SyncResult {
     /// Number of repositories processed.
     pub processed: usize,
@@ -83,7 +87,11 @@ impl Default for SyncOptions {
 }
 
 /// Result of syncing a single namespace.
+///
+/// This type should not be silently ignored as it may contain an error
+/// indicating the namespace sync failed entirely.
 #[derive(Debug)]
+#[must_use = "NamespaceSyncResult may contain errors that should be checked"]
 pub struct NamespaceSyncResult {
     /// The namespace name/path.
     pub namespace: String,
@@ -98,7 +106,10 @@ pub struct NamespaceSyncResult {
 /// Result of syncing a single namespace (streaming version).
 ///
 /// This version doesn't include models since they're sent via channel.
+/// This type should not be silently ignored as it may contain an error
+/// indicating the namespace sync failed entirely.
 #[derive(Debug)]
+#[must_use = "NamespaceSyncResultStreaming may contain errors that should be checked"]
 pub struct NamespaceSyncResultStreaming {
     /// The namespace name/path.
     pub namespace: String,
@@ -120,7 +131,11 @@ pub enum StarResult {
 }
 
 /// Result of a batch starring operation.
+///
+/// This type should not be silently ignored as it contains error information
+/// about failed starring operations.
 #[derive(Debug, Default)]
+#[must_use = "StarringStats may contain errors that should be checked"]
 pub struct StarringStats {
     /// Number of repositories successfully starred.
     pub starred: usize,

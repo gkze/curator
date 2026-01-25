@@ -442,7 +442,10 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
 /// Result of a streaming sync operation.
 ///
 /// Combines the sync result with persistence information.
+/// This type should not be silently ignored as it contains error information
+/// from both the sync and persistence operations.
 #[derive(Debug)]
+#[must_use = "SyncStreamingResult may contain errors that should be checked"]
 pub struct SyncStreamingResult {
     /// The sync operation result (processed, matched, starred, etc.)
     pub sync: SyncResult,
