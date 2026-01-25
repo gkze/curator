@@ -469,6 +469,87 @@ impl GitHubClient {
 
         Ok((repos, result.stats))
     }
+
+    /// List user repositories with ETag caching support.
+    ///
+    /// This method supports conditional requests using ETags to avoid
+    /// refetching unchanged data. When a database connection is provided,
+    /// it will:
+    /// - Check for cached ETags before each page fetch
+    /// - Skip fetching if the server returns 304 Not Modified
+    /// - Store new ETags and pagination info after successful fetches
+    /// - Continue checking all pages using stored pagination metadata
+    ///
+    /// # Arguments
+    ///
+    /// * `username` - The username whose repositories to fetch
+    /// * `db` - Optional database connection for ETag caching
+    /// * `on_progress` - Optional progress callback
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(repos, cache_stats)` where `cache_stats` indicates
+    /// how many pages were cache hits vs fetched.
+    pub async fn list_user_repos_cached(
+        &self,
+        username: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
+        use super::pagination::PaginatedFetchConfig;
+        use crate::repository;
+
+        // Get user info to know total repos upfront
+        let user_info: Option<serde_json::Value> = self
+            .inner
+            .get(format!("/users/{}", username), None::<&()>)
+            .await
+            .ok();
+        let total_repos = user_info
+            .as_ref()
+            .and_then(|u| u.get("public_repos"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let config = PaginatedFetchConfig::user_repos(username, total_repos);
+
+        let result = self
+            .fetch_pages::<octocrab::models::Repository>(&config, db, on_progress)
+            .await?;
+
+        // Convert to PlatformRepo
+        let repos: Vec<PlatformRepo> = result.items.iter().map(to_platform_repo).collect();
+
+        // If all pages were cache hits and we got no repos, load from database
+        if result.all_cache_hits
+            && repos.is_empty()
+            && result.stats.cache_hits > 0
+            && let Some(db) = db
+        {
+            let cached_repos =
+                repository::find_all_by_platform_and_owner(db, CodePlatform::GitHub, username)
+                    .await
+                    .map_err(|e| PlatformError::internal(e.to_string()))?;
+
+            if !cached_repos.is_empty() {
+                if let Some(cb) = on_progress {
+                    cb(SyncProgress::CacheHit {
+                        namespace: username.to_string(),
+                        cached_count: cached_repos.len(),
+                    });
+                    cb(SyncProgress::FetchComplete {
+                        total: cached_repos.len(),
+                    });
+                }
+
+                let repos: Vec<PlatformRepo> =
+                    cached_repos.iter().map(PlatformRepo::from_model).collect();
+                return Ok((repos, result.stats));
+            }
+        }
+
+        Ok((repos, result.stats))
+    }
 }
 
 /// Statistics about cache usage during a fetch operation.
@@ -634,10 +715,18 @@ impl PlatformClient for GitHubClient {
     async fn list_user_repos(
         &self,
         username: &str,
-        _db: Option<&sea_orm::DatabaseConnection>,
+        db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
-        // TODO: Implement caching for user repos similar to org repos (see beads issue curator-1tx)
+        // Use cached version if database connection is provided
+        if let Some(db) = db {
+            let (repos, _stats) = self
+                .list_user_repos_cached(username, Some(db), on_progress)
+                .await?;
+            return Ok(repos);
+        }
+
+        // Non-cached fallback
         let mut all_repos = Vec::new();
         let mut page = 1u32;
 

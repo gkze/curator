@@ -74,14 +74,6 @@ async fn sync_repos<C: PlatformClient + Clone + 'static>(
         },
     );
 
-    emit(
-        on_progress,
-        SyncProgress::FilteredPage {
-            matched_so_far: 0,
-            processed_so_far: 0,
-        },
-    );
-
     let active_repos = filter::filter_by_activity(&repos, options.active_within);
     result.matched = active_repos.len();
 
