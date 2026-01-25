@@ -706,7 +706,6 @@ dependencies = [
  "serde_json",
  "tabled",
  "tokio",
- "tokio-stream",
  "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",

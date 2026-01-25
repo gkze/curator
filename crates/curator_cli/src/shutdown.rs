@@ -1,23 +1,28 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use console::Term;
 
 /// Global shutdown flag for graceful termination.
+/// Uses Arc so it can be shared with spawned tasks in the library.
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+pub(crate) static SHUTDOWN_FLAG: std::sync::LazyLock<Arc<AtomicBool>> =
+    std::sync::LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 
 /// Check if shutdown has been requested.
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 #[inline]
 pub(crate) fn is_shutdown_requested() -> bool {
-    SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+    SHUTDOWN_FLAG.load(Ordering::Acquire)
 }
 
 /// Request shutdown.
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 #[inline]
 fn request_shutdown() {
-    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+    SHUTDOWN_FLAG.store(true, Ordering::Release);
 }
 
 /// Set up the Ctrl+C handler for graceful shutdown.

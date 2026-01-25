@@ -8,8 +8,10 @@
 //! - [`types`] - Core types: `SyncResult`, `SyncOptions`, constants
 //! - [`progress`] - Progress reporting: `SyncProgress`, `ProgressCallback`, `emit()`
 //! - [`engine`] - Unified sync engine: `sync_namespace()`, `sync_namespaces_streaming()`
+//! - [`context`] - Builder pattern for sync operations: `SyncContext`
+//! - [`persist_task`] - Background persistence task with batching and retry
 //!
-//! # Example
+//! # Example (Classic API)
 //!
 //! ```ignore
 //! use curator::sync::{SyncOptions, SyncProgress, emit, sync_namespace};
@@ -22,8 +24,30 @@
 //!     println!("Synced {} repos", result.matched);
 //! }
 //! ```
+//!
+//! # Example (Builder API)
+//!
+//! ```ignore
+//! use curator::sync::{SyncContext, SyncOptions};
+//! use curator::platform::ApiRateLimiter;
+//!
+//! async fn sync_with_context(client: GitHubClient, db: Arc<DatabaseConnection>) {
+//!     let ctx = SyncContext::builder()
+//!         .client(client)
+//!         .options(SyncOptions::default())
+//!         .rate_limiter(ApiRateLimiter::new(5))
+//!         .database(db)
+//!         .build()
+//!         .unwrap();
+//!
+//!     let result = ctx.sync_namespace_streaming("rust-lang").await?;
+//!     println!("Synced {} repos, saved {}", result.sync.matched, result.persist.saved_count);
+//! }
+//! ```
 
+pub mod context;
 pub mod engine;
+pub mod persist_task;
 mod progress;
 mod types;
 
@@ -47,4 +71,14 @@ pub use engine::{
     filter_by_activity, sync_namespace, sync_namespace_streaming, sync_namespaces,
     sync_namespaces_streaming, sync_starred_streaming, sync_user, sync_user_streaming,
     sync_users_streaming,
+};
+
+// Re-export context types
+pub use context::{SyncContext, SyncContextBuilder, SyncContextError, SyncStreamingResult};
+
+// Re-export persist task types
+pub use persist_task::{
+    MODEL_CHANNEL_BUFFER_SIZE, PERSIST_BATCH_SIZE, PERSIST_FLUSH_TIMEOUT, PERSIST_RETRY_ATTEMPTS,
+    PERSIST_RETRY_BACKOFF_MS, PersistTaskResult, await_persist_task, create_model_channel,
+    display_persist_errors, spawn_persist_task,
 };

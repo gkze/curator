@@ -750,12 +750,15 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     // Poll fetch, processor, and progress concurrently, emitting FilteredPage events in real-time
     // Wrap receiver in a stream for idiomatic async handling
     let mut progress_stream = UnboundedReceiverStream::new(progress_rx).fuse();
+    // Track when progress stream is exhausted to avoid spinning on fused stream
+    // (fused streams return Ready(None) immediately, which would cause a spin loop)
+    let mut progress_stream_done = false;
 
     loop {
         tokio::select! {
             biased;
 
-            result = progress_stream.next(), if processor_result.is_none() => {
+            result = progress_stream.next(), if processor_result.is_none() && !progress_stream_done => {
                 if let Some((matched_count, processed_count)) = result {
                     let should_emit = matched_count >= last_emitted_matched + 25
                         || processed_count >= last_emitted_processed + 100
@@ -773,8 +776,10 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
                         last_emitted_matched = matched_count;
                         last_emitted_processed = processed_count;
                     }
+                } else {
+                    // Stream exhausted (sender dropped), disable this branch to avoid spinning
+                    progress_stream_done = true;
                 }
-                // When result is None, stream is exhausted - fuse() prevents re-polling
             }
 
             result = fetch_future.as_mut(), if !fetch_done => {
