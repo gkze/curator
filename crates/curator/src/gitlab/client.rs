@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use backon::Retryable;
 use chrono::Utc;
 use gitlab::api::{self, AsyncQuery, Pagination};
 use gitlab::{AsyncGitlab, GitlabBuilder};
@@ -18,7 +17,7 @@ use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{
     self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
 };
-use crate::retry::default_backoff;
+use crate::retry::with_retry;
 use crate::sync::SyncProgress;
 
 /// GitLab API client wrapper with Arc<Mutex<>> for cloneability.
@@ -428,7 +427,7 @@ impl PlatformClient for GitLabClient {
     ) -> platform::Result<bool> {
         let full_path = format!("{}/{}", owner, name);
 
-        // Look up project ID first
+        // Look up project ID first (before retry loop)
         let endpoint = gitlab::api::projects::Project::builder()
             .project(&full_path)
             .build()
@@ -444,38 +443,18 @@ impl PlatformClient for GitLabClient {
         let project_id = project.id;
         let client = self.clone();
 
-        // Track attempt number for progress reporting
-        let attempt = std::sync::atomic::AtomicU32::new(0);
+        // GitLab uses full_path as owner and empty name for progress reporting
+        let result = with_retry(
+            || async { client.star_project(project_id).await },
+            is_rate_limit_error,
+            short_error_message,
+            &full_path,
+            "",
+            on_progress,
+        )
+        .await
+        .map_err(PlatformError::from)?;
 
-        let star_op = || async {
-            attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            client.star_project(project_id).await
-        };
-
-        let result = star_op
-            .retry(default_backoff())
-            .notify(|err, dur| {
-                let current_attempt = attempt.load(std::sync::atomic::Ordering::SeqCst);
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::RateLimitBackoff {
-                        owner: full_path.clone(),
-                        name: String::new(),
-                        retry_after_ms: dur.as_millis() as u64,
-                        attempt: current_attempt,
-                    });
-                }
-                tracing::debug!(
-                    "Rate limited on {}, retrying in {:?} (attempt {}): {}",
-                    full_path,
-                    dur,
-                    current_attempt,
-                    short_error_message(err)
-                );
-            })
-            .when(is_rate_limit_error)
-            .await;
-
-        let result = result.map_err(PlatformError::from)?;
         self.clear_starred_cache().await;
         Ok(result)
     }

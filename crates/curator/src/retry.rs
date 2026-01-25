@@ -3,11 +3,14 @@
 //! This module provides common retry configuration and utilities used across
 //! all platform integrations (GitHub, GitLab, Gitea).
 
+use std::future::Future;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use backon::ExponentialBuilder;
+use backon::{ExponentialBuilder, Retryable};
 
-use crate::sync::{INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, MAX_STAR_RETRIES};
+use crate::platform::ProgressCallback;
+use crate::sync::{INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, MAX_STAR_RETRIES, SyncProgress};
 
 /// Configuration for retry operations.
 #[derive(Debug, Clone)]
@@ -90,6 +93,89 @@ impl RetryConfig {
 #[must_use]
 pub fn default_backoff() -> ExponentialBuilder {
     RetryConfig::default().into_backoff()
+}
+
+/// Execute an operation with automatic retry on rate limit errors.
+///
+/// This function provides a common retry pattern used across all platform clients:
+/// - Tracks retry attempts with an atomic counter
+/// - Uses exponential backoff with jitter
+/// - Reports progress via callback on each retry
+/// - Logs retry attempts with debug-level tracing
+///
+/// # Arguments
+///
+/// * `operation` - The async operation to retry. Must be a closure that returns a `Future`.
+/// * `is_rate_limit` - A function that checks if an error is a rate limit error (retryable).
+/// * `short_message` - A function that extracts a short error message for logging.
+/// * `owner` - The owner/namespace for progress reporting.
+/// * `name` - The repository name for progress reporting.
+/// * `on_progress` - Optional callback for reporting retry progress.
+///
+/// # Example
+///
+/// ```ignore
+/// use curator::retry::with_retry;
+/// use curator::github::error::{GitHubError, is_rate_limit_error_from_github, short_error_message};
+///
+/// let result = with_retry(
+///     || async { client.star_repo(owner, name).await },
+///     is_rate_limit_error_from_github,
+///     short_error_message,
+///     "owner",
+///     "repo",
+///     Some(&progress_callback),
+/// ).await;
+/// ```
+pub async fn with_retry<T, E, F, Fut, IsRateLimit, ShortMsg>(
+    mut operation: F,
+    is_rate_limit: IsRateLimit,
+    short_message: ShortMsg,
+    owner: &str,
+    name: &str,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+    IsRateLimit: Fn(&E) -> bool + Send + Sync + 'static,
+    ShortMsg: Fn(&E) -> String + Send + Sync + 'static,
+{
+    let owner_str = owner.to_string();
+    let name_str = name.to_string();
+
+    // Track attempt number for progress reporting
+    let attempt = AtomicU32::new(0);
+
+    let retry_op = || {
+        attempt.fetch_add(1, Ordering::SeqCst);
+        operation()
+    };
+
+    retry_op
+        .retry(default_backoff())
+        .notify(|err, dur| {
+            let current_attempt = attempt.load(Ordering::SeqCst);
+            if let Some(cb) = on_progress {
+                cb(SyncProgress::RateLimitBackoff {
+                    owner: owner_str.clone(),
+                    name: name_str.clone(),
+                    retry_after_ms: dur.as_millis() as u64,
+                    attempt: current_attempt,
+                });
+            }
+            tracing::debug!(
+                "Rate limited on {}/{}, retrying in {:?} (attempt {}): {}",
+                owner_str,
+                name_str,
+                dur,
+                current_attempt,
+                short_message(err)
+            );
+        })
+        .when(is_rate_limit)
+        .await
 }
 
 #[cfg(test)]

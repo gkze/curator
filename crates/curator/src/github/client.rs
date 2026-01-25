@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use backon::Retryable;
 use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
 use reqwest::StatusCode;
@@ -18,7 +17,7 @@ use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{
     self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
 };
-use crate::retry::default_backoff;
+use crate::retry::with_retry;
 use crate::sync::SyncProgress;
 
 /// Extract ETag from response headers.
@@ -853,45 +852,24 @@ impl PlatformClient for GitHubClient {
         let name_str = name.to_string();
         let client = self.inner.clone();
 
-        // Track attempt number for progress reporting
-        let attempt = std::sync::atomic::AtomicU32::new(0);
-
-        let star_op = || async {
-            attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            // PUT /user/starred/{owner}/{repo}
-            let route = format!("/user/starred/{}/{}", owner_str, name_str);
-            client
-                ._put(&route, None::<&()>)
-                .await
-                .map_err(GitHubError::Api)
-        };
-
-        let result = star_op
-            .retry(default_backoff())
-            .notify(|err, dur| {
-                let current_attempt = attempt.load(std::sync::atomic::Ordering::SeqCst);
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::RateLimitBackoff {
-                        owner: owner.to_string(),
-                        name: name.to_string(),
-                        retry_after_ms: dur.as_millis() as u64,
-                        attempt: current_attempt,
-                    });
-                }
-                tracing::debug!(
-                    "Rate limited on {}/{}, retrying in {:?} (attempt {}): {}",
-                    owner_str,
-                    name_str,
-                    dur,
-                    current_attempt,
-                    short_error_message(err)
-                );
-            })
-            .when(is_rate_limit_error_from_github)
-            .await;
-
-        result.map(|_| true).map_err(PlatformError::from)
+        with_retry(
+            || async {
+                // PUT /user/starred/{owner}/{repo}
+                let route = format!("/user/starred/{}/{}", owner_str, name_str);
+                client
+                    ._put(&route, None::<&()>)
+                    .await
+                    .map_err(GitHubError::Api)
+            },
+            is_rate_limit_error_from_github,
+            short_error_message,
+            owner,
+            name,
+            on_progress,
+        )
+        .await
+        .map(|_| true)
+        .map_err(PlatformError::from)
     }
 
     async fn unstar_repo(&self, owner: &str, name: &str) -> platform::Result<bool> {

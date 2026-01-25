@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
-use backon::Retryable;
 use chrono::Utc;
 use reqwest::{Client, StatusCode, header};
 use tokio::sync::Semaphore;
@@ -17,7 +16,7 @@ use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{
     self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
 };
-use crate::retry::default_backoff;
+use crate::retry::with_retry;
 use crate::sync::SyncProgress;
 
 /// Default Codeberg host.
@@ -500,43 +499,20 @@ impl PlatformClient for GiteaClient {
         name: &str,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<bool> {
+        let client = self.clone();
         let owner_str = owner.to_string();
         let name_str = name.to_string();
-        let client = self.clone();
 
-        // Track attempt number for progress reporting
-        let attempt = std::sync::atomic::AtomicU32::new(0);
-
-        let star_op = || async {
-            attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            client.star_repo(&owner_str, &name_str).await
-        };
-
-        let result = star_op
-            .retry(default_backoff())
-            .notify(|err, dur| {
-                let current_attempt = attempt.load(std::sync::atomic::Ordering::SeqCst);
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::RateLimitBackoff {
-                        owner: owner_str.clone(),
-                        name: name_str.clone(),
-                        retry_after_ms: dur.as_millis() as u64,
-                        attempt: current_attempt,
-                    });
-                }
-                tracing::debug!(
-                    "Rate limited on {}/{}, retrying in {:?} (attempt {}): {}",
-                    owner_str,
-                    name_str,
-                    dur,
-                    current_attempt,
-                    short_error_message(err)
-                );
-            })
-            .when(is_rate_limit_error)
-            .await;
-
-        result.map_err(PlatformError::from)
+        with_retry(
+            || async { client.star_repo(&owner_str, &name_str).await },
+            is_rate_limit_error,
+            short_error_message,
+            owner,
+            name,
+            on_progress,
+        )
+        .await
+        .map_err(PlatformError::from)
     }
 
     async fn unstar_repo(&self, owner: &str, name: &str) -> platform::Result<bool> {
