@@ -28,13 +28,14 @@ pub async fn list_org_repos(
     let total_repos = org_info.as_ref().map(|i| i.public_repos);
     let expected_pages = total_repos.map(|t| t.div_ceil(100) as u32);
 
-    if let Some(cb) = on_progress {
-        cb(SyncProgress::FetchingRepos {
+    emit(
+        on_progress,
+        SyncProgress::FetchingRepos {
             namespace: org.to_string(),
             total_repos,
             expected_pages,
-        });
-    }
+        },
+    );
 
     loop {
         // Check rate limit before making request
@@ -53,14 +54,15 @@ pub async fn list_org_repos(
 
         all_repos.extend(repos);
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchedPage {
+        emit(
+            on_progress,
+            SyncProgress::FetchedPage {
                 page,
                 count,
                 total_so_far: all_repos.len(),
                 expected_pages,
-            });
-        }
+            },
+        );
 
         // If we got fewer than 100, we've reached the end
         if count < 100 {
@@ -70,11 +72,12 @@ pub async fn list_org_repos(
         page += 1;
     }
 
-    if let Some(cb) = on_progress {
-        cb(SyncProgress::FetchComplete {
+    emit(
+        on_progress,
+        SyncProgress::FetchComplete {
             total: all_repos.len(),
-        });
-    }
+        },
+    );
 
     Ok(all_repos)
 }
@@ -165,13 +168,14 @@ pub async fn list_starred_repos(
     let mut all_repos = Vec::new();
     let mut page = 1u32;
 
-    if let Some(cb) = on_progress {
-        cb(SyncProgress::FetchingRepos {
+    emit(
+        on_progress,
+        SyncProgress::FetchingRepos {
             namespace: "starred".to_string(),
             total_repos: None,
             expected_pages: None,
-        });
-    }
+        },
+    );
 
     loop {
         // Check rate limit before making request
@@ -184,14 +188,15 @@ pub async fn list_starred_repos(
         let count = repos.len();
         all_repos.extend(repos);
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchedPage {
+        emit(
+            on_progress,
+            SyncProgress::FetchedPage {
                 page,
                 count,
                 total_so_far: all_repos.len(),
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         // If we got fewer than 100, we've reached the end
         if count < 100 {
@@ -201,11 +206,12 @@ pub async fn list_starred_repos(
         page += 1;
     }
 
-    if let Some(cb) = on_progress {
-        cb(SyncProgress::FetchComplete {
+    emit(
+        on_progress,
+        SyncProgress::FetchComplete {
             total: all_repos.len(),
-        });
-    }
+        },
+    );
 
     Ok(all_repos)
 }

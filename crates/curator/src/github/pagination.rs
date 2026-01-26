@@ -12,7 +12,7 @@ use crate::api_cache;
 use crate::entity::api_cache::EndpointType;
 use crate::entity::code_platform::CodePlatform;
 use crate::platform::{self, ProgressCallback};
-use crate::sync::SyncProgress;
+use crate::sync::{SyncProgress, emit};
 
 use super::client::{CacheStats, FetchResult, GitHubClient, check_rate_limit};
 
@@ -134,13 +134,14 @@ impl GitHubClient {
         let expected_pages = known_total_pages
             .or_else(|| config.expected_total_repos.map(|t| t.div_ceil(100) as u32));
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: config.namespace.to_string(),
                 total_repos: config.expected_total_repos,
                 expected_pages,
-            });
-        }
+            },
+        );
 
         loop {
             // Check rate limit before making request
@@ -178,14 +179,15 @@ impl GitHubClient {
                 FetchResult::NotModified => {
                     stats.cache_hits += 1;
 
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchedPage {
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchedPage {
                             page,
                             count: 0,
                             total_so_far: all_items.len(),
                             expected_pages: known_total_pages,
-                        });
-                    }
+                        },
+                    );
 
                     // Continue to next page if we know there are more
                     if let Some(total) = known_total_pages
@@ -232,14 +234,15 @@ impl GitHubClient {
 
                     all_items.extend(items);
 
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchedPage {
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchedPage {
                             page,
                             count,
                             total_so_far: all_items.len(),
                             expected_pages: known_total_pages,
-                        });
-                    }
+                        },
+                    );
 
                     // Check if we should continue
                     if let Some(total) = known_total_pages {
@@ -260,11 +263,12 @@ impl GitHubClient {
             }
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: all_items.len(),
-            });
-        }
+            },
+        );
 
         Ok(PaginatedFetchResult {
             items: all_items,
@@ -344,19 +348,23 @@ impl GitHubClient {
         match first_result {
             FetchResult::NotModified => {
                 stats.cache_hits += 1;
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::FetchingRepos {
+                emit(
+                    on_progress,
+                    SyncProgress::FetchingRepos {
                         namespace: config.namespace.to_string(),
                         total_repos: known_total_pages.map(|p| (p * 100) as usize),
                         expected_pages: known_total_pages,
-                    });
-                    cb(SyncProgress::FetchedPage {
+                    },
+                );
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
                         page: 1,
                         count: 0,
                         total_so_far: 0,
                         expected_pages: known_total_pages,
-                    });
-                }
+                    },
+                );
             }
             FetchResult::Fetched {
                 data: items,
@@ -382,13 +390,14 @@ impl GitHubClient {
                     .await;
                 }
 
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::FetchingRepos {
+                emit(
+                    on_progress,
+                    SyncProgress::FetchingRepos {
                         namespace: config.namespace.to_string(),
                         total_repos: known_total_pages.map(|p| (p * 100) as usize),
                         expected_pages: known_total_pages,
-                    });
-                }
+                    },
+                );
 
                 // Send first page items
                 for item in &items {
@@ -397,22 +406,24 @@ impl GitHubClient {
                     }
                 }
 
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::FetchedPage {
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
                         page: 1,
                         count,
                         total_so_far: total_sent.load(Ordering::Relaxed),
                         expected_pages: known_total_pages,
-                    });
-                }
+                    },
+                );
 
                 // If first page wasn't full and we don't know total, we're done
                 if known_total_pages.is_none() && count < 100 {
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchComplete {
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchComplete {
                             total: total_sent.load(Ordering::Relaxed),
-                        });
-                    }
+                        },
+                    );
                     return Ok((total_sent.load(Ordering::Relaxed), stats));
                 }
             }
@@ -519,14 +530,15 @@ impl GitHubClient {
                         stats.cache_hits += 1;
                     }
 
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchedPage {
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchedPage {
                             page,
                             count,
                             total_so_far: total_sent.load(Ordering::Relaxed),
                             expected_pages: known_total_pages,
-                        });
-                    }
+                        },
+                    );
                 }
             }
         }
@@ -534,11 +546,12 @@ impl GitHubClient {
         // Note: All-cache-hits case (loading from DB) is handled by the caller
         // since the streaming function can't use the convert function with DB models
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: total_sent.load(Ordering::Relaxed),
-            });
-        }
+            },
+        );
 
         Ok((total_sent.load(Ordering::Relaxed), stats))
     }

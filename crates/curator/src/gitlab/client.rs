@@ -18,7 +18,7 @@ use crate::platform::{
     self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
 };
 use crate::retry::with_retry;
-use crate::sync::SyncProgress;
+use crate::sync::{SyncProgress, emit};
 
 /// GitLab API client wrapper with Arc<Mutex<>> for cloneability.
 ///
@@ -319,21 +319,23 @@ impl PlatformClient for GitLabClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
         // TODO: Implement ETag caching for GitLab
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: org.to_string(),
                 total_repos: None,
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         let projects = self.list_group_projects(org, true).await?;
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: projects.len(),
-            });
-        }
+            },
+        );
 
         // Convert to PlatformRepo
         let repos: Vec<PlatformRepo> = projects.iter().map(to_platform_repo).collect();
@@ -348,21 +350,23 @@ impl PlatformClient for GitLabClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
         // TODO: Implement ETag caching for GitLab
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: username.to_string(),
                 total_repos: None,
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         let projects = self.list_user_projects(username).await?;
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: projects.len(),
-            });
-        }
+            },
+        );
 
         // Convert to PlatformRepo
         let repos: Vec<PlatformRepo> = projects.iter().map(to_platform_repo).collect();
@@ -493,13 +497,14 @@ impl PlatformClient for GitLabClient {
     ) -> platform::Result<Vec<PlatformRepo>> {
         // LIMITATION: The gitlab crate handles pagination internally, so `concurrency` is ignored.
         // TODO: Implement ETag caching for GitLab (see beads issue curator-vvy)
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: "starred".to_string(),
                 total_repos: None,
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         // First get the current user's ID
         let user = self.get_user_info().await?;
@@ -507,11 +512,12 @@ impl PlatformClient for GitLabClient {
         // Then fetch their starred projects
         let projects = self.list_starred_projects(user.id).await?;
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: projects.len(),
-            });
-        }
+            },
+        );
 
         self.update_starred_cache(user.id, &projects).await;
 
@@ -533,13 +539,14 @@ impl PlatformClient for GitLabClient {
         // so this isn't truly streaming. The `concurrency` parameter is ignored.
         // See beads issue curator-0tg for tracking.
         // TODO: Implement ETag caching for GitLab (see beads issue curator-vvy)
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: "starred".to_string(),
                 total_repos: None,
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         // First get the current user's ID
         let user = self.get_user_info().await?;
@@ -558,9 +565,7 @@ impl PlatformClient for GitLabClient {
             }
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete { total: sent });
-        }
+        emit(on_progress, SyncProgress::FetchComplete { total: sent });
 
         Ok(sent)
     }

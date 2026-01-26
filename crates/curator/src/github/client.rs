@@ -18,7 +18,7 @@ use crate::platform::{
     self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
 };
 use crate::retry::with_retry;
-use crate::sync::SyncProgress;
+use crate::sync::{SyncProgress, emit};
 
 /// Extract ETag from response headers.
 ///
@@ -379,15 +379,19 @@ impl GitHubClient {
                     .map_err(|e| PlatformError::internal(e.to_string()))?;
 
             if !cached_repos.is_empty() {
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::CacheHit {
+                emit(
+                    on_progress,
+                    SyncProgress::CacheHit {
                         namespace: org.to_string(),
                         cached_count: cached_repos.len(),
-                    });
-                    cb(SyncProgress::FetchComplete {
+                    },
+                );
+                emit(
+                    on_progress,
+                    SyncProgress::FetchComplete {
                         total: cached_repos.len(),
-                    });
-                }
+                    },
+                );
 
                 let repos: Vec<PlatformRepo> =
                     cached_repos.iter().map(PlatformRepo::from_model).collect();
@@ -450,15 +454,19 @@ impl GitHubClient {
                 .map_err(|e| PlatformError::internal(e.to_string()))?;
 
             if !cached_repos.is_empty() {
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::CacheHit {
+                emit(
+                    on_progress,
+                    SyncProgress::CacheHit {
                         namespace: "starred".to_string(),
                         cached_count: cached_repos.len(),
-                    });
-                    cb(SyncProgress::FetchComplete {
+                    },
+                );
+                emit(
+                    on_progress,
+                    SyncProgress::FetchComplete {
                         total: cached_repos.len(),
-                    });
-                }
+                    },
+                );
 
                 let repos: Vec<PlatformRepo> =
                     cached_repos.iter().map(PlatformRepo::from_model).collect();
@@ -531,15 +539,19 @@ impl GitHubClient {
                     .map_err(|e| PlatformError::internal(e.to_string()))?;
 
             if !cached_repos.is_empty() {
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::CacheHit {
+                emit(
+                    on_progress,
+                    SyncProgress::CacheHit {
                         namespace: username.to_string(),
                         cached_count: cached_repos.len(),
-                    });
-                    cb(SyncProgress::FetchComplete {
+                    },
+                );
+                emit(
+                    on_progress,
+                    SyncProgress::FetchComplete {
                         total: cached_repos.len(),
-                    });
-                }
+                    },
+                );
 
                 let repos: Vec<PlatformRepo> =
                     cached_repos.iter().map(PlatformRepo::from_model).collect();
@@ -654,13 +666,14 @@ impl PlatformClient for GitHubClient {
         let org_info = self.get_org_info(org).await.ok();
         let total_repos = org_info.as_ref().map(|i| i.public_repos);
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: org.to_string(),
                 total_repos,
                 expected_pages: total_repos.map(|t| t.div_ceil(100) as u32),
-            });
-        }
+            },
+        );
 
         loop {
             // Check rate limit before making request
@@ -685,14 +698,15 @@ impl PlatformClient for GitHubClient {
             let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
             all_repos.extend(platform_repos);
 
-            if let Some(cb) = on_progress {
-                cb(SyncProgress::FetchedPage {
+            emit(
+                on_progress,
+                SyncProgress::FetchedPage {
                     page,
                     count,
                     total_so_far: all_repos.len(),
                     expected_pages: None,
-                });
-            }
+                },
+            );
 
             // If we got fewer than 100, we've reached the end
             if count < 100 {
@@ -702,11 +716,12 @@ impl PlatformClient for GitHubClient {
             page += 1;
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: all_repos.len(),
-            });
-        }
+            },
+        );
 
         Ok(all_repos)
     }
@@ -741,13 +756,14 @@ impl PlatformClient for GitHubClient {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: username.to_string(),
                 total_repos,
                 expected_pages: total_repos.map(|t| t.div_ceil(100) as u32),
-            });
-        }
+            },
+        );
 
         loop {
             // Check rate limit before making request
@@ -769,14 +785,15 @@ impl PlatformClient for GitHubClient {
             let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
             all_repos.extend(platform_repos);
 
-            if let Some(cb) = on_progress {
-                cb(SyncProgress::FetchedPage {
+            emit(
+                on_progress,
+                SyncProgress::FetchedPage {
                     page,
                     count,
                     total_so_far: all_repos.len(),
                     expected_pages: None,
-                });
-            }
+                },
+            );
 
             // If we got fewer than 100, we've reached the end
             if count < 100 {
@@ -786,11 +803,12 @@ impl PlatformClient for GitHubClient {
             page += 1;
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: all_repos.len(),
-            });
-        }
+            },
+        );
 
         Ok(all_repos)
     }
@@ -906,13 +924,14 @@ impl PlatformClient for GitHubClient {
         }
 
         // Non-cached fallback
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: "starred".to_string(),
                 total_repos: None,
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         // Fetch first page
         if !skip_rate_checks {
@@ -932,22 +951,24 @@ impl PlatformClient for GitHubClient {
         let mut all_repos: Vec<PlatformRepo> =
             first_page_repos.iter().map(to_platform_repo).collect();
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchedPage {
+        emit(
+            on_progress,
+            SyncProgress::FetchedPage {
                 page: 1,
                 count: first_page_count,
                 total_so_far: all_repos.len(),
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         // If first page is not full, we're done
         if first_page_count < 100 {
-            if let Some(cb) = on_progress {
-                cb(SyncProgress::FetchComplete {
+            emit(
+                on_progress,
+                SyncProgress::FetchComplete {
                     total: all_repos.len(),
-                });
-            }
+                },
+            );
             return Ok(all_repos);
         }
 
@@ -995,14 +1016,15 @@ impl PlatformClient for GitHubClient {
                             repos.iter().map(to_platform_repo).collect();
                         all_repos.extend(platform_repos);
 
-                        if let Some(cb) = on_progress {
-                            cb(SyncProgress::FetchedPage {
+                        emit(
+                            on_progress,
+                            SyncProgress::FetchedPage {
                                 page: page_num,
                                 count,
                                 total_so_far: all_repos.len(),
                                 expected_pages: None,
-                            });
-                        }
+                            },
+                        );
 
                         if count < 100 {
                             got_partial = true;
@@ -1023,22 +1045,24 @@ impl PlatformClient for GitHubClient {
                     repos.iter().map(to_platform_repo).collect();
                 all_repos.extend(platform_repos);
 
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::FetchedPage {
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
                         page: page_num,
                         count,
                         total_so_far: all_repos.len(),
                         expected_pages: None,
-                    });
-                }
+                    },
+                );
             }
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: all_repos.len(),
-            });
-        }
+            },
+        );
 
         Ok(all_repos)
     }
@@ -1096,21 +1120,23 @@ impl PlatformClient for GitHubClient {
                 FetchResult::NotModified => {
                     cache_hits += 1;
                     // Emit FetchingRepos with cached expected_pages so fetch bar is created
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchingRepos {
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchingRepos {
                             namespace: "starred".to_string(),
                             total_repos: expected_pages.map(|p| (p * 100) as usize),
                             expected_pages,
-                        });
-                    }
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchedPage {
+                        },
+                    );
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchedPage {
                             page: 1,
                             count: 0,
                             total_so_far: total_sent.load(Ordering::Relaxed),
                             expected_pages,
-                        });
-                    }
+                        },
+                    );
                 }
                 FetchResult::Fetched {
                     data: repos,
@@ -1136,13 +1162,14 @@ impl PlatformClient for GitHubClient {
                     .await;
 
                     // Emit FetchingRepos with expected_pages from Link header
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchingRepos {
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchingRepos {
                             namespace: "starred".to_string(),
                             total_repos: expected_pages.map(|p| (p * 100) as usize),
                             expected_pages,
-                        });
-                    }
+                        },
+                    );
 
                     for repo in &repos {
                         let platform_repo = to_platform_repo(repo);
@@ -1151,21 +1178,23 @@ impl PlatformClient for GitHubClient {
                         }
                     }
 
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::FetchedPage {
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchedPage {
                             page: 1,
                             count,
                             total_so_far: total_sent.load(Ordering::Relaxed),
                             expected_pages,
-                        });
-                    }
+                        },
+                    );
 
                     if expected_pages.is_none() && count < 100 {
-                        if let Some(cb) = on_progress {
-                            cb(SyncProgress::FetchComplete {
+                        emit(
+                            on_progress,
+                            SyncProgress::FetchComplete {
                                 total: total_sent.load(Ordering::Relaxed),
-                            });
-                        }
+                            },
+                        );
                         return Ok(total_sent.load(Ordering::Relaxed));
                     }
                 }
@@ -1180,12 +1209,13 @@ impl PlatformClient for GitHubClient {
                     if !cached_repos.is_empty() {
                         let cached_count = cached_repos.len();
 
-                        if let Some(cb) = on_progress {
-                            cb(SyncProgress::CacheHit {
+                        emit(
+                            on_progress,
+                            SyncProgress::CacheHit {
                                 namespace: "starred".to_string(),
                                 cached_count,
-                            });
-                        }
+                            },
+                        );
 
                         for model in &cached_repos {
                             let platform_repo = PlatformRepo::from_model(model);
@@ -1196,11 +1226,12 @@ impl PlatformClient for GitHubClient {
                     }
                 }
 
-                if let Some(cb) = on_progress {
-                    cb(SyncProgress::FetchComplete {
+                emit(
+                    on_progress,
+                    SyncProgress::FetchComplete {
                         total: total_sent.load(Ordering::Relaxed),
-                    });
-                }
+                    },
+                );
 
                 return Ok(total_sent.load(Ordering::Relaxed));
             }
@@ -1285,14 +1316,15 @@ impl PlatformClient for GitHubClient {
                             cache_hits += 1;
                         }
 
-                        if let Some(cb) = on_progress {
-                            cb(SyncProgress::FetchedPage {
+                        emit(
+                            on_progress,
+                            SyncProgress::FetchedPage {
                                 page: page_num,
                                 count,
                                 total_so_far: total_sent.load(Ordering::Relaxed),
                                 expected_pages,
-                            });
-                        }
+                            },
+                        );
                     }
                 }
 
@@ -1317,12 +1349,13 @@ impl PlatformClient for GitHubClient {
                 if !cached_repos.is_empty() {
                     let cached_count = cached_repos.len();
 
-                    if let Some(cb) = on_progress {
-                        cb(SyncProgress::CacheHit {
+                    emit(
+                        on_progress,
+                        SyncProgress::CacheHit {
                             namespace: "starred".to_string(),
                             cached_count,
-                        });
-                    }
+                        },
+                    );
 
                     for model in &cached_repos {
                         let platform_repo = PlatformRepo::from_model(model);
@@ -1333,11 +1366,12 @@ impl PlatformClient for GitHubClient {
                 }
             }
 
-            if let Some(cb) = on_progress {
-                cb(SyncProgress::FetchComplete {
+            emit(
+                on_progress,
+                SyncProgress::FetchComplete {
                     total: total_sent.load(Ordering::Relaxed),
-                });
-            }
+                },
+            );
 
             return Ok(total_sent.load(Ordering::Relaxed));
         }
@@ -1370,13 +1404,14 @@ impl PlatformClient for GitHubClient {
         let first_page_count = first_page_repos.len();
 
         // Emit FetchingRepos with expected_pages from Link header
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: "starred".to_string(),
                 total_repos: expected_pages.map(|p| (p * 100) as usize),
                 expected_pages,
-            });
-        }
+            },
+        );
 
         for repo in &first_page_repos {
             let platform_repo = to_platform_repo(repo);
@@ -1385,22 +1420,24 @@ impl PlatformClient for GitHubClient {
             }
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchedPage {
+        emit(
+            on_progress,
+            SyncProgress::FetchedPage {
                 page: 1,
                 count: first_page_count,
                 total_so_far: total_sent.load(Ordering::Relaxed),
                 expected_pages,
-            });
-        }
+            },
+        );
 
         // If first page is not full and we don't know total pages, we're done
         if first_page_count < 100 && expected_pages.is_none() {
-            if let Some(cb) = on_progress {
-                cb(SyncProgress::FetchComplete {
+            emit(
+                on_progress,
+                SyncProgress::FetchComplete {
                     total: total_sent.load(Ordering::Relaxed),
-                });
-            }
+                },
+            );
             return Ok(total_sent.load(Ordering::Relaxed));
         }
 
@@ -1461,14 +1498,15 @@ impl PlatformClient for GitHubClient {
                 let mut got_partial = false;
                 for handle in handles.drain(..) {
                     if let Ok(Some((page_num, count))) = handle.await {
-                        if let Some(cb) = on_progress {
-                            cb(SyncProgress::FetchedPage {
+                        emit(
+                            on_progress,
+                            SyncProgress::FetchedPage {
                                 page: page_num,
                                 count,
                                 total_so_far: total_sent.load(Ordering::Relaxed),
                                 expected_pages,
-                            });
-                        }
+                            },
+                        );
                         if count < 100 {
                             got_partial = true;
                         }
@@ -1482,23 +1520,25 @@ impl PlatformClient for GitHubClient {
 
         // Collect any remaining results
         for handle in handles {
-            if let Ok(Some((page_num, count))) = handle.await
-                && let Some(cb) = on_progress
-            {
-                cb(SyncProgress::FetchedPage {
-                    page: page_num,
-                    count,
-                    total_so_far: total_sent.load(Ordering::Relaxed),
-                    expected_pages,
-                });
+            if let Ok(Some((page_num, count))) = handle.await {
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
+                        page: page_num,
+                        count,
+                        total_so_far: total_sent.load(Ordering::Relaxed),
+                        expected_pages,
+                    },
+                );
             }
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: total_sent.load(Ordering::Relaxed),
-            });
-        }
+            },
+        );
 
         Ok(total_sent.load(Ordering::Relaxed))
     }

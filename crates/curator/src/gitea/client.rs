@@ -17,7 +17,7 @@ use crate::platform::{
     self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
 };
 use crate::retry::with_retry;
-use crate::sync::SyncProgress;
+use crate::sync::{SyncProgress, emit};
 
 /// Default Codeberg host.
 pub const CODEBERG_HOST: &str = "https://codeberg.org";
@@ -431,19 +431,21 @@ impl PlatformClient for GiteaClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
         // TODO: Implement ETag caching for Gitea
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: org.to_string(),
                 total_repos: None,
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         let repos = self.list_org_repos(org).await?;
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete { total: repos.len() });
-        }
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete { total: repos.len() },
+        );
 
         // Convert to PlatformRepo
         let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
@@ -458,22 +460,24 @@ impl PlatformClient for GiteaClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
         // TODO: Implement ETag caching for Gitea
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: username.to_string(),
                 total_repos: None,
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         let repos = self
             .list_user_repos_internal(username)
             .await
             .map_err(PlatformError::from)?;
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete { total: repos.len() });
-        }
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete { total: repos.len() },
+        );
 
         // Convert to PlatformRepo
         let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
@@ -529,22 +533,24 @@ impl PlatformClient for GiteaClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
         // TODO: Implement ETag caching for Gitea
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: "starred".to_string(),
                 total_repos: None,
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         let repos = self
             .list_starred_repos_internal(concurrency)
             .await
             .map_err(PlatformError::from)?;
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete { total: repos.len() });
-        }
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete { total: repos.len() },
+        );
 
         // Convert to PlatformRepo
         let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
@@ -563,13 +569,14 @@ impl PlatformClient for GiteaClient {
         // TODO: Implement ETag caching for Gitea
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchingRepos {
+        emit(
+            on_progress,
+            SyncProgress::FetchingRepos {
                 namespace: "starred".to_string(),
                 total_repos: None,
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         let total_sent = Arc::new(AtomicUsize::new(0));
 
@@ -589,22 +596,24 @@ impl PlatformClient for GiteaClient {
             }
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchedPage {
+        emit(
+            on_progress,
+            SyncProgress::FetchedPage {
                 page: 1,
                 count: first_page_count,
                 total_so_far: total_sent.load(Ordering::Relaxed),
                 expected_pages: None,
-            });
-        }
+            },
+        );
 
         // If first page is not full, we're done
         if first_page_count < PAGE_SIZE as usize {
-            if let Some(cb) = on_progress {
-                cb(SyncProgress::FetchComplete {
+            emit(
+                on_progress,
+                SyncProgress::FetchComplete {
                     total: total_sent.load(Ordering::Relaxed),
-                });
-            }
+                },
+            );
             return Ok(total_sent.load(Ordering::Relaxed));
         }
 
@@ -661,14 +670,15 @@ impl PlatformClient for GiteaClient {
                 let mut got_partial = false;
                 for handle in handles.drain(..) {
                     if let Ok(Some((page_num, count))) = handle.await {
-                        if let Some(cb) = on_progress {
-                            cb(SyncProgress::FetchedPage {
+                        emit(
+                            on_progress,
+                            SyncProgress::FetchedPage {
                                 page: page_num,
                                 count,
                                 total_so_far: total_sent.load(Ordering::Relaxed),
                                 expected_pages: None,
-                            });
-                        }
+                            },
+                        );
                         if count < PAGE_SIZE as usize {
                             got_partial = true;
                         }
@@ -682,23 +692,25 @@ impl PlatformClient for GiteaClient {
 
         // Collect any remaining results from handles
         for handle in handles {
-            if let Ok(Some((page_num, count))) = handle.await
-                && let Some(cb) = on_progress
-            {
-                cb(SyncProgress::FetchedPage {
-                    page: page_num,
-                    count,
-                    total_so_far: total_sent.load(Ordering::Relaxed),
-                    expected_pages: None,
-                });
+            if let Ok(Some((page_num, count))) = handle.await {
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
+                        page: page_num,
+                        count,
+                        total_so_far: total_sent.load(Ordering::Relaxed),
+                        expected_pages: None,
+                    },
+                );
             }
         }
 
-        if let Some(cb) = on_progress {
-            cb(SyncProgress::FetchComplete {
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
                 total: total_sent.load(Ordering::Relaxed),
-            });
-        }
+            },
+        );
 
         Ok(total_sent.load(Ordering::Relaxed))
     }
