@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "curator"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "backon",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "curator_cli"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "arboard",
  "chrono",
