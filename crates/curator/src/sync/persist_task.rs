@@ -60,6 +60,12 @@ pub const PERSIST_BATCH_SIZE: usize = 100;
 /// which prevents channels from closing, which prevents the persist task from flushing.
 pub const PERSIST_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Maximum time to wait for the persist task to complete after all senders are dropped.
+/// If the persist task doesn't complete within this timeout, it's likely a bug (sender leak).
+/// 30 seconds is generous - in normal operation, the task should finish within milliseconds
+/// once all senders are dropped.
+pub const PERSIST_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Number of retry attempts for database writes.
 pub const PERSIST_RETRY_ATTEMPTS: u32 = 3;
 
@@ -129,6 +135,9 @@ pub fn spawn_persist_task(
 
     let handle = tokio::spawn(async move {
         let mut result = PersistTaskResult::default();
+        let task_start = std::time::Instant::now();
+
+        tracing::debug!("Persist task started, waiting for models");
 
         // Convert the receiver to a stream that yields batches.
         // chunks_timeout collects up to PERSIST_BATCH_SIZE items, OR flushes after
@@ -138,7 +147,9 @@ pub fn spawn_persist_task(
         let batched = stream.chunks_timeout(PERSIST_BATCH_SIZE, PERSIST_FLUSH_TIMEOUT);
         tokio::pin!(batched);
 
+        let mut batch_count = 0u64;
         while let Some(batch) = batched.next().await {
+            batch_count += 1;
             // Check for shutdown between batches
             let shutdown_requested = shutdown_flag
                 .as_ref()
@@ -230,43 +241,92 @@ pub fn spawn_persist_task(
             }
         }
 
-        tracing::debug!("Persist stream ended");
+        let task_elapsed = task_start.elapsed();
+        tracing::debug!(
+            batch_count,
+            saved = result.saved_count,
+            errors = result.errors.len(),
+            elapsed_ms = task_elapsed.as_millis(),
+            "Persist stream ended, task completing"
+        );
         result
     });
 
     (handle, counter)
 }
 
-/// Await the persist task handle and capture any panic information.
+/// Await the persist task handle with a timeout, capturing any panic information.
+///
+/// If the task doesn't complete within `PERSIST_TASK_TIMEOUT`, it's aborted and
+/// a timeout error is returned. This prevents the CLI from hanging indefinitely
+/// if there's a sender leak or other bug preventing the channel from closing.
 ///
 /// If the task panicked, returns a PersistTaskResult with panic_info set.
 pub async fn await_persist_task(
     handle: tokio::task::JoinHandle<PersistTaskResult>,
 ) -> PersistTaskResult {
-    match handle.await {
-        Ok(result) => result,
-        Err(e) => {
-            // Task panicked or was cancelled
-            let panic_info = if e.is_panic() {
-                // Try to extract panic message
-                let panic_payload = e.into_panic();
-                if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                    Some((*s).to_string())
-                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                    Some(s.clone())
-                } else {
-                    Some("Unknown panic".to_string())
+    tracing::debug!("Awaiting persist task completion");
+    let start = std::time::Instant::now();
+
+    // Use tokio::select! to allow aborting the task on timeout
+    tokio::select! {
+        result = handle => {
+            let elapsed = start.elapsed();
+            match result {
+                Ok(persist_result) => {
+                    tracing::debug!(
+                        elapsed_ms = elapsed.as_millis(),
+                        saved = persist_result.saved_count,
+                        errors = persist_result.errors.len(),
+                        "Persist task completed"
+                    );
+                    persist_result
                 }
-            } else if e.is_cancelled() {
-                Some("Task was cancelled".to_string())
-            } else {
-                Some(format!("Task failed: {}", e))
-            };
+                Err(e) => {
+                    // Task panicked or was cancelled
+                    let panic_info = if e.is_panic() {
+                        // Try to extract panic message
+                        let panic_payload = e.into_panic();
+                        if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                            Some((*s).to_string())
+                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                            Some(s.clone())
+                        } else {
+                            Some("Unknown panic".to_string())
+                        }
+                    } else if e.is_cancelled() {
+                        Some("Task was cancelled".to_string())
+                    } else {
+                        Some(format!("Task failed: {}", e))
+                    };
+
+                    tracing::error!(panic_info = ?panic_info, "Persist task failed");
+
+                    PersistTaskResult {
+                        saved_count: 0,
+                        errors: Vec::new(),
+                        panic_info,
+                    }
+                }
+            }
+        }
+        _ = tokio::time::sleep(PERSIST_TASK_TIMEOUT) => {
+            // Task timed out - this indicates a bug (likely a sender leak)
+            tracing::error!(
+                timeout_secs = PERSIST_TASK_TIMEOUT.as_secs(),
+                elapsed_ms = start.elapsed().as_millis(),
+                "Persist task timed out - possible sender leak or channel not closing. \
+                 This is a bug. Please report it at https://github.com/gkze/curator/issues"
+            );
 
             PersistTaskResult {
                 saved_count: 0,
                 errors: Vec::new(),
-                panic_info,
+                panic_info: Some(format!(
+                    "Persist task timed out after {}s - channel may not have closed properly. \
+                     This is a bug.",
+                    PERSIST_TASK_TIMEOUT.as_secs()
+                )),
             }
         }
     }

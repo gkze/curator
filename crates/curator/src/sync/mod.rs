@@ -79,6 +79,6 @@ pub use context::{SyncContext, SyncContextBuilder, SyncContextError, SyncStreami
 // Re-export persist task types
 pub use persist_task::{
     MODEL_CHANNEL_BUFFER_SIZE, PERSIST_BATCH_SIZE, PERSIST_FLUSH_TIMEOUT, PERSIST_RETRY_ATTEMPTS,
-    PERSIST_RETRY_BACKOFF_MS, PersistTaskResult, await_persist_task, create_model_channel,
-    display_persist_errors, spawn_persist_task,
+    PERSIST_RETRY_BACKOFF_MS, PERSIST_TASK_TIMEOUT, PersistTaskResult, await_persist_task,
+    create_model_channel, display_persist_errors, spawn_persist_task,
 };

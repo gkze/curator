@@ -279,7 +279,7 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
             namespaces,
             &self.options,
             self.rate_limiter.as_ref(),
-            self.database.as_ref().map(|db| db.as_ref()),
+            self.database.clone(), // Pass Arc for ETag caching in concurrent syncs
             tx,
             self.progress.as_ref().map(|p| p.as_ref()),
         )
@@ -362,7 +362,7 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
             usernames,
             &self.options,
             self.rate_limiter.as_ref(),
-            self.database.as_ref().map(|db| db.as_ref()),
+            self.database.clone(), // Pass Arc for ETag caching in concurrent syncs
             tx,
             self.progress.as_ref().map(|p| p.as_ref()),
         )

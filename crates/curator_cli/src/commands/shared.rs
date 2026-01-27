@@ -342,7 +342,7 @@ impl SyncRunner {
             namespaces,
             &self.options,
             self.rate_limiter.as_ref(),
-            None, // db not passed to concurrent syncs
+            Some(Arc::clone(&self.db)), // Pass db for ETag caching in concurrent syncs
             tx,
             Some(&*self.progress),
         )
@@ -418,7 +418,7 @@ impl SyncRunner {
             users,
             &self.options,
             self.rate_limiter.as_ref(),
-            None, // db not passed to concurrent syncs
+            Some(Arc::clone(&self.db)), // Pass db for ETag caching in concurrent syncs
             tx,
             Some(&*self.progress),
         )

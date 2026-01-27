@@ -226,7 +226,7 @@ pub async fn sync_namespace_streaming<C: PlatformClient + Clone + 'static>(
 /// * `namespaces` - List of organization or group names to sync
 /// * `options` - Sync configuration options
 /// * `rate_limiter` - Optional rate limiter for proactive rate limiting
-/// * `db` - Optional database connection for ETag caching
+/// * `db` - Optional database connection for ETag caching (wrapped in Arc for concurrent access)
 /// * `on_progress` - Optional progress callback
 #[cfg_attr(
     any(feature = "github", feature = "gitlab", feature = "gitea"),
@@ -237,7 +237,7 @@ pub async fn sync_namespaces<C: PlatformClient + Clone + 'static>(
     namespaces: &[String],
     options: &SyncOptions,
     rate_limiter: Option<&ApiRateLimiter>,
-    _db: Option<&DatabaseConnection>,
+    db: Option<Arc<DatabaseConnection>>,
     on_progress: Option<&ProgressCallback>,
 ) -> Vec<NamespaceSyncResult> {
     if namespaces.is_empty() {
@@ -264,6 +264,7 @@ pub async fn sync_namespaces<C: PlatformClient + Clone + 'static>(
         let options = options.clone();
         let semaphore = Arc::clone(&semaphore);
         let limiter = limiter.clone();
+        let task_db = db.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = match semaphore.acquire().await {
@@ -278,11 +279,16 @@ pub async fn sync_namespaces<C: PlatformClient + Clone + 'static>(
                 }
             };
 
-            // Note: db is not passed to spawned tasks as DatabaseConnection doesn't impl Clone
-            // For concurrent namespace syncs, caching is not used. Use sync_namespace directly
-            // with a db connection for cached single-namespace syncs.
-            let result =
-                sync_namespace(&client, &namespace, &options, limiter.as_ref(), None, None).await;
+            // Pass the Arc-wrapped db connection to enable ETag caching in concurrent syncs
+            let result = sync_namespace(
+                &client,
+                &namespace,
+                &options,
+                limiter.as_ref(),
+                task_db.as_deref(),
+                None,
+            )
+            .await;
 
             match result {
                 Ok((sync_result, models)) => NamespaceSyncResult {
@@ -334,7 +340,7 @@ pub async fn sync_namespaces<C: PlatformClient + Clone + 'static>(
 /// * `namespaces` - List of organization or group names to sync
 /// * `options` - Sync configuration options
 /// * `rate_limiter` - Optional rate limiter for proactive rate limiting
-/// * `db` - Optional database connection for ETag caching
+/// * `db` - Optional database connection for ETag caching (wrapped in Arc for concurrent access)
 /// * `model_tx` - Channel sender for streaming model persistence
 /// * `on_progress` - Optional progress callback
 #[cfg_attr(
@@ -346,7 +352,7 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
     namespaces: &[String],
     options: &SyncOptions,
     rate_limiter: Option<&ApiRateLimiter>,
-    _db: Option<&DatabaseConnection>,
+    db: Option<Arc<DatabaseConnection>>,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Vec<NamespaceSyncResultStreaming> {
@@ -374,6 +380,7 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
         let semaphore = Arc::clone(&semaphore);
         let tx = model_tx.clone();
         let limiter = limiter.clone();
+        let task_db = db.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = match semaphore.acquire().await {
@@ -387,10 +394,17 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
                 }
             };
 
-            let result =
-                // Note: db is not passed to spawned tasks as DatabaseConnection doesn't impl Clone
-                sync_namespace_streaming(&client, &namespace, &options, limiter.as_ref(), None, tx, None)
-                    .await;
+            // Pass the Arc-wrapped db connection to enable ETag caching in concurrent syncs
+            let result = sync_namespace_streaming(
+                &client,
+                &namespace,
+                &options,
+                limiter.as_ref(),
+                task_db.as_deref(),
+                tx,
+                None,
+            )
+            .await;
 
             match result {
                 Ok(sync_result) => NamespaceSyncResultStreaming {
@@ -505,7 +519,7 @@ pub async fn sync_user_streaming<C: PlatformClient + Clone + 'static>(
 /// * `usernames` - List of usernames to sync
 /// * `options` - Sync configuration options
 /// * `rate_limiter` - Optional rate limiter for proactive rate limiting
-/// * `db` - Optional database connection for ETag caching
+/// * `db` - Optional database connection for ETag caching (wrapped in Arc for concurrent access)
 /// * `model_tx` - Channel sender for streaming model persistence
 /// * `on_progress` - Optional progress callback
 #[cfg_attr(
@@ -517,7 +531,7 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
     usernames: &[String],
     options: &SyncOptions,
     rate_limiter: Option<&ApiRateLimiter>,
-    _db: Option<&DatabaseConnection>,
+    db: Option<Arc<DatabaseConnection>>,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Vec<NamespaceSyncResultStreaming> {
@@ -545,6 +559,7 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
         let semaphore = Arc::clone(&semaphore);
         let tx = model_tx.clone();
         let limiter = limiter.clone();
+        let task_db = db.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = match semaphore.acquire().await {
@@ -558,9 +573,17 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
                 }
             };
 
-            let result =
-                // Note: db is not passed to spawned tasks as DatabaseConnection doesn't impl Clone
-                sync_user_streaming(&client, &username, &options, limiter.as_ref(), None, tx, None).await;
+            // Pass the Arc-wrapped db connection to enable ETag caching in concurrent syncs
+            let result = sync_user_streaming(
+                &client,
+                &username,
+                &options,
+                limiter.as_ref(),
+                task_db.as_deref(),
+                tx,
+                None,
+            )
+            .await;
 
             match result {
                 Ok(sync_result) => NamespaceSyncResultStreaming {
