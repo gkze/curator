@@ -1,0 +1,3462 @@
+---
+openapi: 3.0.0
+info:
+  title: GitLab API
+  version: v4
+paths:
+  /api/v4/user:
+    get:
+      summary: Get the currently authenticated user
+      description: Gets the currently authenticated user. Returns user info for the
+        token holder.
+      operationId: getApiV4User
+      tags:
+        - users
+      responses:
+        '200':
+          description: The currently authenticated user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                    description: User ID
+                  username:
+                    type: string
+                    description: Username
+                  name:
+                    type: string
+                    nullable: true
+                    description: Display name
+                  email:
+                    type: string
+                    nullable: true
+                    description: Email address (may be empty based on privacy settings)
+                  bio:
+                    type: string
+                    nullable: true
+                    description: User bio
+                  public_email:
+                    type: string
+                    nullable: true
+                    description: Public email address
+                required:
+                  - id
+                  - username
+        '401':
+          description: Unauthorized
+  /api/v4/groups/{id}:
+    put:
+      description: Update a group. Available only for users who can administrate groups.
+      parameters:
+        - in: path
+          name: id
+          description: The ID of a group
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/putApiV4GroupsId'
+        required: true
+      responses:
+        '200':
+          description: Update a group. Available only for users who can administrate
+            groups.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/API_Entities_Group'
+      tags:
+        - groups
+      operationId: putApiV4GroupsId
+    get:
+      description: Get a single group, with containing projects.
+      parameters:
+        - in: path
+          name: id
+          description: The ID of a group
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: with_custom_attributes
+          description: Include custom attributes in the response
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_projects
+          description: Omit project details
+          required: false
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Get a single group, with containing projects.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/API_Entities_GroupDetail'
+      tags:
+        - groups
+      operationId: getApiV4GroupsId
+    delete:
+      description: Remove a group.
+      parameters:
+        - in: path
+          name: id
+          description: The ID of a group
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Remove a group.
+      tags:
+        - groups
+      operationId: deleteApiV4GroupsId
+  /api/v4/groups/{id}/projects:
+    get:
+      description: Get a list of projects in this group.
+      parameters:
+        - in: path
+          name: id
+          description: The ID of a group
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: active
+          description: Limit by projects that are not archived and not marked for
+            deletion
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: archived
+          description: Limit by archived status
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: visibility
+          description: Limit by visibility
+          required: false
+          schema:
+            type: string
+            enum:
+              - private
+              - internal
+              - public
+        - in: query
+          name: search
+          description: Return list of authorized projects matching the search criteria
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: order_by
+          description: Return projects ordered by field
+          required: false
+          schema:
+            type: string
+            enum:
+              - id
+              - name
+              - path
+              - created_at
+              - updated_at
+              - last_activity_at
+              - similarity
+              - star_count
+            default: created_at
+        - in: query
+          name: sort
+          description: Return projects sorted in ascending and descending order
+          required: false
+          schema:
+            type: string
+            enum:
+              - asc
+              - desc
+            default: desc
+        - in: query
+          name: simple
+          description: Return only the ID, URL, name, and path of each project
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: owned
+          description: Limit by owned by authenticated user
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: starred
+          description: Limit by starred status
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_issues_enabled
+          description: Limit by enabled issues feature
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_merge_requests_enabled
+          description: Limit by enabled merge requests feature
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_shared
+          description: Include projects shared to this group
+          required: false
+          schema:
+            type: boolean
+            default: true
+        - in: query
+          name: include_subgroups
+          description: Includes projects in subgroups of this group
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: include_ancestor_groups
+          description: Includes projects in ancestors of this group
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: min_access_level
+          description: Limit by minimum access level of authenticated user on projects
+          required: false
+          schema:
+            type: integer
+            format: int32
+            enum:
+              - 10
+              - 15
+              - 20
+              - 30
+              - 40
+              - 50
+        - in: query
+          name: page
+          description: Current page number
+          required: false
+          example: 1
+          schema:
+            type: integer
+            format: int32
+            default: 1
+        - in: query
+          name: per_page
+          description: Number of items per page
+          required: false
+          example: 20
+          schema:
+            type: integer
+            format: int32
+            default: 20
+        - in: query
+          name: with_custom_attributes
+          description: Include custom attributes in the response
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_security_reports
+          description: Return only projects having security report artifacts present
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Get a list of projects in this group.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/API_Entities_Project'
+      tags:
+        - groups
+      operationId: getApiV4GroupsIdProjects
+  /api/v4/users/{user_id}/projects:
+    get:
+      description: Get a user projects
+      parameters:
+        - in: path
+          name: user_id
+          description: The ID or username of the user
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: order_by
+          description: Return projects ordered by field. storage_size, repository_size,
+            wiki_size, packages_size are only available to admins. Similarity is available
+            when searching and is limited to projects the user has access to.
+          required: false
+          schema:
+            type: string
+            enum:
+              - id
+              - name
+              - path
+              - created_at
+              - updated_at
+              - last_activity_at
+              - similarity
+              - star_count
+              - storage_size
+              - repository_size
+              - wiki_size
+              - packages_size
+            default: created_at
+        - in: query
+          name: sort
+          description: Return projects sorted in ascending and descending order
+          required: false
+          schema:
+            type: string
+            enum:
+              - asc
+              - desc
+            default: desc
+        - in: query
+          name: archived
+          description: Limit by archived status
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: visibility
+          description: Limit by visibility
+          required: false
+          schema:
+            type: string
+            enum:
+              - private
+              - internal
+              - public
+        - in: query
+          name: search
+          description: Return list of projects matching the search criteria
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: search_namespaces
+          description: Include ancestor namespaces when matching search criteria
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: owned
+          description: Limit by owned by authenticated user
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: starred
+          description: Limit by starred status
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: imported
+          description: Limit by imported by authenticated user
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: membership
+          description: Limit by projects that the current user is a member of
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_issues_enabled
+          description: Limit by enabled issues feature
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_merge_requests_enabled
+          description: Limit by enabled merge requests feature
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_programming_language
+          description: Limit to repositories which use the given programming language
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: min_access_level
+          description: Limit by minimum access level of authenticated user
+          required: false
+          schema:
+            type: integer
+            format: int32
+            enum:
+              - 10
+              - 15
+              - 20
+              - 30
+              - 40
+              - 50
+        - in: query
+          name: id_after
+          description: Limit results to projects with IDs greater than the specified
+            ID
+          required: false
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: id_before
+          description: Limit results to projects with IDs less than the specified
+            ID
+          required: false
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: last_activity_after
+          description: 'Limit results to projects with last_activity after specified
+            time. Format: ISO 8601 YYYY-MM-DDTHH:MM:SSZ'
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: last_activity_before
+          description: 'Limit results to projects with last_activity before specified
+            time. Format: ISO 8601 YYYY-MM-DDTHH:MM:SSZ'
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: repository_storage
+          description: Which storage shard the repository is on. Available only to
+            admins
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: topic
+          description: Comma-separated list of topics. Limit results to projects having
+            all topics
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        - in: query
+          name: topic_id
+          description: Limit results to projects with the assigned topic given by
+            the topic ID
+          required: false
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: updated_before
+          description: 'Return projects updated before the specified datetime. Format:
+            ISO 8601 YYYY-MM-DDTHH:MM:SSZ'
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: updated_after
+          description: 'Return projects updated after the specified datetime. Format:
+            ISO 8601 YYYY-MM-DDTHH:MM:SSZ'
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: include_pending_delete
+          description: Include projects in pending delete state. Can only be set by
+            admins
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: marked_for_deletion_on
+          description: Date when the project was marked for deletion
+          required: false
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: active
+          description: Limit by projects that are not archived and not marked for
+            deletion
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: wiki_checksum_failed
+          description: Limit by projects where wiki checksum is failed
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: repository_checksum_failed
+          description: Limit by projects where repository checksum is failed
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: include_hidden
+          description: Include hidden projects. Can only be set by admins
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: page
+          description: Current page number
+          required: false
+          example: 1
+          schema:
+            type: integer
+            format: int32
+            default: 1
+        - in: query
+          name: per_page
+          description: Number of items per page
+          required: false
+          example: 20
+          schema:
+            type: integer
+            format: int32
+            default: 20
+        - in: query
+          name: simple
+          description: Return only the ID, URL, name, and path of each project
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: statistics
+          description: Include project statistics
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_custom_attributes
+          description: Include custom attributes in the response
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Get a user projects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/API_Entities_BasicProjectDetails'
+        '404':
+          description: 404 User Not Found
+      tags:
+        - projects
+      operationId: getApiV4UsersUserIdProjects
+  /api/v4/users/{user_id}/starred_projects:
+    get:
+      description: Get projects starred by a user
+      parameters:
+        - in: path
+          name: user_id
+          description: The ID or username of the user
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: order_by
+          description: Return projects ordered by field. storage_size, repository_size,
+            wiki_size, packages_size are only available to admins. Similarity is available
+            when searching and is limited to projects the user has access to.
+          required: false
+          schema:
+            type: string
+            enum:
+              - id
+              - name
+              - path
+              - created_at
+              - updated_at
+              - last_activity_at
+              - similarity
+              - star_count
+              - storage_size
+              - repository_size
+              - wiki_size
+              - packages_size
+            default: created_at
+        - in: query
+          name: sort
+          description: Return projects sorted in ascending and descending order
+          required: false
+          schema:
+            type: string
+            enum:
+              - asc
+              - desc
+            default: desc
+        - in: query
+          name: archived
+          description: Limit by archived status
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: visibility
+          description: Limit by visibility
+          required: false
+          schema:
+            type: string
+            enum:
+              - private
+              - internal
+              - public
+        - in: query
+          name: search
+          description: Return list of projects matching the search criteria
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: search_namespaces
+          description: Include ancestor namespaces when matching search criteria
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: owned
+          description: Limit by owned by authenticated user
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: starred
+          description: Limit by starred status
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: imported
+          description: Limit by imported by authenticated user
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: membership
+          description: Limit by projects that the current user is a member of
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_issues_enabled
+          description: Limit by enabled issues feature
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_merge_requests_enabled
+          description: Limit by enabled merge requests feature
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_programming_language
+          description: Limit to repositories which use the given programming language
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: min_access_level
+          description: Limit by minimum access level of authenticated user
+          required: false
+          schema:
+            type: integer
+            format: int32
+            enum:
+              - 10
+              - 15
+              - 20
+              - 30
+              - 40
+              - 50
+        - in: query
+          name: id_after
+          description: Limit results to projects with IDs greater than the specified
+            ID
+          required: false
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: id_before
+          description: Limit results to projects with IDs less than the specified
+            ID
+          required: false
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: last_activity_after
+          description: 'Limit results to projects with last_activity after specified
+            time. Format: ISO 8601 YYYY-MM-DDTHH:MM:SSZ'
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: last_activity_before
+          description: 'Limit results to projects with last_activity before specified
+            time. Format: ISO 8601 YYYY-MM-DDTHH:MM:SSZ'
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: repository_storage
+          description: Which storage shard the repository is on. Available only to
+            admins
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: topic
+          description: Comma-separated list of topics. Limit results to projects having
+            all topics
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+        - in: query
+          name: topic_id
+          description: Limit results to projects with the assigned topic given by
+            the topic ID
+          required: false
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: updated_before
+          description: 'Return projects updated before the specified datetime. Format:
+            ISO 8601 YYYY-MM-DDTHH:MM:SSZ'
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: updated_after
+          description: 'Return projects updated after the specified datetime. Format:
+            ISO 8601 YYYY-MM-DDTHH:MM:SSZ'
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: include_pending_delete
+          description: Include projects in pending delete state. Can only be set by
+            admins
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: marked_for_deletion_on
+          description: Date when the project was marked for deletion
+          required: false
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: active
+          description: Limit by projects that are not archived and not marked for
+            deletion
+          required: false
+          schema:
+            type: boolean
+        - in: query
+          name: wiki_checksum_failed
+          description: Limit by projects where wiki checksum is failed
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: repository_checksum_failed
+          description: Limit by projects where repository checksum is failed
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: include_hidden
+          description: Include hidden projects. Can only be set by admins
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: page
+          description: Current page number
+          required: false
+          example: 1
+          schema:
+            type: integer
+            format: int32
+            default: 1
+        - in: query
+          name: per_page
+          description: Number of items per page
+          required: false
+          example: 20
+          schema:
+            type: integer
+            format: int32
+            default: 20
+        - in: query
+          name: simple
+          description: Return only the ID, URL, name, and path of each project
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: statistics
+          description: Include project statistics
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Get projects starred by a user
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/API_Entities_BasicProjectDetails'
+        '404':
+          description: 404 User Not Found
+      tags:
+        - projects
+      operationId: getApiV4UsersUserIdStarredProjects
+  /api/v4/projects/{id}/star:
+    post:
+      description: Star a project
+      parameters:
+        - in: path
+          name: id
+          description: The ID or URL-encoded path of the project
+          required: true
+          schema:
+            type: string
+      responses:
+        '201':
+          description: Star a project
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/API_Entities_Project'
+        '304':
+          description: Not modified
+        '403':
+          description: Unauthenticated
+      tags:
+        - projects
+      operationId: postApiV4ProjectsIdStar
+  /api/v4/projects/{id}/unstar:
+    post:
+      description: Unstar a project
+      parameters:
+        - in: path
+          name: id
+          description: The ID or URL-encoded path of the project
+          required: true
+          schema:
+            type: string
+      responses:
+        '201':
+          description: Unstar a project
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/API_Entities_Project'
+        '304':
+          description: Not modified
+        '403':
+          description: Unauthenticated
+      tags:
+        - projects
+      operationId: postApiV4ProjectsIdUnstar
+  /api/v4/projects/{id}:
+    get:
+      description: Get a single project
+      parameters:
+        - in: path
+          name: id
+          description: The ID or URL-encoded path of the project
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: statistics
+          description: Include project statistics
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: with_custom_attributes
+          description: Include custom attributes in the response
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: license
+          description: Include project license data
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Get a single project
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/API_Entities_ProjectWithAccess'
+      tags:
+        - projects
+      operationId: getApiV4ProjectsId
+    put:
+      description: Update an existing project
+      parameters:
+        - in: path
+          name: id
+          description: The ID or URL-encoded path of the project
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/putApiV4ProjectsId'
+        required: true
+      responses:
+        '200':
+          description: Update an existing project
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/API_Entities_Project'
+        '400':
+          description: Bad request
+        '403':
+          description: Unauthenticated
+      tags:
+        - projects
+      operationId: putApiV4ProjectsId
+    delete:
+      description: Delete a project
+      parameters:
+        - in: path
+          name: id
+          description: The ID or URL-encoded path of the project
+          required: true
+          schema:
+            type: string
+      responses:
+        '202':
+          description: Delete a project
+        '403':
+          description: Unauthenticated
+        '404':
+          description: Not found
+      tags:
+        - projects
+      operationId: deleteApiV4ProjectsId
+components:
+  schemas:
+    API_Entities_BasicProjectDetails:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int32
+          example: 1
+        description:
+          type: string
+          example: desc
+        name:
+          type: string
+          example: project1
+        name_with_namespace:
+          type: string
+          example: John Doe / project1
+        path:
+          type: string
+          example: project1
+        path_with_namespace:
+          type: string
+          example: namespace1/project1
+        created_at:
+          type: string
+          format: date-time
+          example: 2020-05-07 04:27:17.016000+00:00
+        default_branch:
+          type: string
+          example: main
+        tag_list:
+          type: array
+          items:
+            type: string
+          example: tag
+        topics:
+          type: array
+          items:
+            type: string
+          example: topic
+        ssh_url_to_repo:
+          type: string
+          example: git@gitlab.example.com:gitlab/gitlab.git
+        http_url_to_repo:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab.git
+        web_url:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab
+        readme_url:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab/blob/master/README.md
+        forks_count:
+          type: integer
+          format: int32
+          example: 1
+        license_url:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab/blob/master/LICENCE
+        license:
+          $ref: '#/components/schemas/API_Entities_LicenseBasic'
+        avatar_url:
+          type: string
+          example: http://example.com/uploads/project/avatar/3/uploads/avatar.png
+        star_count:
+          type: integer
+          format: int32
+          example: 1
+        last_activity_at:
+          type: string
+          format: date-time
+          example: 2013-09-30 13:46:02+00:00
+        visibility:
+          type: string
+          example: public
+        namespace:
+          $ref: '#/components/schemas/API_Entities_NamespaceBasic'
+        custom_attributes:
+          $ref: '#/components/schemas/API_Entities_CustomAttribute'
+        repository_storage:
+          type: string
+          example: default
+      description: API_Entities_BasicProjectDetails model
+    API_Entities_ContainerExpirationPolicy:
+      type: object
+      properties:
+        cadence:
+          type: string
+        enabled:
+          type: boolean
+        keep_n:
+          type: integer
+          format: int32
+        older_than:
+          type: string
+        name_regex:
+          type: string
+        name_regex_keep:
+          type: string
+        next_run_at:
+          type: string
+          format: date-time
+    API_Entities_CustomAttribute:
+      type: object
+      properties:
+        key:
+          type: string
+          example: foo
+        value:
+          type: string
+          example: bar
+      description: API_Entities_CustomAttribute model
+    API_Entities_Group:
+      type: object
+      properties:
+        id:
+          type: string
+        web_url:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        description:
+          type: string
+        visibility:
+          type: string
+        share_with_group_lock:
+          type: string
+        require_two_factor_authentication:
+          type: string
+        two_factor_grace_period:
+          type: string
+        project_creation_level:
+          type: string
+        auto_devops_enabled:
+          type: string
+        subgroup_creation_level:
+          type: string
+        emails_disabled:
+          type: boolean
+        emails_enabled:
+          type: boolean
+        show_diff_preview_in_email:
+          type: boolean
+        mentions_disabled:
+          type: string
+        lfs_enabled:
+          type: string
+        archived:
+          type: boolean
+        math_rendering_limits_enabled:
+          type: boolean
+        lock_math_rendering_limits_enabled:
+          type: boolean
+        default_branch:
+          type: string
+        default_branch_protection:
+          type: string
+        default_branch_protection_defaults:
+          type: string
+        avatar_url:
+          type: string
+        request_access_enabled:
+          type: string
+        full_name:
+          type: string
+        full_path:
+          type: string
+        created_at:
+          type: string
+        parent_id:
+          type: string
+        organization_id:
+          type: string
+        shared_runners_setting:
+          type: string
+        max_artifacts_size:
+          type: integer
+          format: int32
+        custom_attributes:
+          $ref: '#/components/schemas/API_Entities_CustomAttribute'
+        statistics:
+          type: object
+          properties:
+            storage_size:
+              type: string
+            repository_size:
+              type: string
+            wiki_size:
+              type: string
+            lfs_objects_size:
+              type: string
+            job_artifacts_size:
+              type: string
+            pipeline_artifacts_size:
+              type: string
+            packages_size:
+              type: string
+            snippets_size:
+              type: string
+            uploads_size:
+              type: string
+        marked_for_deletion_on:
+          type: string
+        root_storage_statistics:
+          $ref: '#/components/schemas/API_Entities_Namespace_RootStorageStatistics'
+        ldap_cn:
+          type: string
+        ldap_access:
+          type: string
+        ldap_group_links:
+          $ref: '#/components/schemas/API_Entities_LdapGroupLink'
+        saml_group_links:
+          $ref: '#/components/schemas/API_Entities_SamlGroupLink'
+        file_template_project_id:
+          type: string
+        wiki_access_level:
+          type: string
+        repository_storage:
+          type: string
+        duo_core_features_enabled:
+          type: boolean
+          description: '[Experimental] Indicates whether GitLab Duo Core features
+            are enabled for the group'
+        duo_features_enabled:
+          type: string
+        lock_duo_features_enabled:
+          type: string
+        auto_duo_code_review_enabled:
+          type: string
+        web_based_commit_signing_enabled:
+          type: string
+        allow_personal_snippets:
+          type: string
+        duo_namespace_access_rules:
+          type: string
+      description: API_Entities_Group model
+    API_Entities_GroupAccess:
+      type: object
+      properties:
+        access_level:
+          type: string
+        notification_level:
+          type: string
+    API_Entities_GroupDetail:
+      type: object
+      properties:
+        id:
+          type: string
+        web_url:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        description:
+          type: string
+        visibility:
+          type: string
+        share_with_group_lock:
+          type: string
+        require_two_factor_authentication:
+          type: string
+        two_factor_grace_period:
+          type: string
+        project_creation_level:
+          type: string
+        auto_devops_enabled:
+          type: string
+        subgroup_creation_level:
+          type: string
+        emails_disabled:
+          type: boolean
+        emails_enabled:
+          type: boolean
+        show_diff_preview_in_email:
+          type: boolean
+        mentions_disabled:
+          type: string
+        lfs_enabled:
+          type: string
+        archived:
+          type: boolean
+        math_rendering_limits_enabled:
+          type: boolean
+        lock_math_rendering_limits_enabled:
+          type: boolean
+        default_branch:
+          type: string
+        default_branch_protection:
+          type: string
+        default_branch_protection_defaults:
+          type: string
+        avatar_url:
+          type: string
+        request_access_enabled:
+          type: string
+        full_name:
+          type: string
+        full_path:
+          type: string
+        created_at:
+          type: string
+        parent_id:
+          type: string
+        organization_id:
+          type: string
+        shared_runners_setting:
+          type: string
+        max_artifacts_size:
+          type: integer
+          format: int32
+        custom_attributes:
+          $ref: '#/components/schemas/API_Entities_CustomAttribute'
+        statistics:
+          type: object
+          properties:
+            storage_size:
+              type: string
+            repository_size:
+              type: string
+            wiki_size:
+              type: string
+            lfs_objects_size:
+              type: string
+            job_artifacts_size:
+              type: string
+            pipeline_artifacts_size:
+              type: string
+            packages_size:
+              type: string
+            snippets_size:
+              type: string
+            uploads_size:
+              type: string
+        marked_for_deletion_on:
+          type: string
+        root_storage_statistics:
+          $ref: '#/components/schemas/API_Entities_Namespace_RootStorageStatistics'
+        ldap_cn:
+          type: string
+        ldap_access:
+          type: string
+        ldap_group_links:
+          $ref: '#/components/schemas/API_Entities_LdapGroupLink'
+        saml_group_links:
+          $ref: '#/components/schemas/API_Entities_SamlGroupLink'
+        file_template_project_id:
+          type: string
+        wiki_access_level:
+          type: string
+        repository_storage:
+          type: string
+        duo_core_features_enabled:
+          type: boolean
+          description: '[Experimental] Indicates whether GitLab Duo Core features
+            are enabled for the group'
+        duo_features_enabled:
+          type: string
+        lock_duo_features_enabled:
+          type: string
+        auto_duo_code_review_enabled:
+          type: string
+        web_based_commit_signing_enabled:
+          type: string
+        allow_personal_snippets:
+          type: string
+        duo_namespace_access_rules:
+          type: string
+        shared_with_groups:
+          type: string
+        runners_token:
+          type: string
+        enabled_git_access_protocol:
+          type: string
+        prevent_sharing_groups_outside_hierarchy:
+          type: string
+        step_up_auth_required_oauth_provider:
+          type: string
+          description: OAuth provider required for step-up authentication.
+        projects:
+          $ref: '#/components/schemas/API_Entities_Project'
+        shared_projects:
+          $ref: '#/components/schemas/API_Entities_Project'
+        shared_runners_minutes_limit:
+          type: string
+        extra_shared_runners_minutes_limit:
+          type: string
+        prevent_forking_outside_group:
+          type: string
+        service_access_tokens_expiration_enforced:
+          type: string
+        membership_lock:
+          type: string
+        ip_restriction_ranges:
+          type: string
+        allowed_email_domains_list:
+          type: string
+        only_allow_merge_if_pipeline_succeeds:
+          type: string
+        allow_merge_on_skipped_pipeline:
+          type: string
+        only_allow_merge_if_all_discussions_are_resolved:
+          type: string
+        unique_project_download_limit:
+          type: string
+        unique_project_download_limit_interval_in_seconds:
+          type: string
+        unique_project_download_limit_allowlist:
+          type: string
+        unique_project_download_limit_alertlist:
+          type: string
+        auto_ban_user_on_excessive_projects_download:
+          type: string
+      description: API_Entities_GroupDetail model
+    API_Entities_LdapGroupLink:
+      type: object
+      properties:
+        cn:
+          type: string
+          example: ldap-group-1
+        group_access:
+          type: integer
+          format: int32
+          example: 10
+        provider:
+          type: string
+          example: ldapmain
+        filter:
+          type: string
+          example: id >= 500
+        member_role_id:
+          type: integer
+          format: int32
+          example: 12
+    API_Entities_LicenseBasic:
+      type: object
+      properties:
+        key:
+          type: string
+          example: gpl-3.0
+        name:
+          type: string
+          example: GNU General Public License v3.0
+        nickname:
+          type: string
+          example: GNU GPLv3
+        html_url:
+          type: string
+          example: http://choosealicense.com/licenses/gpl-3.0
+        source_url:
+          type: string
+    API_Entities_NamespaceBasic:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int32
+          example: 2
+        name:
+          type: string
+          example: project
+        path:
+          type: string
+          example: my_project
+        kind:
+          type: string
+          example: project
+        full_path:
+          type: string
+          example: group/my_project
+        parent_id:
+          type: integer
+          format: int32
+          example: 1
+        avatar_url:
+          type: string
+          example: https://example.com/avatar/12345
+        web_url:
+          type: string
+          example: https://example.com/group/my_project
+    API_Entities_Namespace_RootStorageStatistics:
+      type: object
+      properties:
+        build_artifacts_size:
+          type: integer
+          format: int32
+          description: CI artifacts size in bytes.
+        container_registry_size:
+          type: integer
+          format: int32
+          description: container registry size in bytes.
+        container_registry_size_is_estimated:
+          type: boolean
+          description: Indicates whether the deduplicated container registry size
+            for the namespace is an estimated value or not.
+        dependency_proxy_size:
+          type: integer
+          format: int32
+          description: Dependency Proxy sizes in bytes.
+        lfs_objects_size:
+          type: integer
+          format: int32
+          description: LFS objects size in bytes.
+        packages_size:
+          type: integer
+          format: int32
+          description: Packages size in bytes.
+        pipeline_artifacts_size:
+          type: integer
+          format: int32
+          description: CI pipeline artifacts size in bytes.
+        repository_size:
+          type: integer
+          format: int32
+          description: Git repository size in bytes.
+        snippets_size:
+          type: integer
+          format: int32
+          description: Snippets size in bytes.
+        storage_size:
+          type: integer
+          format: int32
+          description: Total storage in bytes.
+        uploads_size:
+          type: integer
+          format: int32
+          description: Uploads size in bytes.
+        wiki_size:
+          type: integer
+          format: int32
+          description: Wiki size in bytes.
+    API_Entities_Project:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int32
+          example: 1
+        description:
+          type: string
+          example: desc
+        name:
+          type: string
+          example: project1
+        name_with_namespace:
+          type: string
+          example: John Doe / project1
+        path:
+          type: string
+          example: project1
+        path_with_namespace:
+          type: string
+          example: namespace1/project1
+        created_at:
+          type: string
+          format: date-time
+          example: 2020-05-07 04:27:17.016000+00:00
+        default_branch:
+          type: string
+          example: main
+        tag_list:
+          type: array
+          items:
+            type: string
+          example: tag
+        topics:
+          type: array
+          items:
+            type: string
+          example: topic
+        ssh_url_to_repo:
+          type: string
+          example: git@gitlab.example.com:gitlab/gitlab.git
+        http_url_to_repo:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab.git
+        web_url:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab
+        readme_url:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab/blob/master/README.md
+        forks_count:
+          type: integer
+          format: int32
+          example: 1
+        license_url:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab/blob/master/LICENCE
+        license:
+          $ref: '#/components/schemas/API_Entities_LicenseBasic'
+        avatar_url:
+          type: string
+          example: http://example.com/uploads/project/avatar/3/uploads/avatar.png
+        star_count:
+          type: integer
+          format: int32
+          example: 1
+        last_activity_at:
+          type: string
+          format: date-time
+          example: 2013-09-30 13:46:02+00:00
+        visibility:
+          type: string
+          example: public
+        namespace:
+          $ref: '#/components/schemas/API_Entities_NamespaceBasic'
+        custom_attributes:
+          $ref: '#/components/schemas/API_Entities_CustomAttribute'
+        repository_storage:
+          type: string
+          example: default
+        forked_from_project:
+          $ref: '#/components/schemas/API_Entities_BasicProjectDetails'
+        container_registry_image_prefix:
+          type: string
+          example: registry.gitlab.example.com/gitlab/gitlab-client
+        _links:
+          type: object
+          properties:
+            self:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4
+            issues:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/issues
+            merge_requests:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/merge_requests
+            repo_branches:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/repository/branches
+            labels:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/labels
+            events:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/events
+            members:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/members
+            cluster_agents:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/cluster_agents
+        marked_for_deletion_at:
+          type: string
+        marked_for_deletion_on:
+          type: string
+        packages_enabled:
+          type: boolean
+        empty_repo:
+          type: boolean
+        archived:
+          type: boolean
+        owner:
+          $ref: '#/components/schemas/API_Entities_UserBasic'
+        resolve_outdated_diff_discussions:
+          type: boolean
+        container_expiration_policy:
+          $ref: '#/components/schemas/API_Entities_ContainerExpirationPolicy'
+        repository_object_format:
+          type: string
+          example: sha1
+        issues_enabled:
+          type: boolean
+        merge_requests_enabled:
+          type: boolean
+        wiki_enabled:
+          type: boolean
+        jobs_enabled:
+          type: boolean
+        snippets_enabled:
+          type: boolean
+        container_registry_enabled:
+          type: boolean
+        service_desk_enabled:
+          type: boolean
+        service_desk_address:
+          type: string
+          example: address@example.com
+        can_create_merge_request_in:
+          type: boolean
+        issues_access_level:
+          type: string
+          example: enabled
+        repository_access_level:
+          type: string
+          example: enabled
+        merge_requests_access_level:
+          type: string
+          example: enabled
+        forking_access_level:
+          type: string
+          example: enabled
+        wiki_access_level:
+          type: string
+          example: enabled
+        builds_access_level:
+          type: string
+          example: enabled
+        snippets_access_level:
+          type: string
+          example: enabled
+        pages_access_level:
+          type: string
+          example: enabled
+        analytics_access_level:
+          type: string
+          example: enabled
+        container_registry_access_level:
+          type: string
+          example: enabled
+        security_and_compliance_access_level:
+          type: string
+          example: enabled
+        releases_access_level:
+          type: string
+          example: enabled
+        environments_access_level:
+          type: string
+          example: enabled
+        feature_flags_access_level:
+          type: string
+          example: enabled
+        infrastructure_access_level:
+          type: string
+          example: enabled
+        monitor_access_level:
+          type: string
+          example: enabled
+        model_experiments_access_level:
+          type: string
+          example: enabled
+        model_registry_access_level:
+          type: string
+          example: enabled
+        package_registry_access_level:
+          type: string
+          example: enabled
+        emails_disabled:
+          type: boolean
+        emails_enabled:
+          type: boolean
+        show_diff_preview_in_email:
+          type: boolean
+        shared_runners_enabled:
+          type: boolean
+        lfs_enabled:
+          type: boolean
+        creator_id:
+          type: integer
+          format: int32
+          example: 1
+        mr_default_target_self:
+          type: boolean
+        import_url:
+          type: string
+          example: https://gitlab.com/gitlab/gitlab.git
+        import_type:
+          type: string
+          example: git
+        import_status:
+          type: string
+          example: none
+        import_error:
+          type: string
+          example: Import error
+        open_issues_count:
+          type: integer
+          format: int32
+          example: 1
+        description_html:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+          example: 2020-05-07 04:27:17.016000+00:00
+        ci_default_git_depth:
+          type: integer
+          format: int32
+          example: 20
+        ci_delete_pipelines_in_seconds:
+          type: integer
+          format: int32
+          example: 86400
+        ci_forward_deployment_enabled:
+          type: boolean
+        ci_forward_deployment_rollback_allowed:
+          type: boolean
+        ci_job_token_scope_enabled:
+          type: boolean
+        ci_separated_caches:
+          type: boolean
+        ci_allow_fork_pipelines_to_run_in_parent_project:
+          type: boolean
+        ci_id_token_sub_claim_components:
+          type: array
+          items:
+            type: string
+        build_git_strategy:
+          type: string
+          example: fetch
+        keep_latest_artifact:
+          type: boolean
+        restrict_user_defined_variables:
+          type: boolean
+        ci_pipeline_variables_minimum_override_role:
+          type: string
+        runner_token_expiration_interval:
+          type: integer
+          format: int32
+          example: 3600
+        group_runners_enabled:
+          type: boolean
+        resource_group_default_process_mode:
+          type: string
+          example: unordered
+        auto_cancel_pending_pipelines:
+          type: string
+          example: enabled
+        build_timeout:
+          type: integer
+          format: int32
+          example: 3600
+        auto_devops_enabled:
+          type: boolean
+        auto_devops_deploy_strategy:
+          type: string
+          example: continuous
+        ci_push_repository_for_job_token_allowed:
+          type: boolean
+        runners_token:
+          type: string
+          example: b8547b1dc37721d05889db52fa2f02
+        ci_config_path:
+          type: string
+          example: ''
+        public_jobs:
+          type: boolean
+        shared_with_groups:
+          type: array
+          items:
+            type: object
+            properties:
+              group_id:
+                type: integer
+                format: int64
+              group_name:
+                type: string
+              group_full_path:
+                type: string
+              group_access_level:
+                type: integer
+                format: int32
+              expires_at:
+                type: string
+                nullable: true
+        only_allow_merge_if_pipeline_succeeds:
+          type: boolean
+        allow_merge_on_skipped_pipeline:
+          type: boolean
+        request_access_enabled:
+          type: boolean
+        only_allow_merge_if_all_discussions_are_resolved:
+          type: boolean
+        remove_source_branch_after_merge:
+          type: boolean
+        printing_merge_request_link_enabled:
+          type: boolean
+        merge_method:
+          type: string
+          example: merge
+        merge_request_title_regex:
+          type: string
+          example: /Title of merge request/
+        merge_request_title_regex_description:
+          type: string
+          example: This requires the title to include a Jira label
+        squash_option:
+          type: string
+          example: default_off
+        enforce_auth_checks_on_uploads:
+          type: boolean
+        suggestion_commit_message:
+          type: string
+          example: Suggestion message
+        merge_commit_template:
+          type: string
+          example: '%(title)'
+        squash_commit_template:
+          type: string
+          example: '%(source_branch)'
+        issue_branch_template:
+          type: string
+          example: '%(title)'
+        statistics:
+          $ref: '#/components/schemas/API_Entities_ProjectStatistics'
+        warn_about_potentially_unwanted_characters:
+          type: boolean
+        autoclose_referenced_issues:
+          type: boolean
+        max_artifacts_size:
+          type: integer
+          format: int32
+        approvals_before_merge:
+          type: integer
+          format: int32
+        mirror:
+          type: boolean
+        mirror_user_id:
+          type: integer
+          format: int64
+        mirror_trigger_builds:
+          type: boolean
+        only_mirror_protected_branches:
+          type: boolean
+        mirror_overwrites_diverged_branches:
+          type: boolean
+        external_authorization_classification_label:
+          type: string
+        requirements_enabled:
+          type: boolean
+        requirements_access_level:
+          type: string
+        security_and_compliance_enabled:
+          type: boolean
+        secret_push_protection_enabled:
+          type: boolean
+        pre_receive_secret_detection_enabled:
+          type: boolean
+        compliance_frameworks:
+          type: array
+          items:
+            type: string
+        issues_template:
+          type: string
+        merge_requests_template:
+          type: string
+        ci_restrict_pipeline_cancellation_role:
+          type: string
+        merge_pipelines_enabled:
+          type: boolean
+        merge_trains_enabled:
+          type: boolean
+        merge_trains_skip_train_allowed:
+          type: boolean
+        only_allow_merge_if_all_status_checks_passed:
+          type: boolean
+        allow_pipeline_trigger_approve_deployment:
+          type: boolean
+        prevent_merge_without_jira_issue:
+          type: boolean
+        auto_duo_code_review_enabled:
+          type: boolean
+        duo_remote_flows_enabled:
+          type: boolean
+        duo_foundational_flows_enabled:
+          type: boolean
+        duo_sast_fp_detection_enabled:
+          type: boolean
+        web_based_commit_signing_enabled:
+          type: boolean
+        spp_repository_pipeline_access:
+          type: boolean
+          description: The spp_repository_pipeline_access setting is only visible
+            if the security_orchestration_policies feature is available.
+      description: API_Entities_Project model
+    API_Entities_ProjectAccess:
+      type: object
+      properties:
+        access_level:
+          type: string
+        notification_level:
+          type: string
+    API_Entities_ProjectStatistics:
+      type: object
+      properties:
+        commit_count:
+          type: string
+        storage_size:
+          type: string
+        repository_size:
+          type: string
+        wiki_size:
+          type: string
+        lfs_objects_size:
+          type: string
+        job_artifacts_size:
+          type: string
+        pipeline_artifacts_size:
+          type: string
+        packages_size:
+          type: string
+        snippets_size:
+          type: string
+        uploads_size:
+          type: string
+        container_registry_size:
+          type: string
+    API_Entities_ProjectWithAccess:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int32
+          example: 1
+        description:
+          type: string
+          example: desc
+        name:
+          type: string
+          example: project1
+        name_with_namespace:
+          type: string
+          example: John Doe / project1
+        path:
+          type: string
+          example: project1
+        path_with_namespace:
+          type: string
+          example: namespace1/project1
+        created_at:
+          type: string
+          format: date-time
+          example: 2020-05-07 04:27:17.016000+00:00
+        default_branch:
+          type: string
+          example: main
+        tag_list:
+          type: array
+          items:
+            type: string
+          example: tag
+        topics:
+          type: array
+          items:
+            type: string
+          example: topic
+        ssh_url_to_repo:
+          type: string
+          example: git@gitlab.example.com:gitlab/gitlab.git
+        http_url_to_repo:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab.git
+        web_url:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab
+        readme_url:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab/blob/master/README.md
+        forks_count:
+          type: integer
+          format: int32
+          example: 1
+        license_url:
+          type: string
+          example: https://gitlab.example.com/gitlab/gitlab/blob/master/LICENCE
+        license:
+          $ref: '#/components/schemas/API_Entities_LicenseBasic'
+        avatar_url:
+          type: string
+          example: http://example.com/uploads/project/avatar/3/uploads/avatar.png
+        star_count:
+          type: integer
+          format: int32
+          example: 1
+        last_activity_at:
+          type: string
+          format: date-time
+          example: 2013-09-30 13:46:02+00:00
+        visibility:
+          type: string
+          example: public
+        namespace:
+          $ref: '#/components/schemas/API_Entities_NamespaceBasic'
+        custom_attributes:
+          $ref: '#/components/schemas/API_Entities_CustomAttribute'
+        repository_storage:
+          type: string
+          example: default
+        forked_from_project:
+          $ref: '#/components/schemas/API_Entities_BasicProjectDetails'
+        container_registry_image_prefix:
+          type: string
+          example: registry.gitlab.example.com/gitlab/gitlab-client
+        _links:
+          type: object
+          properties:
+            self:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4
+            issues:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/issues
+            merge_requests:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/merge_requests
+            repo_branches:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/repository/branches
+            labels:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/labels
+            events:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/events
+            members:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/members
+            cluster_agents:
+              type: string
+              example: https://gitlab.example.com/api/v4/projects/4/cluster_agents
+        marked_for_deletion_at:
+          type: string
+        marked_for_deletion_on:
+          type: string
+        packages_enabled:
+          type: boolean
+        empty_repo:
+          type: boolean
+        archived:
+          type: boolean
+        owner:
+          $ref: '#/components/schemas/API_Entities_UserBasic'
+        resolve_outdated_diff_discussions:
+          type: boolean
+        container_expiration_policy:
+          $ref: '#/components/schemas/API_Entities_ContainerExpirationPolicy'
+        repository_object_format:
+          type: string
+          example: sha1
+        issues_enabled:
+          type: boolean
+        merge_requests_enabled:
+          type: boolean
+        wiki_enabled:
+          type: boolean
+        jobs_enabled:
+          type: boolean
+        snippets_enabled:
+          type: boolean
+        container_registry_enabled:
+          type: boolean
+        service_desk_enabled:
+          type: boolean
+        service_desk_address:
+          type: string
+          example: address@example.com
+        can_create_merge_request_in:
+          type: boolean
+        issues_access_level:
+          type: string
+          example: enabled
+        repository_access_level:
+          type: string
+          example: enabled
+        merge_requests_access_level:
+          type: string
+          example: enabled
+        forking_access_level:
+          type: string
+          example: enabled
+        wiki_access_level:
+          type: string
+          example: enabled
+        builds_access_level:
+          type: string
+          example: enabled
+        snippets_access_level:
+          type: string
+          example: enabled
+        pages_access_level:
+          type: string
+          example: enabled
+        analytics_access_level:
+          type: string
+          example: enabled
+        container_registry_access_level:
+          type: string
+          example: enabled
+        security_and_compliance_access_level:
+          type: string
+          example: enabled
+        releases_access_level:
+          type: string
+          example: enabled
+        environments_access_level:
+          type: string
+          example: enabled
+        feature_flags_access_level:
+          type: string
+          example: enabled
+        infrastructure_access_level:
+          type: string
+          example: enabled
+        monitor_access_level:
+          type: string
+          example: enabled
+        model_experiments_access_level:
+          type: string
+          example: enabled
+        model_registry_access_level:
+          type: string
+          example: enabled
+        package_registry_access_level:
+          type: string
+          example: enabled
+        emails_disabled:
+          type: boolean
+        emails_enabled:
+          type: boolean
+        show_diff_preview_in_email:
+          type: boolean
+        shared_runners_enabled:
+          type: boolean
+        lfs_enabled:
+          type: boolean
+        creator_id:
+          type: integer
+          format: int32
+          example: 1
+        mr_default_target_self:
+          type: boolean
+        import_url:
+          type: string
+          example: https://gitlab.com/gitlab/gitlab.git
+        import_type:
+          type: string
+          example: git
+        import_status:
+          type: string
+          example: none
+        import_error:
+          type: string
+          example: Import error
+        open_issues_count:
+          type: integer
+          format: int32
+          example: 1
+        description_html:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+          example: 2020-05-07 04:27:17.016000+00:00
+        ci_default_git_depth:
+          type: integer
+          format: int32
+          example: 20
+        ci_delete_pipelines_in_seconds:
+          type: integer
+          format: int32
+          example: 86400
+        ci_forward_deployment_enabled:
+          type: boolean
+        ci_forward_deployment_rollback_allowed:
+          type: boolean
+        ci_job_token_scope_enabled:
+          type: boolean
+        ci_separated_caches:
+          type: boolean
+        ci_allow_fork_pipelines_to_run_in_parent_project:
+          type: boolean
+        ci_id_token_sub_claim_components:
+          type: array
+          items:
+            type: string
+        build_git_strategy:
+          type: string
+          example: fetch
+        keep_latest_artifact:
+          type: boolean
+        restrict_user_defined_variables:
+          type: boolean
+        ci_pipeline_variables_minimum_override_role:
+          type: string
+        runner_token_expiration_interval:
+          type: integer
+          format: int32
+          example: 3600
+        group_runners_enabled:
+          type: boolean
+        resource_group_default_process_mode:
+          type: string
+          example: unordered
+        auto_cancel_pending_pipelines:
+          type: string
+          example: enabled
+        build_timeout:
+          type: integer
+          format: int32
+          example: 3600
+        auto_devops_enabled:
+          type: boolean
+        auto_devops_deploy_strategy:
+          type: string
+          example: continuous
+        ci_push_repository_for_job_token_allowed:
+          type: boolean
+        runners_token:
+          type: string
+          example: b8547b1dc37721d05889db52fa2f02
+        ci_config_path:
+          type: string
+          example: ''
+        public_jobs:
+          type: boolean
+        shared_with_groups:
+          type: array
+          items:
+            type: object
+            properties:
+              group_id:
+                type: integer
+                format: int64
+              group_name:
+                type: string
+              group_full_path:
+                type: string
+              group_access_level:
+                type: integer
+                format: int32
+              expires_at:
+                type: string
+                nullable: true
+        only_allow_merge_if_pipeline_succeeds:
+          type: boolean
+        allow_merge_on_skipped_pipeline:
+          type: boolean
+        request_access_enabled:
+          type: boolean
+        only_allow_merge_if_all_discussions_are_resolved:
+          type: boolean
+        remove_source_branch_after_merge:
+          type: boolean
+        printing_merge_request_link_enabled:
+          type: boolean
+        merge_method:
+          type: string
+          example: merge
+        merge_request_title_regex:
+          type: string
+          example: /Title of merge request/
+        merge_request_title_regex_description:
+          type: string
+          example: This requires the title to include a Jira label
+        squash_option:
+          type: string
+          example: default_off
+        enforce_auth_checks_on_uploads:
+          type: boolean
+        suggestion_commit_message:
+          type: string
+          example: Suggestion message
+        merge_commit_template:
+          type: string
+          example: '%(title)'
+        squash_commit_template:
+          type: string
+          example: '%(source_branch)'
+        issue_branch_template:
+          type: string
+          example: '%(title)'
+        statistics:
+          $ref: '#/components/schemas/API_Entities_ProjectStatistics'
+        warn_about_potentially_unwanted_characters:
+          type: boolean
+        autoclose_referenced_issues:
+          type: boolean
+        max_artifacts_size:
+          type: integer
+          format: int32
+        approvals_before_merge:
+          type: integer
+          format: int32
+        mirror:
+          type: boolean
+        mirror_user_id:
+          type: integer
+          format: int64
+        mirror_trigger_builds:
+          type: boolean
+        only_mirror_protected_branches:
+          type: boolean
+        mirror_overwrites_diverged_branches:
+          type: boolean
+        external_authorization_classification_label:
+          type: string
+        requirements_enabled:
+          type: boolean
+        requirements_access_level:
+          type: string
+        security_and_compliance_enabled:
+          type: boolean
+        secret_push_protection_enabled:
+          type: boolean
+        pre_receive_secret_detection_enabled:
+          type: boolean
+        compliance_frameworks:
+          type: array
+          items:
+            type: string
+        issues_template:
+          type: string
+        merge_requests_template:
+          type: string
+        ci_restrict_pipeline_cancellation_role:
+          type: string
+        merge_pipelines_enabled:
+          type: boolean
+        merge_trains_enabled:
+          type: boolean
+        merge_trains_skip_train_allowed:
+          type: boolean
+        only_allow_merge_if_all_status_checks_passed:
+          type: boolean
+        allow_pipeline_trigger_approve_deployment:
+          type: boolean
+        prevent_merge_without_jira_issue:
+          type: boolean
+        auto_duo_code_review_enabled:
+          type: boolean
+        duo_remote_flows_enabled:
+          type: boolean
+        duo_foundational_flows_enabled:
+          type: boolean
+        duo_sast_fp_detection_enabled:
+          type: boolean
+        web_based_commit_signing_enabled:
+          type: boolean
+        spp_repository_pipeline_access:
+          type: boolean
+          description: The spp_repository_pipeline_access setting is only visible
+            if the security_orchestration_policies feature is available.
+        permissions:
+          type: object
+          properties:
+            project_access:
+              $ref: '#/components/schemas/API_Entities_ProjectAccess'
+            group_access:
+              $ref: '#/components/schemas/API_Entities_GroupAccess'
+      description: API_Entities_ProjectWithAccess model
+    API_Entities_SamlGroupLink:
+      type: object
+      properties:
+        name:
+          type: string
+          example: saml-group-1
+        access_level:
+          type: integer
+          format: int32
+          example: 40
+        member_role_id:
+          type: integer
+          format: int32
+          example: 12
+        provider:
+          type: string
+          example: saml
+    API_Entities_UserBasic:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int32
+          example: 1
+        username:
+          type: string
+          example: admin
+        public_email:
+          type: string
+          example: john@example.com
+        name:
+          type: string
+          example: Administrator
+        state:
+          type: string
+          example: active
+        locked:
+          type: boolean
+        avatar_url:
+          type: string
+          example: https://gravatar.com/avatar/1
+        avatar_path:
+          type: string
+          example: /user/avatar/28/The-Big-Lebowski-400-400.png
+        custom_attributes:
+          type: array
+          items:
+            $ref: '#/components/schemas/API_Entities_CustomAttribute'
+        web_url:
+          type: string
+          example: https://gitlab.example.com/root
+      description: API_Entities_UserBasic model
+    putApiV4GroupsId:
+      type: object
+      properties:
+        name:
+          type: string
+          description: The name of the group
+        path:
+          type: string
+          description: The path of the group
+        description:
+          type: string
+          description: The description of the group
+        visibility:
+          type: string
+          description: The visibility of the group
+          enum:
+            - private
+            - internal
+            - public
+        avatar:
+          type: string
+          description: Avatar image for the group
+          format: binary
+        share_with_group_lock:
+          type: boolean
+          description: Prevent sharing a project with another group within this group
+        require_two_factor_authentication:
+          type: boolean
+          description: Require all users in this group to setup Two-factor authentication
+        two_factor_grace_period:
+          type: integer
+          format: int32
+          description: Time before Two-factor authentication is enforced
+        project_creation_level:
+          type: string
+          description: Determine if developers can create projects in the group
+          enum:
+            - noone
+            - owner
+            - maintainer
+            - developer
+            - administrator
+        auto_devops_enabled:
+          type: boolean
+          description: Default to Auto DevOps pipeline for all projects within this
+            group
+        subgroup_creation_level:
+          type: string
+          description: Allowed to create subgroups
+          enum:
+            - owner
+            - maintainer
+        emails_disabled:
+          type: boolean
+          description: '_(Deprecated)_ Disable email notifications. Use: emails_enabled'
+        emails_enabled:
+          type: boolean
+          description: Enable email notifications
+        show_diff_preview_in_email:
+          type: boolean
+          description: Include the code diff preview in merge request notification
+            emails
+        mentions_disabled:
+          type: boolean
+          description: Disable a group from getting mentioned
+        lfs_enabled:
+          type: boolean
+          description: Enable/disable LFS for the projects in this group
+        request_access_enabled:
+          type: boolean
+          description: Allow users to request member access
+        default_branch:
+          type: string
+          description: The default branch of group's projects
+          example: main
+        default_branch_protection:
+          type: integer
+          format: int32
+          description: Determine if developers can push to default branch
+          enum:
+            - 0
+            - 3
+            - 1
+            - 2
+            - 4
+        default_branch_protection_defaults:
+          type: object
+          description: Determine if developers can push to default branch
+          properties:
+            allowed_to_push:
+              type: array
+              description: An array of access levels allowed to push
+              items:
+                type: object
+                properties:
+                  access_level:
+                    type: integer
+                    format: int32
+                    description: A valid access level
+                    enum:
+                      - 30
+                      - 40
+                      - 60
+                      - 0
+                required:
+                  - access_level
+            allow_force_push:
+              type: boolean
+              description: Allow force push for all users with push access.
+            allowed_to_merge:
+              type: array
+              description: An array of access levels allowed to merge
+              items:
+                type: object
+                properties:
+                  access_level:
+                    type: integer
+                    format: int32
+                    description: A valid access level
+                    enum:
+                      - 30
+                      - 40
+                      - 60
+                      - 0
+                required:
+                  - access_level
+            code_owner_approval_required:
+              type: boolean
+              description: Require approval from code owners
+            developer_can_initial_push:
+              type: boolean
+              description: Allow developers to initial push
+        shared_runners_setting:
+          type: string
+          description: Enable/disable shared runners for the group and its subgroups
+            and projects
+          enum:
+            - disabled_and_unoverridable
+            - disabled_and_overridable
+            - enabled
+        enabled_git_access_protocol:
+          type: string
+          description: Allow only the selected protocols to be used for Git access.
+          enum:
+            - ssh
+            - http
+            - all
+        membership_lock:
+          type: boolean
+          description: Prevent adding new members to projects within this group
+        ldap_cn:
+          type: string
+          description: LDAP Common Name
+        ldap_access:
+          type: integer
+          format: int32
+          description: A valid access level
+        shared_runners_minutes_limit:
+          type: integer
+          format: int32
+          description: (admin-only) compute minutes quota for this group
+        extra_shared_runners_minutes_limit:
+          type: integer
+          format: int32
+          description: (admin-only) Extra compute minutes quota for this group
+        wiki_access_level:
+          type: string
+          description: Wiki access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        duo_availability:
+          type: string
+          description: Duo availability. One of `default_on`, `default_off` or `never_on`
+          enum:
+            - default_on
+            - default_off
+            - never_on
+        duo_remote_flows_availability:
+          type: boolean
+          description: Enable GitLab Duo remote flows for this group
+        duo_foundational_flows_availability:
+          type: boolean
+          description: Enable GitLab foundational Duo flows for this group
+        duo_sast_fp_detection_availability:
+          type: boolean
+          description: Enable GitLab Duo SAST false position detection for this group
+        amazon_q_auto_review_enabled:
+          type: boolean
+          description: Enable Amazon Q auto review for merge request
+        experiment_features_enabled:
+          type: boolean
+          description: Enable experiment features for this group
+        model_prompt_cache_enabled:
+          type: boolean
+          description: Enable model prompt cache for this group
+        foundational_agents_statuses:
+          type: array
+          description: Whether each foundational agent has been enabled or disabled.
+          items:
+            type: object
+            properties:
+              reference:
+                type: string
+                description: Reference of the foundational agent.
+              enabled:
+                type: boolean
+                description: Whether foundational agent has been enabled or disabled.
+            required:
+              - reference
+              - enabled
+        ai_settings_attributes:
+          type: object
+          description: AI-related settings
+          properties:
+            duo_agent_platform_enabled:
+              type: boolean
+              description: Whether Duo Agent Platform features are enabled
+            duo_workflow_mcp_enabled:
+              type: boolean
+              description: Enable MCP support for Duo Agent Platform
+            foundational_agents_default_enabled:
+              type: boolean
+              description: Whether new foundational agents are enabled by default
+            prompt_injection_protection_level:
+              type: string
+              description: Prompt injection protection level. One of `no_checks`,
+                `log_only` or `interrupt`
+              enum:
+                - no_checks
+                - log_only
+                - interrupt
+            minimum_access_level_execute:
+              type: integer
+              format: int32
+              description: The minimum access level required to execute Duo Agent
+                Platform. This field is behind a feature flag.
+              enum:
+                - 10
+                - 15
+                - 20
+                - 30
+                - 40
+                - 50
+            minimum_access_level_execute_async:
+              type: integer
+              format: int32
+              description: The minimum access level required to execute Duo Agent
+                Platform features in CI/CD. This field is behind a feature flag.
+              enum:
+                - 30
+                - 40
+                - 50
+            minimum_access_level_manage:
+              type: integer
+              format: int32
+              description: The minimum access level required to manage Duo Agent Platform.
+                This field is behind a feature flag.
+              enum:
+                - 30
+                - 40
+                - 50
+            minimum_access_level_enable_on_projects:
+              type: integer
+              format: int32
+              description: The minimum access level required to enable Duo Agent Platform.
+                This field is behind a feature flag.
+              enum:
+                - 30
+                - 40
+                - 50
+        prevent_sharing_groups_outside_hierarchy:
+          type: boolean
+          description: Prevent sharing groups within this namespace with any groups
+            outside the namespace. Only available on top-level groups.
+        step_up_auth_required_oauth_provider:
+          type: string
+          description: OAuth provider required for step-up authentication. Pass empty
+            string to disable.
+        lock_math_rendering_limits_enabled:
+          type: boolean
+          description: Indicates if math rendering limits are locked for all descendent
+            groups.
+        math_rendering_limits_enabled:
+          type: boolean
+          description: Indicates if math rendering limits are used for this group.
+        max_artifacts_size:
+          type: integer
+          format: int32
+          description: Set the maximum file size for each job's artifacts
+        file_template_project_id:
+          type: integer
+          format: int32
+          description: The ID of a project to use for custom templates in this group
+        prevent_forking_outside_group:
+          type: boolean
+          description: Prevent forking projects inside this group to external namespaces
+        unique_project_download_limit:
+          type: integer
+          format: int32
+          description: Maximum number of unique projects a user can download in the
+            specified time period before they are banned.
+        unique_project_download_limit_interval_in_seconds:
+          type: integer
+          format: int32
+          description: Time period during which a user can download a maximum amount
+            of projects before they are banned.
+        unique_project_download_limit_allowlist:
+          type: array
+          description: List of usernames excluded from the unique project download
+            limit
+          items:
+            type: string
+        unique_project_download_limit_alertlist:
+          type: array
+          description: List of user ids who will be emailed when Git abuse rate limit
+            is exceeded
+          items:
+            type: integer
+            format: int32
+        auto_ban_user_on_excessive_projects_download:
+          type: boolean
+          description: Ban users from the group when they exceed maximum number of
+            unique projects download in the specified time period
+        ip_restriction_ranges:
+          type: string
+          description: List of IP addresses which need to be restricted for group
+        allowed_email_domains_list:
+          type: string
+          description: List of allowed email domains for group
+        service_access_tokens_expiration_enforced:
+          type: boolean
+          description: To enforce token expiration for Service accounts users for
+            group
+        duo_core_features_enabled:
+          type: boolean
+          description: '[Experimental] Indicates whether GitLab Duo Core features
+            are enabled for the group'
+        duo_features_enabled:
+          type: boolean
+          description: Indicates whether GitLab Duo features are enabled for the group
+        lock_duo_features_enabled:
+          type: boolean
+          description: Indicates if the GitLab Duo features enabled setting is enforced
+            for all subgroups
+        auto_duo_code_review_enabled:
+          type: boolean
+          description: Enable automatic reviews by GitLab Duo on merge requests
+        web_based_commit_signing_enabled:
+          type: boolean
+          description: Enable web based commit signing for this group
+        only_allow_merge_if_pipeline_succeeds:
+          type: boolean
+          description: Only allow to merge if builds succeed
+        allow_merge_on_skipped_pipeline:
+          type: boolean
+          description: Allow to merge if pipeline is skipped
+        only_allow_merge_if_all_discussions_are_resolved:
+          type: boolean
+          description: Only allow to merge if all threads are resolved
+        enabled_foundational_flows:
+          type: array
+          description: References of enabled foundational flows
+          items:
+            type: string
+        allow_personal_snippets:
+          type: boolean
+          description: Allow creation of personal snippets for enterprise users of
+            this group
+        duo_namespace_access_rules:
+          type: array
+          description: AI entity access rules for controlling Duo feature access
+          items:
+            type: object
+            properties:
+              through_namespace:
+                type: object
+                description: Object containing through namespace information
+                properties:
+                  id:
+                    type: integer
+                    format: int32
+                    description: ID of the through namespace
+                  name:
+                    type: string
+                    description: Name of the through namespace
+                  full_path:
+                    type: string
+                    description: Full path of the through namespace
+                required:
+                  - id
+              features:
+                type: array
+                description: List of accessible features
+                items:
+                  type: string
+            required:
+              - through_namespace
+              - features
+      description: Update a group. Available only for users who can administrate groups.
+    putApiV4ProjectsId:
+      type: object
+      properties:
+        name:
+          type: string
+          description: The name of the project
+          example: project
+        default_branch:
+          type: string
+          description: The default branch of the project
+          example: main
+        path:
+          type: string
+          description: The path of the repository
+          example: group/project
+        description:
+          type: string
+          description: The description of the project
+        build_git_strategy:
+          type: string
+          description: The Git strategy. Defaults to `fetch`
+          enum:
+            - fetch
+            - clone
+        build_timeout:
+          type: integer
+          format: int32
+          description: Build timeout
+        auto_cancel_pending_pipelines:
+          type: string
+          description: Auto-cancel pending pipelines
+          enum:
+            - disabled
+            - enabled
+        ci_config_path:
+          type: string
+          description: The path to CI config file. Defaults to `.gitlab-ci.yml`
+        service_desk_enabled:
+          type: boolean
+          description: Disable or enable the service desk
+        issues_enabled:
+          type: boolean
+          description: Flag indication if the issue tracker is enabled
+        merge_requests_enabled:
+          type: boolean
+          description: Flag indication if merge requests are enabled
+        wiki_enabled:
+          type: boolean
+          description: Flag indication if the wiki is enabled
+        jobs_enabled:
+          type: boolean
+          description: Flag indication if jobs are enabled
+        snippets_enabled:
+          type: boolean
+          description: Flag indication if snippets are enabled
+        issues_access_level:
+          type: string
+          description: Issues access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        repository_access_level:
+          type: string
+          description: Repository access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        merge_requests_access_level:
+          type: string
+          description: Merge requests access level. One of `disabled`, `private` or
+            `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        forking_access_level:
+          type: string
+          description: Forks access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        wiki_access_level:
+          type: string
+          description: Wiki access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        builds_access_level:
+          type: string
+          description: Builds access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        snippets_access_level:
+          type: string
+          description: Snippets access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        package_registry_access_level:
+          type: string
+          description: Controls visibility of the package registry. One of `disabled`,
+            `private`, `enabled` or `public`. `private` will make the package registry
+            accessible only to project members (reporter role and above). `enabled`
+            will make the package registry accessible to everyone who has access to
+            the project. `public` will make the package registry accessible to everyone.
+            `disabled` will disable the package registry
+          enum:
+            - disabled
+            - private
+            - enabled
+            - public
+        pages_access_level:
+          type: string
+          description: Pages access level. One of `disabled`, `private`, `enabled`
+            or `public`
+          enum:
+            - disabled
+            - private
+            - enabled
+            - public
+        analytics_access_level:
+          type: string
+          description: Analytics access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        container_registry_access_level:
+          type: string
+          description: Controls visibility of the container registry. One of `disabled`,
+            `private` or `enabled`. `private` will make the container registry accessible
+            only to project members (reporter role and above). `enabled` will make
+            the container registry accessible to everyone who has access to the project.
+            `disabled` will disable the container registry
+          enum:
+            - disabled
+            - private
+            - enabled
+        security_and_compliance_access_level:
+          type: string
+          description: Security and compliance access level. One of `disabled`, `private`
+            or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        releases_access_level:
+          type: string
+          description: Releases access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        environments_access_level:
+          type: string
+          description: Environments access level. One of `disabled`, `private` or
+            `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        feature_flags_access_level:
+          type: string
+          description: Feature flags access level. One of `disabled`, `private` or
+            `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        infrastructure_access_level:
+          type: string
+          description: Infrastructure access level. One of `disabled`, `private` or
+            `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        monitor_access_level:
+          type: string
+          description: Monitor access level. One of `disabled`, `private` or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        model_experiments_access_level:
+          type: string
+          description: Model experiments access level. One of `disabled`, `private`
+            or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        model_registry_access_level:
+          type: string
+          description: Model registry access level. One of `disabled`, `private` or
+            `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        emails_disabled:
+          type: boolean
+          description: 'Deprecated: Use emails_enabled instead.'
+        emails_enabled:
+          type: boolean
+          description: Enable email notifications
+        show_default_award_emojis:
+          type: boolean
+          description: Show default award emojis
+        show_diff_preview_in_email:
+          type: boolean
+          description: Include the code diff preview in merge request notification
+            emails
+        warn_about_potentially_unwanted_characters:
+          type: boolean
+          description: Warn about potentially unwanted characters
+        enforce_auth_checks_on_uploads:
+          type: boolean
+          description: Enforce auth check on uploads
+        shared_runners_enabled:
+          type: boolean
+          description: Flag indication if shared runners are enabled for that project
+        group_runners_enabled:
+          type: boolean
+          description: Flag indication if group runners are enabled for that project
+        resource_group_default_process_mode:
+          type: string
+          description: The process mode of the resource group
+          enum:
+            - unordered
+            - oldest_first
+            - newest_first
+            - newest_ready_first
+        resolve_outdated_diff_discussions:
+          type: boolean
+          description: Automatically resolve merge request diff threads on lines changed
+            with a push
+        remove_source_branch_after_merge:
+          type: boolean
+          description: Remove the source branch by default after merge
+        packages_enabled:
+          type: boolean
+          description: 'Deprecated: Use :package_registry_access_level instead. Enable
+            project packages feature'
+        container_registry_enabled:
+          type: boolean
+          description: 'Deprecated: Use :container_registry_access_level instead.
+            Flag indication if the container registry is enabled for that project'
+        container_expiration_policy_attributes:
+          type: object
+          description: Object that contains information on the container expiration
+            policy
+          properties:
+            cadence:
+              type: string
+              description: Container expiration policy cadence for recurring job
+            keep_n:
+              type: integer
+              format: int32
+              description: Container expiration policy number of images to keep
+            older_than:
+              type: string
+              description: Container expiration policy remove images older than value
+            name_regex:
+              type: string
+              description: Container expiration policy regex for image removal
+            name_regex_keep:
+              type: string
+              description: Container expiration policy regex for image retention
+            enabled:
+              type: boolean
+              description: Flag indication if container expiration policy is enabled
+        lfs_enabled:
+          type: boolean
+          description: Flag indication if Git LFS is enabled for that project
+        visibility:
+          type: string
+          description: The visibility of the project.
+          enum:
+            - private
+            - internal
+            - public
+        public_builds:
+          type: boolean
+          description: 'Deprecated: Use public_jobs instead.'
+        public_jobs:
+          type: boolean
+          description: Perform public builds
+        request_access_enabled:
+          type: boolean
+          description: Allow users to request member access
+        only_allow_merge_if_pipeline_succeeds:
+          type: boolean
+          description: Only allow to merge if builds succeed
+        allow_merge_on_skipped_pipeline:
+          type: boolean
+          description: Allow to merge if pipeline is skipped
+        only_allow_merge_if_all_discussions_are_resolved:
+          type: boolean
+          description: Only allow to merge if all threads are resolved
+        tag_list:
+          type: array
+          description: 'Deprecated: Use :topics instead'
+          items:
+            type: string
+        topics:
+          type: array
+          description: The list of topics for a project
+          items:
+            type: string
+        avatar:
+          type: string
+          description: Avatar image for project
+          format: binary
+        printing_merge_request_link_enabled:
+          type: boolean
+          description: Show link to create/view merge request when pushing from the
+            command line
+        merge_method:
+          type: string
+          description: The merge method used when merging merge requests
+          enum:
+            - ff
+            - rebase_merge
+            - merge
+        suggestion_commit_message:
+          type: string
+          description: The commit message used to apply merge request suggestions
+        merge_commit_template:
+          type: string
+          description: Template used to create merge commit message
+        squash_commit_template:
+          type: string
+          description: Template used to create squash commit message
+        issue_branch_template:
+          type: string
+          description: Template used to create a branch from an issue
+        auto_devops_enabled:
+          type: boolean
+          description: Flag indication if Auto DevOps is enabled
+        auto_devops_deploy_strategy:
+          type: string
+          description: Auto Deploy strategy
+          enum:
+            - continuous
+            - manual
+            - timed_incremental
+        autoclose_referenced_issues:
+          type: boolean
+          description: Flag indication if referenced issues auto-closing is enabled
+        repository_storage:
+          type: string
+          description: Which storage shard the repository is on. Available only to
+            admins
+        squash_option:
+          type: string
+          description: Squash default for project. One of `never`, `always`, `default_on`,
+            or `default_off`.
+          enum:
+            - never
+            - always
+            - default_on
+            - default_off
+        mr_default_target_self:
+          type: boolean
+          description: Merge requests of this forked project targets itself by default
+        merge_request_title_regex:
+          type: string
+          description: The regex the Merge Request must adhere to
+        merge_request_title_regex_description:
+          type: string
+          description: The description for the regex the Merge Request must adhere
+            to
+        only_allow_merge_if_all_status_checks_passed:
+          type: boolean
+          description: Blocks merge requests from merging unless all status checks
+            have passed
+        approvals_before_merge:
+          type: integer
+          format: int32
+          description: How many approvers should approve merge request by default
+        mirror:
+          type: boolean
+          description: '[Deprecated] Enables pull mirroring in a project'
+        mirror_trigger_builds:
+          type: boolean
+          description: '[Deprecated] Pull mirroring triggers builds'
+        external_authorization_classification_label:
+          type: string
+          description: The classification label for the project
+        requirements_access_level:
+          type: string
+          description: Requirements feature access level. One of `disabled`, `private`
+            or `enabled`
+          enum:
+            - disabled
+            - private
+            - enabled
+        prevent_merge_without_jira_issue:
+          type: boolean
+          description: Require an associated issue from Jira
+        auto_duo_code_review_enabled:
+          type: boolean
+          description: Enable automatic reviews by GitLab Duo on merge requests
+        duo_remote_flows_enabled:
+          type: boolean
+          description: Enable GitLab Duo remote flows for this project
+        duo_sast_fp_detection_enabled:
+          type: boolean
+          description: Enable GitLab Duo SAST false positive detection for this project
+        spp_repository_pipeline_access:
+          type: boolean
+          description: Grant read-only access to security policy configurations for
+            enforcement in linked CI/CD projects
+        ci_default_git_depth:
+          type: integer
+          format: int32
+          description: Default number of revisions for shallow cloning
+        keep_latest_artifact:
+          type: boolean
+          description: Indicates if the latest artifact should be kept for this project.
+        ci_forward_deployment_enabled:
+          type: boolean
+          description: Prevent older deployment jobs that are still pending
+        ci_forward_deployment_rollback_allowed:
+          type: boolean
+          description: Allow job retries for rollback deployments
+        ci_allow_fork_pipelines_to_run_in_parent_project:
+          type: boolean
+          description: Allow fork merge request pipelines to run in parent project
+        ci_separated_caches:
+          type: boolean
+          description: Enable or disable separated caches based on branch protection.
+        restrict_user_defined_variables:
+          type: boolean
+          description: Restrict use of user-defined variables when triggering a pipeline
+        ci_pipeline_variables_minimum_override_role:
+          type: string
+          description: Limit ability to override CI/CD variables when triggering a
+            pipeline to only users with at least the set minimum role
+          enum:
+            - no_one_allowed
+            - developer
+            - maintainer
+            - owner
+        ci_push_repository_for_job_token_allowed:
+          type: boolean
+          description: Allow pushing to this project's repository by authenticating
+            with a CI/CD job token generated in this project.
+        ci_id_token_sub_claim_components:
+          type: array
+          description: Claims that will be used to build the sub claim in id tokens
+          items:
+            type: string
+        ci_delete_pipelines_in_seconds:
+          type: integer
+          format: int32
+          description: Pipelines older than the configured time are deleted
+        max_artifacts_size:
+          type: integer
+          format: int32
+          description: Set the maximum file size for each job's artifacts
+        allow_pipeline_trigger_approve_deployment:
+          type: boolean
+          description: Allow pipeline triggerer to approve deployments
+        mirror_user_id:
+          type: integer
+          format: int32
+          description: '[Deprecated] User responsible for all the activity surrounding
+            a pull mirror event. Can only be set by admins'
+        only_mirror_protected_branches:
+          type: boolean
+          description: '[Deprecated] Only mirror protected branches'
+        mirror_branch_regex:
+          type: string
+          description: '[Deprecated] Only mirror branches match regex'
+        mirror_overwrites_diverged_branches:
+          type: boolean
+          description: '[Deprecated] Pull mirror overwrites diverged branches'
+        import_url:
+          type: string
+          description: URL from which the project is imported
+        fallback_approvals_required:
+          type: integer
+          format: int32
+          description: Overall approvals required when no rule is present
+        issues_template:
+          type: string
+          description: Default description for Issues. Description is parsed with
+            GitLab Flavored Markdown.
+        merge_requests_template:
+          type: string
+          description: Default description for merge requests. Description is parsed
+            with GitLab Flavored Markdown.
+        merge_pipelines_enabled:
+          type: boolean
+          description: Enable merged results pipelines.
+        merge_trains_enabled:
+          type: boolean
+          description: Enable merge trains.
+        merge_trains_skip_train_allowed:
+          type: boolean
+          description: Allow merge train merge requests to be merged without waiting
+            for pipelines to finish.
+        ci_restrict_pipeline_cancellation_role:
+          type: string
+          description: Roles allowed to cancel pipelines and jobs.
+        web_based_commit_signing_enabled:
+          type: boolean
+          description: Enable web based commit signing for this project
+      description: Update an existing project
+  securitySchemes:
+    access_token_header:
+      type: apiKey
+      name: PRIVATE-TOKEN
+      in: header
+    access_token_query:
+      type: apiKey
+      name: private_token
+      in: query
+servers:
+  - url: //gitlab.com

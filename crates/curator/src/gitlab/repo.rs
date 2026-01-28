@@ -2,23 +2,17 @@
 
 use std::sync::Arc;
 
-use backon::Retryable;
 use chrono::{Duration, Utc};
-use gitlab::AsyncGitlab;
-use gitlab::api::{self, AsyncQuery, Pagination};
 use tokio::sync::Semaphore;
 
-use super::error::{GitLabError, is_rate_limit_error, short_error_message};
+use super::client::GitLabClient;
+use super::error::GitLabError;
 use super::types::{GitLabProject, ProgressCallback, SyncProgress, emit};
-use crate::retry::default_backoff;
 use crate::sync::{StarResult, StarringStats};
 
 /// List all projects for a group with automatic pagination.
-///
-/// Uses the gitlab crate's `paged()` function to automatically handle
-/// pagination and collect all results.
 pub async fn list_group_projects(
-    client: &AsyncGitlab,
+    client: &GitLabClient,
     group: &str,
     include_subgroups: bool,
     on_progress: Option<&ProgressCallback>,
@@ -32,17 +26,7 @@ pub async fn list_group_projects(
         },
     );
 
-    let endpoint = gitlab::api::groups::projects::GroupProjects::builder()
-        .group(group)
-        .include_subgroups(include_subgroups)
-        .build()
-        .map_err(|e| GitLabError::Builder(e.to_string()))?;
-
-    // Use paged() for automatic pagination
-    let paged = api::paged(endpoint, Pagination::All);
-
-    let projects: Vec<GitLabProject> =
-        paged.query_async(client).await.map_err(GitLabError::from)?;
+    let projects: Vec<GitLabProject> = client.list_group_projects(group, include_subgroups).await?;
 
     emit(
         on_progress,
@@ -84,75 +68,39 @@ pub fn filter_by_activity_owned(
 /// Star a project by ID.
 ///
 /// Returns Ok(true) if the project was starred, Ok(false) if already starred.
-pub async fn star_project(client: &AsyncGitlab, project_id: u64) -> Result<bool, GitLabError> {
-    let endpoint = gitlab::api::projects::star::StarProject::builder()
-        .project(project_id)
-        .build()
-        .map_err(|e| GitLabError::Builder(e.to_string()))?;
-
-    // Use api::ignore() since we don't need the response body for starring
-    match api::ignore(endpoint).query_async(client).await {
-        Ok(()) => Ok(true), // Newly starred
-        Err(e) => {
-            let msg = e.to_string();
-            // GitLab returns 304 Not Modified if already starred
-            if msg.contains("304") || msg.contains("Not Modified") {
-                Ok(false) // Already starred
-            } else {
-                Err(GitLabError::from(e))
-            }
-        }
-    }
+pub async fn star_project(client: &GitLabClient, project_id: u64) -> Result<bool, GitLabError> {
+    client.star_project(project_id).await
 }
 
 /// Star a project with exponential backoff retry on rate limit errors.
 ///
 /// Returns Ok(true) if starred, Ok(false) if already starred, Err on permanent failure.
 pub async fn star_project_with_retry(
-    client: &AsyncGitlab,
+    client: &GitLabClient,
     project_id: u64,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<bool, GitLabError> {
-    // Track attempt number for progress reporting
-    let attempt = std::sync::atomic::AtomicU32::new(0);
+    use super::error::{is_rate_limit_error, short_error_message};
+    use crate::retry::with_retry;
 
-    let star_op = || async {
-        attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        star_project(client, project_id).await
-    };
+    let full_name = format!("project_{}", project_id);
+    let client = client.clone();
 
-    star_op
-        .retry(default_backoff())
-        .notify(|err, dur| {
-            let current_attempt = attempt.load(std::sync::atomic::Ordering::SeqCst);
-            emit(
-                on_progress,
-                SyncProgress::RateLimitBackoff {
-                    owner: String::new(),
-                    name: format!("project_{}", project_id),
-                    retry_after_ms: dur.as_millis() as u64,
-                    attempt: current_attempt,
-                },
-            );
-            tracing::debug!(
-                "Rate limited on project {}, retrying in {:?} (attempt {}): {}",
-                project_id,
-                dur,
-                current_attempt,
-                short_error_message(err)
-            );
-        })
-        .when(is_rate_limit_error)
-        .await
+    with_retry(
+        || async { client.star_project(project_id).await },
+        is_rate_limit_error,
+        short_error_message,
+        &full_name,
+        "",
+        on_progress,
+    )
+    .await
 }
 
 /// Star multiple projects concurrently with progress reporting.
-///
-/// Takes a list of projects and stars them concurrently, respecting the
-/// given concurrency limit.
 #[allow(dead_code)]
 pub async fn star_projects_batch(
-    _client: &AsyncGitlab,
+    client: &GitLabClient,
     projects: &[&GitLabProject],
     concurrency: usize,
     dry_run: bool,
@@ -176,7 +124,6 @@ pub async fn star_projects_batch(
         },
     );
 
-    // Collect project info before spawning tasks
     let project_info: Vec<_> = projects
         .iter()
         .map(|p| (p.id, p.namespace.full_path.clone(), p.name.clone()))
@@ -184,11 +131,9 @@ pub async fn star_projects_batch(
 
     let mut handles = Vec::with_capacity(projects.len());
 
-    for (_project_id, owner, name) in project_info {
+    for (project_id, owner, name) in project_info {
         let semaphore = Arc::clone(&semaphore);
-        // Clone client for the async task
-        // Note: AsyncGitlab doesn't implement Clone, so we need to work around this
-        // For now, we'll process sequentially or use a reference
+        let client = client.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = match semaphore.acquire().await {
@@ -202,16 +147,15 @@ pub async fn star_projects_batch(
                 }
             };
 
-            // In dry run mode, we just report what would happen
-            let star_result = if dry_run {
-                StarResult::Starred // Assume would be starred
-            } else {
-                // We can't actually star here without the client
-                // This is a limitation - see note below
-                StarResult::Error("Batch starring not implemented".to_string())
-            };
+            if dry_run {
+                return (owner, name, StarResult::Starred);
+            }
 
-            (owner, name, star_result)
+            match client.star_project(project_id).await {
+                Ok(true) => (owner, name, StarResult::Starred),
+                Ok(false) => (owner, name, StarResult::AlreadyStarred),
+                Err(e) => (owner, name, StarResult::Error(e.to_string())),
+            }
         });
 
         handles.push(handle);
@@ -321,7 +265,6 @@ mod tests {
     #[test]
     fn test_filter_by_activity_includes_recent() {
         let projects = vec![mock_project("recent-project", 10)];
-
         let filtered = filter_by_activity(&projects, Duration::days(30));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "recent-project");
@@ -330,7 +273,6 @@ mod tests {
     #[test]
     fn test_filter_by_activity_excludes_old() {
         let projects = vec![mock_project("old-project", 100)];
-
         let filtered = filter_by_activity(&projects, Duration::days(30));
         assert_eq!(filtered.len(), 0);
     }
@@ -342,10 +284,8 @@ mod tests {
             mock_project("old", 100),
             mock_project("borderline", 29),
         ];
-
         let filtered = filter_by_activity(&projects, Duration::days(30));
         assert_eq!(filtered.len(), 2);
-
         let names: Vec<_> = filtered.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"recent"));
         assert!(names.contains(&"borderline"));
@@ -355,15 +295,8 @@ mod tests {
     #[test]
     fn test_filter_by_activity_owned() {
         let projects = vec![mock_project("recent", 10), mock_project("old", 100)];
-
         let filtered = filter_by_activity_owned(projects, Duration::days(30));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "recent");
-    }
-
-    #[test]
-    fn test_default_backoff_builder() {
-        // Just verify it builds without panicking
-        let _backoff = default_backoff();
     }
 }

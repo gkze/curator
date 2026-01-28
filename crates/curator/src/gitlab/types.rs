@@ -6,10 +6,14 @@ use serde::Deserialize;
 // Re-export shared types from sync module
 pub use crate::sync::{ProgressCallback, SyncProgress, emit};
 
+use super::api::types as generated;
+
 /// GitLab project - fields we need from the API response.
 ///
-/// This struct is used to deserialize GitLab API responses. We define only
-/// the fields we need, which makes the code resilient to API changes.
+/// This struct provides strongly-typed access to the fields we use.
+/// The generated Progenitor types have every field as `Option` (per the
+/// OpenAPI spec), so these `From` impls extract what we need with sensible
+/// defaults.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitLabProject {
     /// Project ID.
@@ -116,4 +120,176 @@ pub struct GitLabUser {
     /// Number of public repos (only available on /user endpoint).
     #[serde(default)]
     pub public_email: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// From impls: Progenitor generated types → our types
+// ---------------------------------------------------------------------------
+
+impl From<generated::ApiEntitiesProject> for GitLabProject {
+    fn from(p: generated::ApiEntitiesProject) -> Self {
+        let ns = p
+            .namespace
+            .map(GitLabNamespace::from)
+            .unwrap_or_else(|| GitLabNamespace {
+                id: 0,
+                name: String::new(),
+                path: String::new(),
+                full_path: String::new(),
+                kind: String::new(),
+            });
+
+        Self {
+            id: p.id.unwrap_or(0) as u64,
+            name: p.name.unwrap_or_default(),
+            path: p.path.unwrap_or_default(),
+            path_with_namespace: p.path_with_namespace.unwrap_or_default(),
+            description: p.description,
+            default_branch: p.default_branch,
+            visibility: p.visibility.unwrap_or_else(|| "private".to_string()),
+            archived: p.archived.unwrap_or(false),
+            topics: p.topics,
+            star_count: p.star_count.unwrap_or(0) as u32,
+            forks_count: p.forks_count.unwrap_or(0) as u32,
+            open_issues_count: p.open_issues_count.map(|v| v as u32),
+            created_at: p.created_at.unwrap_or_else(Utc::now),
+            last_activity_at: p.last_activity_at.unwrap_or_else(Utc::now),
+            namespace: ns,
+            forked_from_project: p.forked_from_project.map(|fp| {
+                Box::new(ForkedFrom {
+                    id: fp.id.unwrap_or(0) as u64,
+                })
+            }),
+            mirror: p.mirror,
+            issues_enabled: p.issues_enabled,
+            wiki_enabled: p.wiki_enabled,
+            merge_requests_enabled: p.merge_requests_enabled,
+            web_url: p.web_url.unwrap_or_default(),
+            ssh_url_to_repo: p.ssh_url_to_repo,
+            http_url_to_repo: p.http_url_to_repo,
+        }
+    }
+}
+
+impl From<generated::ApiEntitiesProjectWithAccess> for GitLabProject {
+    fn from(p: generated::ApiEntitiesProjectWithAccess) -> Self {
+        let ns = p
+            .namespace
+            .map(GitLabNamespace::from)
+            .unwrap_or_else(|| GitLabNamespace {
+                id: 0,
+                name: String::new(),
+                path: String::new(),
+                full_path: String::new(),
+                kind: String::new(),
+            });
+
+        Self {
+            id: p.id.unwrap_or(0) as u64,
+            name: p.name.unwrap_or_default(),
+            path: p.path.unwrap_or_default(),
+            path_with_namespace: p.path_with_namespace.unwrap_or_default(),
+            description: p.description,
+            default_branch: p.default_branch,
+            visibility: p.visibility.unwrap_or_else(|| "private".to_string()),
+            archived: p.archived.unwrap_or(false),
+            topics: p.topics,
+            star_count: p.star_count.unwrap_or(0) as u32,
+            forks_count: p.forks_count.unwrap_or(0) as u32,
+            open_issues_count: p.open_issues_count.map(|v| v as u32),
+            created_at: p.created_at.unwrap_or_else(Utc::now),
+            last_activity_at: p.last_activity_at.unwrap_or_else(Utc::now),
+            namespace: ns,
+            forked_from_project: p.forked_from_project.map(|fp| {
+                Box::new(ForkedFrom {
+                    id: fp.id.unwrap_or(0) as u64,
+                })
+            }),
+            mirror: p.mirror,
+            issues_enabled: p.issues_enabled,
+            wiki_enabled: p.wiki_enabled,
+            merge_requests_enabled: p.merge_requests_enabled,
+            web_url: p.web_url.unwrap_or_default(),
+            ssh_url_to_repo: p.ssh_url_to_repo,
+            http_url_to_repo: p.http_url_to_repo,
+        }
+    }
+}
+
+impl From<generated::ApiEntitiesNamespaceBasic> for GitLabNamespace {
+    fn from(ns: generated::ApiEntitiesNamespaceBasic) -> Self {
+        Self {
+            id: ns.id.unwrap_or(0) as u64,
+            name: ns.name.unwrap_or_default(),
+            path: ns.path.unwrap_or_default(),
+            full_path: ns.full_path.unwrap_or_default(),
+            kind: ns.kind.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<generated::GetApiV4UserResponse> for GitLabUser {
+    fn from(u: generated::GetApiV4UserResponse) -> Self {
+        Self {
+            id: u.id as u64,
+            username: u.username,
+            name: u.name,
+            email: u.email,
+            bio: u.bio,
+            public_email: u.public_email,
+        }
+    }
+}
+
+impl From<generated::ApiEntitiesGroupDetail> for GitLabGroup {
+    fn from(g: generated::ApiEntitiesGroupDetail) -> Self {
+        Self {
+            id: g.id.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+            name: g.name.unwrap_or_default(),
+            full_path: g.full_path.unwrap_or_default(),
+            description: g.description,
+            visibility: g.visibility.unwrap_or_else(|| "private".to_string()),
+        }
+    }
+}
+
+impl From<generated::ApiEntitiesBasicProjectDetails> for GitLabProject {
+    fn from(p: generated::ApiEntitiesBasicProjectDetails) -> Self {
+        let ns = p
+            .namespace
+            .map(GitLabNamespace::from)
+            .unwrap_or_else(|| GitLabNamespace {
+                id: 0,
+                name: String::new(),
+                path: String::new(),
+                full_path: String::new(),
+                kind: String::new(),
+            });
+
+        Self {
+            id: p.id.unwrap_or(0) as u64,
+            name: p.name.unwrap_or_default(),
+            path: p.path.unwrap_or_default(),
+            path_with_namespace: p.path_with_namespace.unwrap_or_default(),
+            description: p.description,
+            default_branch: p.default_branch,
+            visibility: p.visibility.unwrap_or_else(|| "private".to_string()),
+            archived: false, // not in BasicProjectDetails
+            topics: p.topics,
+            star_count: p.star_count.unwrap_or(0) as u32,
+            forks_count: p.forks_count.unwrap_or(0) as u32,
+            open_issues_count: None, // not in BasicProjectDetails
+            created_at: p.created_at.unwrap_or_else(Utc::now),
+            last_activity_at: p.last_activity_at.unwrap_or_else(Utc::now),
+            namespace: ns,
+            forked_from_project: None,    // not in BasicProjectDetails
+            mirror: None,                 // not in BasicProjectDetails
+            issues_enabled: None,         // not in BasicProjectDetails
+            wiki_enabled: None,           // not in BasicProjectDetails
+            merge_requests_enabled: None, // not in BasicProjectDetails
+            web_url: p.web_url.unwrap_or_default(),
+            ssh_url_to_repo: p.ssh_url_to_repo,
+            http_url_to_repo: p.http_url_to_repo,
+        }
+    }
 }

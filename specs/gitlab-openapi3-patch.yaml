@@ -1,0 +1,50 @@
+---
+# Patch for GitLab OpenAPI 3.0 spec: adds endpoints missing from the
+# auto-generated Swagger 2.0 spec (doc/api/openapi/openapi_v2.yaml).
+#
+# Applied via yq deep merge after swagger2openapi conversion.
+# See: https://docs.gitlab.com/ee/api/users.html#for-normal-users-1
+paths:
+  /api/v4/user:
+    get:
+      summary: Get the currently authenticated user
+      description: Gets the currently authenticated user. Returns user info for the
+        token holder.
+      operationId: getApiV4User
+      tags:
+        - users
+      responses:
+        "200":
+          description: The currently authenticated user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                    description: User ID
+                  username:
+                    type: string
+                    description: Username
+                  name:
+                    type: string
+                    nullable: true
+                    description: Display name
+                  email:
+                    type: string
+                    nullable: true
+                    description: Email address (may be empty based on privacy settings)
+                  bio:
+                    type: string
+                    nullable: true
+                    description: User bio
+                  public_email:
+                    type: string
+                    nullable: true
+                    description: Public email address
+                required:
+                  - id
+                  - username
+        "401":
+          description: Unauthorized

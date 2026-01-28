@@ -28,9 +28,11 @@
 //! let result = sync_namespace_streaming(&client, "group-name", &options, None, tx, None).await?;
 //! ```
 
+pub(crate) mod api;
 mod client;
 mod convert;
 mod error;
+pub mod oauth;
 mod repo;
 mod types;
 

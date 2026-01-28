@@ -87,9 +87,13 @@ pub struct GitLabConfig {
     /// GitLab host (e.g., "gitlab.com" or "https://gitlab.example.com").
     /// Can also be set via CURATOR_GITLAB_HOST environment variable.
     pub host: Option<String>,
-    /// GitLab API token (personal access token).
+    /// GitLab API token (personal access token or OAuth access token).
     /// Can also be set via CURATOR_GITLAB_TOKEN environment variable.
     pub token: Option<String>,
+    /// OAuth refresh token for automatic token renewal.
+    pub refresh_token: Option<String>,
+    /// Unix timestamp when the OAuth access token expires.
+    pub token_expires_at: Option<u64>,
     /// Include projects from subgroups when syncing.
     pub include_subgroups: bool,
 }
@@ -99,6 +103,8 @@ impl Default for GitLabConfig {
         Self {
             host: Some("gitlab.com".to_string()),
             token: None,
+            refresh_token: None,
+            token_expires_at: None,
             include_subgroups: true,
         }
     }
@@ -248,6 +254,18 @@ impl Config {
         self.gitlab.token.clone()
     }
 
+    /// Get the GitLab OAuth refresh token.
+    #[cfg(feature = "gitlab")]
+    pub fn gitlab_refresh_token(&self) -> Option<String> {
+        self.gitlab.refresh_token.clone()
+    }
+
+    /// Get the GitLab OAuth token expiry (Unix timestamp).
+    #[cfg(feature = "gitlab")]
+    pub fn gitlab_token_expires_at(&self) -> Option<u64> {
+        self.gitlab.token_expires_at
+    }
+
     /// Get the Codeberg token.
     #[cfg(feature = "gitea")]
     pub fn codeberg_token(&self) -> Option<String> {
@@ -329,6 +347,61 @@ impl Config {
             doc["github"] = toml_edit::table();
         }
         doc["github"]["token"] = value(token);
+
+        // Write back to file
+        fs::write(&config_path, doc.to_string())?;
+        Ok(config_path)
+    }
+
+    /// Save GitLab OAuth tokens to the config file.
+    ///
+    /// Saves the access token, refresh token, and expiry timestamp to the
+    /// `[gitlab]` section. Creates the config file and parent directories
+    /// if they don't exist. Preserves existing config formatting and comments.
+    #[cfg(feature = "gitlab")]
+    pub fn save_gitlab_oauth_tokens(
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at: Option<u64>,
+    ) -> io::Result<PathBuf> {
+        use toml_edit::{DocumentMut, value};
+
+        let config_path = Self::default_config_path().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not determine config directory",
+            )
+        })?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Read existing config or start fresh
+        let content = if config_path.exists() {
+            fs::read_to_string(&config_path)?
+        } else {
+            String::new()
+        };
+
+        // Parse as TOML document (preserves formatting and comments)
+        let mut doc: DocumentMut = content.parse().map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid TOML: {}", e))
+        })?;
+
+        // Ensure [gitlab] table exists and set the tokens
+        if !doc.contains_key("gitlab") {
+            doc["gitlab"] = toml_edit::table();
+        }
+        doc["gitlab"]["token"] = value(access_token);
+
+        if let Some(rt) = refresh_token {
+            doc["gitlab"]["refresh_token"] = value(rt);
+        }
+        if let Some(exp) = expires_at {
+            doc["gitlab"]["token_expires_at"] = value(exp as i64);
+        }
 
         // Write back to file
         fs::write(&config_path, doc.to_string())?;

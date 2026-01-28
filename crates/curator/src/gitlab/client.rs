@@ -1,14 +1,17 @@
 //! GitLab API client creation and management.
+//!
+//! Wraps the Progenitor-generated client from [`super::api`] with pagination,
+//! rate-limit header parsing, and starred-project caching.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use gitlab::api::{self, AsyncQuery, Pagination};
-use gitlab::{AsyncGitlab, GitlabBuilder};
+use reqwest::header::{self, HeaderMap, HeaderValue};
 use tokio::sync::Mutex;
 
+use super::api;
 use super::convert::to_platform_repo;
 use super::error::{GitLabError, is_rate_limit_error, short_error_message};
 use super::types::{GitLabGroup, GitLabProject, GitLabUser};
@@ -20,20 +23,20 @@ use crate::platform::{
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
 
-/// GitLab API client wrapper with Arc<Mutex<>> for cloneability.
+/// GitLab API client backed by the Progenitor-generated typed client.
 ///
-/// Wraps the `AsyncGitlab` client from the gitlab crate in an `Arc<Mutex<>>`
-/// to enable cloning and parallel operations. While `AsyncGitlab` doesn't
-/// implement `Clone`, this wrapper does.
-///
-/// The mutex overhead is acceptable because:
-/// - GitLab has lower rate limits (300/min for gitlab.com)
-/// - Most time is spent on network I/O, not holding the lock
-/// - This is simpler than connection pooling
+/// The inner [`api::Client`] provides typed methods for each endpoint defined
+/// in the trimmed OpenAPI spec.  This wrapper adds:
+/// - Automatic pagination (the generated methods return a single page)
+/// - Rate-limit header parsing via [`progenitor_client::ResponseValue::headers`]
+/// - Starred-project caching for efficient `is_repo_starred` checks
 #[derive(Clone)]
 pub struct GitLabClient {
-    inner: Arc<Mutex<AsyncGitlab>>,
+    /// Progenitor-generated typed client.
+    api: api::Client,
+    /// Normalised host URL (e.g. `https://gitlab.com`).
     host: String,
+    /// Starred projects cache to avoid re-fetching.
     starred_projects_cache: Arc<Mutex<Option<StarredProjectsCache>>>,
 }
 
@@ -46,34 +49,40 @@ struct StarredProjectsCache {
 impl GitLabClient {
     /// Create a new GitLab client.
     ///
-    /// # Arguments
-    ///
-    /// * `host` - GitLab host (e.g., "gitlab.com" or "https://gitlab.example.com")
-    /// * `token` - Personal access token
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let client = GitLabClient::new("gitlab.com", "your-token").await?;
-    /// ```
+    /// Builds a [`reqwest::Client`] with the supplied token and passes it to
+    /// the Progenitor-generated client via [`api::Client::new_with_client`].
     pub async fn new(host: &str, token: &str) -> Result<Self, GitLabError> {
-        // The gitlab crate's GitlabBuilder expects just the hostname without scheme.
-        // It will add https:// internally. Strip any scheme if provided.
         let host_only = host
             .trim_start_matches("https://")
             .trim_start_matches("http://")
             .trim_end_matches('/');
 
-        let inner = GitlabBuilder::new(host_only, token)
-            .build_async()
-            .await
-            .map_err(|e| GitLabError::Auth(e.to_string()))?;
+        let base_url = format!("https://{}", host_only);
+        let normalized_host = base_url.clone();
 
-        // Store the full URL for display purposes
-        let normalized_host = format!("https://{}", host_only);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "PRIVATE-TOKEN",
+            HeaderValue::from_str(token)
+                .map_err(|e| GitLabError::Auth(format!("Invalid token: {}", e)))?,
+        );
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .user_agent("curator")
+            .build()
+            .map_err(|e| GitLabError::Http(format!("Failed to build HTTP client: {}", e)))?;
+
+        let api = api::Client::new_with_client(&base_url, http);
+
+        // Validate the token with a typed call
+        let resp = api.get_api_v4_user().await.map_err(GitLabError::from)?;
+        // Discard the body; we only needed to check auth succeeds
+        let _ = resp.into_inner();
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
+            api,
             host: normalized_host,
             starred_projects_cache: Arc::new(Mutex::new(None)),
         })
@@ -83,6 +92,386 @@ impl GitLabClient {
     pub fn host(&self) -> &str {
         &self.host
     }
+
+    /// Extract rate limit info from response headers.
+    fn parse_rate_limit_headers(headers: &HeaderMap) -> Option<RateLimitInfo> {
+        let limit = headers
+            .get("ratelimit-limit")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())?;
+        let remaining = headers
+            .get("ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())?;
+        let reset_epoch = headers
+            .get("ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())?;
+
+        let reset_at = chrono::DateTime::from_timestamp(reset_epoch, 0)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|| Utc::now() + chrono::Duration::minutes(1));
+
+        Some(RateLimitInfo {
+            limit,
+            remaining,
+            reset_at,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Paginated helpers — call generated methods in a loop
+    // ------------------------------------------------------------------
+
+    /// List all projects for a group with automatic pagination.
+    pub async fn list_group_projects(
+        &self,
+        group: &str,
+        include_subgroups: bool,
+    ) -> Result<Vec<GitLabProject>, GitLabError> {
+        let mut all: Vec<GitLabProject> = Vec::new();
+        let mut page = 1i32;
+        let per_page = 100i32;
+
+        loop {
+            let resp = self
+                .api
+                .get_api_v4_groups_id_projects(
+                    group,
+                    None,                    // active
+                    None,                    // archived
+                    None,                    // include_ancestor_groups
+                    Some(include_subgroups), // include_subgroups
+                    None,                    // min_access_level
+                    None,                    // order_by
+                    None,                    // owned
+                    Some(page),              // page
+                    Some(per_page),          // per_page
+                    None,                    // search
+                    None,                    // simple
+                    None,                    // sort
+                    None,                    // starred
+                    None,                    // visibility
+                    None,                    // with_custom_attributes
+                    None,                    // with_issues_enabled
+                    None,                    // with_merge_requests_enabled
+                    None,                    // with_security_reports
+                    None,                    // with_shared
+                )
+                .await
+                .map_err(GitLabError::from)?;
+
+            let total_pages: Option<i32> = resp
+                .headers()
+                .get("x-total-pages")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
+
+            let items = resp.into_inner();
+            let is_empty = items.is_empty();
+            all.extend(items.into_iter().map(GitLabProject::from));
+
+            if is_empty {
+                break;
+            }
+            if let Some(total) = total_pages
+                && page >= total
+            {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(all)
+    }
+
+    /// Get information about the authenticated user.
+    pub async fn get_user_info(&self) -> Result<GitLabUser, GitLabError> {
+        let resp = self
+            .api
+            .get_api_v4_user()
+            .await
+            .map_err(GitLabError::from)?;
+        Ok(GitLabUser::from(resp.into_inner()))
+    }
+
+    /// List all projects for a specific user with automatic pagination.
+    pub async fn list_user_projects(
+        &self,
+        username: &str,
+    ) -> Result<Vec<GitLabProject>, GitLabError> {
+        let user_id = self.resolve_user_id(username).await?;
+        let uid = user_id.to_string();
+        let mut all: Vec<GitLabProject> = Vec::new();
+        let mut page = 1i32;
+        let per_page = 100i32;
+
+        loop {
+            let resp = self
+                .api
+                .get_api_v4_users_user_id_projects(
+                    &uid,
+                    None,           // active
+                    None,           // archived
+                    None,           // id_after
+                    None,           // id_before
+                    None,           // imported
+                    None,           // include_hidden
+                    None,           // include_pending_delete
+                    None,           // last_activity_after
+                    None,           // last_activity_before
+                    None,           // marked_for_deletion_on
+                    None,           // membership
+                    None,           // min_access_level
+                    None,           // order_by
+                    None,           // owned
+                    Some(page),     // page
+                    Some(per_page), // per_page
+                    None,           // repository_checksum_failed
+                    None,           // repository_storage
+                    None,           // search
+                    None,           // search_namespaces
+                    None,           // simple
+                    None,           // sort
+                    None,           // starred
+                    None,           // statistics
+                    None,           // topic
+                    None,           // topic_id
+                    None,           // updated_after
+                    None,           // updated_before
+                    None,           // visibility
+                    None,           // wiki_checksum_failed
+                    None,           // with_custom_attributes
+                    None,           // with_issues_enabled
+                    None,           // with_merge_requests_enabled
+                    None,           // with_programming_language
+                )
+                .await
+                .map_err(GitLabError::from)?;
+
+            let total_pages: Option<i32> = resp
+                .headers()
+                .get("x-total-pages")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
+
+            let items = resp.into_inner();
+            let is_empty = items.is_empty();
+            all.extend(items.into_iter().map(GitLabProject::from));
+
+            if is_empty {
+                break;
+            }
+            if let Some(total) = total_pages
+                && page >= total
+            {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(all)
+    }
+
+    /// Resolve a username to a user ID.
+    ///
+    /// The trimmed OpenAPI spec doesn't include `/users?username=X`, so we
+    /// fall back to the inner reqwest client for this one lookup.
+    async fn resolve_user_id(&self, username: &str) -> Result<u64, GitLabError> {
+        let url = format!("{}/api/v4/users", self.host);
+        let resp = self
+            .api
+            .client
+            .get(&url)
+            .query(&[("username", username)])
+            .send()
+            .await
+            .map_err(GitLabError::from)?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(GitLabError::from_status(status, &body));
+        }
+
+        let users: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| GitLabError::Deserialize(format!("Failed to parse users list: {}", e)))?;
+
+        users
+            .first()
+            .and_then(|u| u.get("id"))
+            .and_then(|id| id.as_u64())
+            .ok_or_else(|| GitLabError::Api(format!("User not found: {}", username)))
+    }
+
+    /// Star a project by ID.
+    ///
+    /// Returns `Ok(true)` if the project was starred, `Ok(false)` if already starred.
+    pub async fn star_project(&self, project_id: u64) -> Result<bool, GitLabError> {
+        let id_str = project_id.to_string();
+        match self.api.post_api_v4_projects_id_star(&id_str).await {
+            Ok(_) => Ok(true),
+            Err(progenitor_client::Error::ErrorResponse(rv))
+                if rv.status() == reqwest::StatusCode::NOT_MODIFIED =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(GitLabError::from(e)),
+        }
+    }
+
+    /// Unstar a project by ID.
+    ///
+    /// Returns `Ok(true)` if the project was unstarred, `Ok(false)` if wasn't starred.
+    pub async fn unstar_project(&self, project_id: u64) -> Result<bool, GitLabError> {
+        let id_str = project_id.to_string();
+        match self.api.post_api_v4_projects_id_unstar(&id_str).await {
+            Ok(_) => Ok(true),
+            Err(progenitor_client::Error::ErrorResponse(rv))
+                if rv.status() == reqwest::StatusCode::NOT_MODIFIED =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(GitLabError::from(e)),
+        }
+    }
+
+    /// List all projects starred by a user with automatic pagination.
+    pub async fn list_starred_projects(
+        &self,
+        user_id: u64,
+    ) -> Result<Vec<GitLabProject>, GitLabError> {
+        let uid = user_id.to_string();
+        let mut all: Vec<GitLabProject> = Vec::new();
+        let mut page = 1i32;
+        let per_page = 100i32;
+
+        loop {
+            let resp = self
+                .api
+                .get_api_v4_users_user_id_starred_projects(
+                    &uid,
+                    None,           // active
+                    None,           // archived
+                    None,           // id_after
+                    None,           // id_before
+                    None,           // imported
+                    None,           // include_hidden
+                    None,           // include_pending_delete
+                    None,           // last_activity_after
+                    None,           // last_activity_before
+                    None,           // marked_for_deletion_on
+                    None,           // membership
+                    None,           // min_access_level
+                    None,           // order_by
+                    None,           // owned
+                    Some(page),     // page
+                    Some(per_page), // per_page
+                    None,           // repository_checksum_failed
+                    None,           // repository_storage
+                    None,           // search
+                    None,           // search_namespaces
+                    None,           // simple
+                    None,           // sort
+                    None,           // starred
+                    None,           // statistics
+                    None,           // topic
+                    None,           // topic_id
+                    None,           // updated_after
+                    None,           // updated_before
+                    None,           // visibility
+                    None,           // wiki_checksum_failed
+                    None,           // with_issues_enabled
+                    None,           // with_merge_requests_enabled
+                    None,           // with_programming_language
+                )
+                .await
+                .map_err(GitLabError::from)?;
+
+            let total_pages: Option<i32> = resp
+                .headers()
+                .get("x-total-pages")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
+
+            let items = resp.into_inner();
+            let is_empty = items.is_empty();
+            all.extend(items.into_iter().map(GitLabProject::from));
+
+            if is_empty {
+                break;
+            }
+            if let Some(total) = total_pages
+                && page >= total
+            {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(all)
+    }
+
+    /// Get information about a group.
+    pub async fn get_group_info(&self, group: &str) -> Result<OrgInfo, GitLabError> {
+        let resp = self
+            .api
+            .get_api_v4_groups_id(
+                group, None, // custom_attributes
+                None, // with_projects
+            )
+            .await;
+
+        match resp {
+            Ok(rv) => {
+                let detail: GitLabGroup = rv.into_inner().into();
+                Ok(OrgInfo {
+                    name: detail.name,
+                    public_repos: 0,
+                    description: detail.description,
+                })
+            }
+            Err(progenitor_client::Error::ErrorResponse(rv))
+                if rv.status() == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Err(GitLabError::GroupNotFound(group.to_string()))
+            }
+            Err(e) => Err(GitLabError::from(e)),
+        }
+    }
+
+    /// Look up a project by its full path (owner/name).
+    async fn get_project_by_path(&self, full_path: &str) -> Result<GitLabProject, GitLabError> {
+        let resp = self
+            .api
+            .get_api_v4_projects_id(
+                full_path, None, // license
+                None, // statistics
+                None, // with_custom_attributes
+            )
+            .await;
+
+        match resp {
+            Ok(rv) => Ok(GitLabProject::from(rv.into_inner())),
+            Err(progenitor_client::Error::ErrorResponse(rv))
+                if rv.status() == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Err(GitLabError::ProjectNotFound(full_path.to_string()))
+            }
+            Err(progenitor_client::Error::UnexpectedResponse(rv))
+                if rv.status() == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Err(GitLabError::ProjectNotFound(full_path.to_string()))
+            }
+            Err(e) => Err(GitLabError::from(e)),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Starred-project cache helpers
+    // ------------------------------------------------------------------
 
     fn build_starred_paths(projects: &[GitLabProject]) -> HashSet<String> {
         projects
@@ -111,179 +500,29 @@ impl GitLabClient {
         *cache = None;
     }
 
-    /// Get rate limit information.
+    /// Get rate limit information from the API.
     ///
-    /// GitLab doesn't have a dedicated rate limit endpoint, so we return
-    /// approximate values. The actual rate limits are included in response
-    /// headers which we don't currently track.
-    pub fn get_rate_limit(&self) -> RateLimitInfo {
-        // GitLab.com defaults: 2000 requests per minute for authenticated users
-        // Self-hosted instances may vary
+    /// Makes a lightweight request to extract rate limit headers. Falls back to
+    /// hardcoded defaults if headers aren't present.
+    pub async fn get_rate_limit(&self) -> RateLimitInfo {
+        if let Ok(resp) = self.api.get_api_v4_user().await
+            && let Some(info) = Self::parse_rate_limit_headers(resp.headers())
+        {
+            return info;
+        }
+
+        // Fallback: GitLab.com defaults (2000 req/min for authenticated users)
         RateLimitInfo {
             limit: 2000,
             remaining: 2000,
             reset_at: Utc::now() + chrono::Duration::minutes(1),
         }
     }
-
-    /// Get information about a group.
-    pub async fn get_group_info(&self, group: &str) -> Result<OrgInfo, GitLabError> {
-        let endpoint = gitlab::api::groups::Group::builder()
-            .group(group)
-            .build()
-            .map_err(|e| GitLabError::Builder(e.to_string()))?;
-
-        let client = self.inner.lock().await;
-        let group_data: GitLabGroup = endpoint
-            .query_async(&*client)
-            .await
-            .map_err(GitLabError::from)?;
-
-        Ok(OrgInfo {
-            name: group_data.name,
-            public_repos: 0, // Unknown without additional API call
-            description: group_data.description,
-        })
-    }
-
-    /// List all projects for a group with automatic pagination.
-    pub async fn list_group_projects(
-        &self,
-        group: &str,
-        include_subgroups: bool,
-    ) -> Result<Vec<GitLabProject>, GitLabError> {
-        let endpoint = gitlab::api::groups::projects::GroupProjects::builder()
-            .group(group)
-            .include_subgroups(include_subgroups)
-            .build()
-            .map_err(|e| GitLabError::Builder(e.to_string()))?;
-
-        // Use paged() for automatic pagination
-        let paged = api::paged(endpoint, Pagination::All);
-
-        let client = self.inner.lock().await;
-        let projects: Vec<GitLabProject> = paged
-            .query_async(&*client)
-            .await
-            .map_err(GitLabError::from)?;
-
-        Ok(projects)
-    }
-
-    /// Get information about the authenticated user.
-    pub async fn get_user_info(&self) -> Result<GitLabUser, GitLabError> {
-        let endpoint = gitlab::api::users::CurrentUser::builder()
-            .build()
-            .map_err(|e| GitLabError::Builder(e.to_string()))?;
-
-        let client = self.inner.lock().await;
-        let user: GitLabUser = endpoint
-            .query_async(&*client)
-            .await
-            .map_err(GitLabError::from)?;
-
-        Ok(user)
-    }
-
-    /// List all projects for a specific user with automatic pagination.
-    pub async fn list_user_projects(
-        &self,
-        username: &str,
-    ) -> Result<Vec<GitLabProject>, GitLabError> {
-        let endpoint = gitlab::api::users::UserProjects::builder()
-            .user(username)
-            .build()
-            .map_err(|e| GitLabError::Builder(e.to_string()))?;
-
-        // Use paged() for automatic pagination
-        let paged = api::paged(endpoint, Pagination::All);
-
-        let client = self.inner.lock().await;
-        let projects: Vec<GitLabProject> = paged
-            .query_async(&*client)
-            .await
-            .map_err(GitLabError::from)?;
-
-        Ok(projects)
-    }
-
-    /// Star a project by ID.
-    ///
-    /// Returns Ok(true) if the project was starred, Ok(false) if already starred.
-    pub async fn star_project(&self, project_id: u64) -> Result<bool, GitLabError> {
-        let endpoint = gitlab::api::projects::star::StarProject::builder()
-            .project(project_id)
-            .build()
-            .map_err(|e| GitLabError::Builder(e.to_string()))?;
-
-        let client = self.inner.lock().await;
-        match api::ignore(endpoint).query_async(&*client).await {
-            Ok(()) => Ok(true), // Newly starred
-            Err(e) => {
-                let msg = e.to_string();
-                // GitLab returns 304 Not Modified if already starred
-                if msg.contains("304") || msg.contains("Not Modified") {
-                    Ok(false) // Already starred
-                } else {
-                    Err(GitLabError::from(e))
-                }
-            }
-        }
-    }
-
-    /// Unstar a project by ID.
-    ///
-    /// Returns Ok(true) if the project was unstarred, Ok(false) if wasn't starred.
-    pub async fn unstar_project(&self, project_id: u64) -> Result<bool, GitLabError> {
-        let endpoint = gitlab::api::projects::star::UnstarProject::builder()
-            .project(project_id)
-            .build()
-            .map_err(
-                |e: gitlab::api::projects::star::UnstarProjectBuilderError| {
-                    GitLabError::Builder(e.to_string())
-                },
-            )?;
-
-        let client = self.inner.lock().await;
-        match api::ignore(endpoint).query_async(&*client).await {
-            Ok(()) => Ok(true), // Unstarred
-            Err(e) => {
-                let msg = e.to_string();
-                // GitLab returns 304 Not Modified if wasn't starred
-                if msg.contains("304") || msg.contains("Not Modified") {
-                    Ok(false) // Wasn't starred
-                } else {
-                    Err(GitLabError::from(e))
-                }
-            }
-        }
-    }
-
-    /// List all projects starred by a user with automatic pagination.
-    pub async fn list_starred_projects(
-        &self,
-        user_id: u64,
-    ) -> Result<Vec<GitLabProject>, GitLabError> {
-        let endpoint = gitlab::api::users::UserProjects::builder()
-            .user(user_id)
-            .starred(true)
-            .build()
-            .map_err(|e: gitlab::api::users::UserProjectsBuilderError| {
-                GitLabError::Builder(e.to_string())
-            })?;
-
-        // Use paged() for automatic pagination
-        let paged = api::paged(endpoint, Pagination::All);
-
-        let client = self.inner.lock().await;
-        let projects: Vec<GitLabProject> = paged
-            .query_async(&*client)
-            .await
-            .map_err(GitLabError::from)?;
-
-        Ok(projects)
-    }
 }
+
+// ---------------------------------------------------------------------------
+// PlatformClient trait implementation
+// ---------------------------------------------------------------------------
 
 #[async_trait]
 impl PlatformClient for GitLabClient {
@@ -292,7 +531,7 @@ impl PlatformClient for GitLabClient {
     }
 
     async fn get_rate_limit(&self) -> platform::Result<RateLimitInfo> {
-        Ok(GitLabClient::get_rate_limit(self))
+        Ok(GitLabClient::get_rate_limit(self).await)
     }
 
     async fn get_org_info(&self, org: &str) -> platform::Result<OrgInfo> {
@@ -307,8 +546,8 @@ impl PlatformClient for GitLabClient {
             name: user.name,
             email: user.email.or(user.public_email),
             bio: user.bio,
-            public_repos: 0, // GitLab doesn't provide this in user endpoint
-            followers: 0,    // GitLab doesn't provide this in user endpoint
+            public_repos: 0,
+            followers: 0,
         })
     }
 
@@ -318,7 +557,6 @@ impl PlatformClient for GitLabClient {
         _db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
-        // TODO: Implement ETag caching for GitLab
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -328,7 +566,7 @@ impl PlatformClient for GitLabClient {
             },
         );
 
-        let projects = self.list_group_projects(org, true).await?;
+        let projects: Vec<GitLabProject> = self.list_group_projects(org, true).await?;
 
         emit(
             on_progress,
@@ -337,9 +575,7 @@ impl PlatformClient for GitLabClient {
             },
         );
 
-        // Convert to PlatformRepo
         let repos: Vec<PlatformRepo> = projects.iter().map(to_platform_repo).collect();
-
         Ok(repos)
     }
 
@@ -349,7 +585,6 @@ impl PlatformClient for GitLabClient {
         _db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
-        // TODO: Implement ETag caching for GitLab
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -359,7 +594,7 @@ impl PlatformClient for GitLabClient {
             },
         );
 
-        let projects = self.list_user_projects(username).await?;
+        let projects: Vec<GitLabProject> = self.list_user_projects(username).await?;
 
         emit(
             on_progress,
@@ -368,15 +603,11 @@ impl PlatformClient for GitLabClient {
             },
         );
 
-        // Convert to PlatformRepo
         let repos: Vec<PlatformRepo> = projects.iter().map(to_platform_repo).collect();
-
         Ok(repos)
     }
 
     async fn is_repo_starred(&self, owner: &str, name: &str) -> platform::Result<bool> {
-        // GitLab doesn't provide a direct "is starred" endpoint. We fetch the
-        // authenticated user's starred projects and cache the list.
         let full_path = format!("{}/{}", owner, name);
         let user = self.get_user_info().await?;
 
@@ -384,7 +615,7 @@ impl PlatformClient for GitLabClient {
             return Ok(cached);
         }
 
-        let projects = self.list_starred_projects(user.id).await?;
+        let projects: Vec<GitLabProject> = self.list_starred_projects(user.id).await?;
         let paths = Self::build_starred_paths(&projects);
         let is_starred = paths.contains(&full_path);
 
@@ -398,22 +629,11 @@ impl PlatformClient for GitLabClient {
     }
 
     async fn star_repo(&self, owner: &str, name: &str) -> platform::Result<bool> {
-        // GitLab stars by project ID, not owner/name
-        // We need to look up the project first or extract ID from metadata
-        // For now, we'll search for the project
         let full_path = format!("{}/{}", owner, name);
-
-        let endpoint = gitlab::api::projects::Project::builder()
-            .project(&full_path)
-            .build()
-            .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-        let client = self.inner.lock().await;
-        let project: GitLabProject = endpoint
-            .query_async(&*client)
+        let project: GitLabProject = self
+            .get_project_by_path(&full_path)
             .await
-            .map_err(|e| PlatformError::api(e.to_string()))?;
-        drop(client); // Release lock before starring
+            .map_err(PlatformError::from)?;
 
         let result = self
             .star_project(project.id)
@@ -431,23 +651,14 @@ impl PlatformClient for GitLabClient {
     ) -> platform::Result<bool> {
         let full_path = format!("{}/{}", owner, name);
 
-        // Look up project ID first (before retry loop)
-        let endpoint = gitlab::api::projects::Project::builder()
-            .project(&full_path)
-            .build()
-            .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-        let client = self.inner.lock().await;
-        let project: GitLabProject = endpoint
-            .query_async(&*client)
+        let project: GitLabProject = self
+            .get_project_by_path(&full_path)
             .await
-            .map_err(|e| PlatformError::api(e.to_string()))?;
-        drop(client); // Release lock
+            .map_err(PlatformError::from)?;
 
         let project_id = project.id;
         let client = self.clone();
 
-        // GitLab uses full_path as owner and empty name for progress reporting
         let result = with_retry(
             || async { client.star_project(project_id).await },
             is_rate_limit_error,
@@ -464,21 +675,11 @@ impl PlatformClient for GitLabClient {
     }
 
     async fn unstar_repo(&self, owner: &str, name: &str) -> platform::Result<bool> {
-        // GitLab unstars by project ID, not owner/name
-        // We need to look up the project first
         let full_path = format!("{}/{}", owner, name);
-
-        let endpoint = gitlab::api::projects::Project::builder()
-            .project(&full_path)
-            .build()
-            .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-        let client = self.inner.lock().await;
-        let project: GitLabProject = endpoint
-            .query_async(&*client)
+        let project: GitLabProject = self
+            .get_project_by_path(&full_path)
             .await
-            .map_err(|e| PlatformError::api(e.to_string()))?;
-        drop(client); // Release lock before unstarring
+            .map_err(PlatformError::from)?;
 
         let result = self
             .unstar_project(project.id)
@@ -495,8 +696,6 @@ impl PlatformClient for GitLabClient {
         _skip_rate_checks: bool,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
-        // LIMITATION: The gitlab crate handles pagination internally, so `concurrency` is ignored.
-        // TODO: Implement ETag caching for GitLab (see beads issue curator-vvy)
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -506,11 +705,8 @@ impl PlatformClient for GitLabClient {
             },
         );
 
-        // First get the current user's ID
         let user = self.get_user_info().await?;
-
-        // Then fetch their starred projects
-        let projects = self.list_starred_projects(user.id).await?;
+        let projects: Vec<GitLabProject> = self.list_starred_projects(user.id).await?;
 
         emit(
             on_progress,
@@ -521,9 +717,7 @@ impl PlatformClient for GitLabClient {
 
         self.update_starred_cache(user.id, &projects).await;
 
-        // Convert to PlatformRepo
         let repos: Vec<PlatformRepo> = projects.iter().map(to_platform_repo).collect();
-
         Ok(repos)
     }
 
@@ -535,10 +729,6 @@ impl PlatformClient for GitLabClient {
         _skip_rate_checks: bool,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<usize> {
-        // LIMITATION: The gitlab crate's `api::paged()` fetches all pages before returning,
-        // so this isn't truly streaming. The `concurrency` parameter is ignored.
-        // See beads issue curator-0tg for tracking.
-        // TODO: Implement ETag caching for GitLab (see beads issue curator-vvy)
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -548,15 +738,11 @@ impl PlatformClient for GitLabClient {
             },
         );
 
-        // First get the current user's ID
         let user = self.get_user_info().await?;
-
-        // Fetch starred projects (uses library pagination internally)
-        let projects = self.list_starred_projects(user.id).await?;
+        let projects: Vec<GitLabProject> = self.list_starred_projects(user.id).await?;
 
         self.update_starred_cache(user.id, &projects).await;
 
-        // Stream repos as we convert them
         let mut sent = 0usize;
         for project in &projects {
             let platform_repo = to_platform_repo(project);
@@ -576,11 +762,6 @@ impl PlatformClient for GitLabClient {
 }
 
 /// Create a GitLab client (convenience function).
-///
-/// # Arguments
-///
-/// * `host` - GitLab host (e.g., "gitlab.com")
-/// * `token` - Personal access token
 pub async fn create_client(host: &str, token: &str) -> Result<GitLabClient, GitLabError> {
     GitLabClient::new(host, token).await
 }
@@ -615,15 +796,31 @@ mod tests {
 
     #[test]
     fn test_gitlab_client_is_clone() {
-        // Verify that GitLabClient implements Clone (compile-time check)
         fn assert_clone<T: Clone>() {}
         assert_clone::<GitLabClient>();
     }
 
     #[test]
     fn test_gitlab_client_platform() {
-        // Verify the trait implementation compiles
         fn assert_platform_client<T: PlatformClient>() {}
         assert_platform_client::<GitLabClient>();
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("ratelimit-limit", HeaderValue::from_static("2000"));
+        headers.insert("ratelimit-remaining", HeaderValue::from_static("1999"));
+        headers.insert("ratelimit-reset", HeaderValue::from_static("1706400000"));
+
+        let info = GitLabClient::parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.limit, 2000);
+        assert_eq!(info.remaining, 1999);
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_missing() {
+        let headers = HeaderMap::new();
+        assert!(GitLabClient::parse_rate_limit_headers(&headers).is_none());
     }
 }

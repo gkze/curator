@@ -30,7 +30,7 @@ pub fn to_platform_repo(project: &GitLabProject) -> PlatformRepo {
     let owner = project
         .path_with_namespace
         .rsplit_once('/')
-        .map(|(ns, _)| ns.to_string())
+        .map(|(ns, _): (&str, &str)| ns.to_string())
         .unwrap_or_else(|| project.namespace.full_path.clone());
 
     // Build platform-specific metadata (strip nulls to reduce storage)

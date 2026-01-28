@@ -23,8 +23,11 @@ pub enum GitLabError {
     #[error("Project not found: {0}")]
     ProjectNotFound(String),
 
-    #[error("Builder error: {0}")]
-    Builder(String),
+    #[error("HTTP request error: {0}")]
+    Http(String),
+
+    #[error("JSON deserialization error: {0}")]
+    Deserialize(String),
 }
 
 impl GitLabError {
@@ -32,44 +35,64 @@ impl GitLabError {
     pub fn api(msg: impl Into<String>) -> Self {
         Self::Api(msg.into())
     }
+
+    /// Classify an HTTP status code and response body into a typed error.
+    pub fn from_status(status: reqwest::StatusCode, body: &str) -> Self {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            Self::Auth(format!("{}: {}", status, body))
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            Self::Api(format!("Not found: {}", body))
+        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            Self::RateLimited {
+                reset_at: Utc::now() + chrono::Duration::minutes(1),
+            }
+        } else {
+            Self::Api(format!("{}: {}", status, body))
+        }
+    }
 }
 
-/// Convert from gitlab crate's ApiError.
-impl<E: std::error::Error + Send + Sync + 'static> From<gitlab::api::ApiError<E>> for GitLabError {
-    fn from(err: gitlab::api::ApiError<E>) -> Self {
+/// Convert from reqwest::Error.
+impl From<reqwest::Error> for GitLabError {
+    fn from(err: reqwest::Error) -> Self {
         let msg = err.to_string();
-
-        // Try to detect specific error types from the message
         if msg.contains("401") || msg.contains("Unauthorized") {
             Self::Auth(msg)
-        } else if msg.contains("404") || msg.contains("Not Found") {
-            Self::Api(msg)
         } else if msg.contains("429") || msg.contains("rate limit") {
             Self::RateLimited {
                 reset_at: Utc::now() + chrono::Duration::minutes(1),
             }
         } else {
-            Self::Api(msg)
+            Self::Http(msg)
         }
     }
 }
 
-/// Convert from gitlab crate's RestError.
-impl From<gitlab::RestError> for GitLabError {
-    fn from(err: gitlab::RestError) -> Self {
-        let msg = err.to_string();
-        if msg.contains("401") || msg.contains("Unauthorized") {
-            Self::Auth(msg)
-        } else {
-            Self::Api(msg)
+/// Convert from progenitor_client::Error.
+impl<T: std::fmt::Debug> From<progenitor_client::Error<T>> for GitLabError {
+    fn from(err: progenitor_client::Error<T>) -> Self {
+        let msg = format!("{:?}", err);
+        match &err {
+            progenitor_client::Error::InvalidRequest(s) => Self::Api(s.clone()),
+            progenitor_client::Error::CommunicationError(e) => Self::Http(e.to_string()),
+            progenitor_client::Error::ErrorResponse(rv) => {
+                let status = rv.status();
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    Self::Auth(msg)
+                } else if status == reqwest::StatusCode::NOT_FOUND {
+                    Self::Api(format!("Not found: {}", msg))
+                } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    Self::RateLimited {
+                        reset_at: Utc::now() + chrono::Duration::minutes(1),
+                    }
+                } else {
+                    Self::Api(msg)
+                }
+            }
+            _ => Self::Api(msg),
         }
-    }
-}
-
-/// Convert from gitlab crate's AuthError.
-impl From<gitlab::AuthError> for GitLabError {
-    fn from(err: gitlab::AuthError) -> Self {
-        Self::Auth(err.to_string())
     }
 }
 
@@ -82,7 +105,8 @@ impl From<GitLabError> for PlatformError {
             GitLabError::GroupNotFound(g) => PlatformError::not_found(format!("group: {}", g)),
             GitLabError::ProjectNotFound(p) => PlatformError::not_found(format!("project: {}", p)),
             GitLabError::Api(msg) => PlatformError::api(msg),
-            GitLabError::Builder(msg) => PlatformError::internal(msg),
+            GitLabError::Http(msg) => PlatformError::api(msg),
+            GitLabError::Deserialize(msg) => PlatformError::internal(msg),
         }
     }
 }
@@ -94,7 +118,9 @@ pub use crate::platform::short_error_message;
 pub fn is_rate_limit_error(e: &GitLabError) -> bool {
     match e {
         GitLabError::RateLimited { .. } => true,
-        GitLabError::Api(msg) => msg.contains("429") || msg.contains("rate limit"),
+        GitLabError::Api(msg) | GitLabError::Http(msg) => {
+            msg.contains("429") || msg.contains("rate limit")
+        }
         _ => false,
     }
 }
@@ -131,5 +157,17 @@ mod tests {
         let auth_err = GitLabError::Auth("bad token".to_string());
         let platform_err: PlatformError = auth_err.into();
         assert!(matches!(platform_err, PlatformError::AuthRequired));
+    }
+
+    #[test]
+    fn test_from_status() {
+        let err = GitLabError::from_status(reqwest::StatusCode::UNAUTHORIZED, "bad token");
+        assert!(matches!(err, GitLabError::Auth(_)));
+
+        let err = GitLabError::from_status(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down");
+        assert!(matches!(err, GitLabError::RateLimited { .. }));
+
+        let err = GitLabError::from_status(reqwest::StatusCode::NOT_FOUND, "no such thing");
+        assert!(matches!(err, GitLabError::Api(_)));
     }
 }

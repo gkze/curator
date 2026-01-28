@@ -67,6 +67,12 @@ impl PlatformError {
     pub fn is_rate_limited(&self) -> bool {
         matches!(self, Self::RateLimited { .. })
     }
+
+    /// Check if this error is a not-found error.
+    #[inline]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::NotFound { .. })
+    }
 }
 
 /// Extract a short error message suitable for display.

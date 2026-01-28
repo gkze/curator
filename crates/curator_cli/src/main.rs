@@ -206,6 +206,16 @@ enum GithubAction {
 #[cfg(feature = "gitlab")]
 #[derive(Subcommand)]
 enum GitlabAction {
+    /// Authenticate with GitLab using OAuth Device Flow
+    ///
+    /// Opens your browser to authorize Curator with GitLab.
+    /// The token is saved to your config file for future use.
+    /// Supports self-hosted GitLab instances via --host.
+    Login {
+        /// GitLab host (default: gitlab.com, or from config/env)
+        #[arg(short = 'H', long)]
+        host: Option<String>,
+    },
     /// Sync projects from a GitLab group
     Group {
         /// Group path(s) - can specify multiple (e.g., "gitlab-org" or "my-company/team")

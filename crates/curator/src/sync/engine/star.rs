@@ -289,6 +289,19 @@ pub(super) async fn prune_repos<C: PlatformClient + Clone + 'static>(
                     );
                 }
                 Ok(false) => {}
+                Err(e) if e.is_not_found() => {
+                    // Project no longer exists — treat as pruned so the DB
+                    // entry gets cleaned up instead of retrying forever.
+                    result.pruned += 1;
+                    result.pruned_repos.push((owner.clone(), name.clone()));
+                    emit(
+                        on_progress,
+                        SyncProgress::PrunedRepo {
+                            owner: owner.clone(),
+                            name: name.clone(),
+                        },
+                    );
+                }
                 Err(e) => {
                     let err_msg = e.to_string();
                     result
