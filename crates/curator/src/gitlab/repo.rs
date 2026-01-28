@@ -33,6 +33,7 @@ pub async fn list_group_projects(
     emit(
         on_progress,
         SyncProgress::FetchComplete {
+            namespace: group.to_string(),
             total: projects.len(),
         },
     );

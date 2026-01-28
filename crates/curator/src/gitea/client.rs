@@ -444,7 +444,10 @@ impl PlatformClient for GiteaClient {
 
         emit(
             on_progress,
-            SyncProgress::FetchComplete { total: repos.len() },
+            SyncProgress::FetchComplete {
+                namespace: org.to_string(),
+                total: repos.len(),
+            },
         );
 
         // Convert to PlatformRepo
@@ -476,7 +479,10 @@ impl PlatformClient for GiteaClient {
 
         emit(
             on_progress,
-            SyncProgress::FetchComplete { total: repos.len() },
+            SyncProgress::FetchComplete {
+                namespace: username.to_string(),
+                total: repos.len(),
+            },
         );
 
         // Convert to PlatformRepo
@@ -549,7 +555,10 @@ impl PlatformClient for GiteaClient {
 
         emit(
             on_progress,
-            SyncProgress::FetchComplete { total: repos.len() },
+            SyncProgress::FetchComplete {
+                namespace: "starred".to_string(),
+                total: repos.len(),
+            },
         );
 
         // Convert to PlatformRepo
@@ -599,6 +608,7 @@ impl PlatformClient for GiteaClient {
         emit(
             on_progress,
             SyncProgress::FetchedPage {
+                namespace: "starred".to_string(),
                 page: 1,
                 count: first_page_count,
                 total_so_far: total_sent.load(Ordering::Relaxed),
@@ -611,6 +621,7 @@ impl PlatformClient for GiteaClient {
             emit(
                 on_progress,
                 SyncProgress::FetchComplete {
+                    namespace: "starred".to_string(),
                     total: total_sent.load(Ordering::Relaxed),
                 },
             );
@@ -673,6 +684,7 @@ impl PlatformClient for GiteaClient {
                         emit(
                             on_progress,
                             SyncProgress::FetchedPage {
+                                namespace: "starred".to_string(),
                                 page: page_num,
                                 count,
                                 total_so_far: total_sent.load(Ordering::Relaxed),
@@ -696,6 +708,7 @@ impl PlatformClient for GiteaClient {
                 emit(
                     on_progress,
                     SyncProgress::FetchedPage {
+                        namespace: "starred".to_string(),
                         page: page_num,
                         count,
                         total_so_far: total_sent.load(Ordering::Relaxed),
@@ -708,6 +721,7 @@ impl PlatformClient for GiteaClient {
         emit(
             on_progress,
             SyncProgress::FetchComplete {
+                namespace: "starred".to_string(),
                 total: total_sent.load(Ordering::Relaxed),
             },
         );

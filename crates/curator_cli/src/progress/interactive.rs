@@ -142,36 +142,35 @@ impl InteractiveReporter {
             }
 
             SyncProgress::FetchedPage {
+                namespace,
                 page,
                 count: _,
                 total_so_far,
                 expected_pages: _,
             } => {
-                for fetch_state in state.fetch_bars.values() {
-                    if !fetch_state.done {
-                        if let Some(len) = fetch_state.bar.length()
-                            && page as u64 > len
-                        {
-                            fetch_state.bar.set_length(page as u64);
-                        }
-                        fetch_state.bar.set_position(page as u64);
-                        fetch_state
-                            .bar
-                            .set_message(format!("Page {} ({} repos)", page, total_so_far));
-                        break;
+                if let Some(fetch_state) = state.fetch_bars.get(&namespace)
+                    && !fetch_state.done
+                {
+                    if let Some(len) = fetch_state.bar.length()
+                        && page as u64 > len
+                    {
+                        fetch_state.bar.set_length(page as u64);
                     }
+                    fetch_state.bar.set_position(page as u64);
+                    fetch_state
+                        .bar
+                        .set_message(format!("Page {} ({} repos)", page, total_so_far));
                 }
             }
 
-            SyncProgress::FetchComplete { total } => {
-                for fetch_state in state.fetch_bars.values_mut() {
-                    if !fetch_state.done {
-                        fetch_state.fetched = total;
-                        fetch_state
-                            .bar
-                            .set_message(format!("Fetched {} repos, filtering...", total));
-                        break;
-                    }
+            SyncProgress::FetchComplete { namespace, total } => {
+                if let Some(fetch_state) = state.fetch_bars.get_mut(&namespace)
+                    && !fetch_state.done
+                {
+                    fetch_state.fetched = total;
+                    fetch_state
+                        .bar
+                        .set_message(format!("Fetched {} repos, filtering...", total));
                 }
 
                 // Convert filter spinner to progress bar in-place (preserves position in MultiProgress)
@@ -182,33 +181,35 @@ impl InteractiveReporter {
                 }
             }
 
-            SyncProgress::FilteringByActivity { days } => {
+            SyncProgress::FilteringByActivity { namespace, days } => {
                 if state.filter_bar.is_none() {
                     let pb = self.create_filter_bar(&state, true);
                     pb.set_prefix(format!("{:12}", "Filtering"));
                     state.filter_bar = Some(pb);
                 }
-                for fetch_state in state.fetch_bars.values() {
-                    if !fetch_state.done {
-                        fetch_state
-                            .bar
-                            .set_message(format!("Filtering (last {} days)...", days));
-                        break;
-                    }
+                if let Some(fetch_state) = state.fetch_bars.get(&namespace)
+                    && !fetch_state.done
+                {
+                    fetch_state
+                        .bar
+                        .set_message(format!("Filtering (last {} days)...", days));
                 }
             }
 
-            SyncProgress::FilterComplete { matched, total } => {
+            SyncProgress::FilterComplete {
+                namespace,
+                matched,
+                total,
+            } => {
                 // Finish fetch bar
-                for fetch_state in state.fetch_bars.values_mut() {
-                    if !fetch_state.done {
-                        fetch_state.matched = matched;
-                        fetch_state.done = true;
-                        fetch_state
-                            .bar
-                            .finish_with_message(format!("✓ {} repos fetched", total));
-                        break;
-                    }
+                if let Some(fetch_state) = state.fetch_bars.get_mut(&namespace)
+                    && !fetch_state.done
+                {
+                    fetch_state.matched = matched;
+                    fetch_state.done = true;
+                    fetch_state
+                        .bar
+                        .finish_with_message(format!("✓ {} repos fetched", total));
                 }
 
                 // Finish filter bar

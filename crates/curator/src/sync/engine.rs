@@ -49,6 +49,7 @@ use crate::platform::{ApiRateLimiter, PlatformClient, PlatformError, PlatformRep
 
 async fn sync_repos<C: PlatformClient + Clone + 'static>(
     client: &C,
+    namespace: &str,
     repos: Vec<PlatformRepo>,
     options: &SyncOptions,
     rate_limiter: Option<&ApiRateLimiter>,
@@ -62,6 +63,7 @@ async fn sync_repos<C: PlatformClient + Clone + 'static>(
     emit(
         on_progress,
         SyncProgress::FilteringByActivity {
+            namespace: namespace.to_string(),
             days: options.active_within.num_days(),
         },
     );
@@ -80,6 +82,7 @@ async fn sync_repos<C: PlatformClient + Clone + 'static>(
     emit(
         on_progress,
         SyncProgress::FilterComplete {
+            namespace: namespace.to_string(),
             matched: result.matched,
             total: result.processed,
         },
@@ -123,14 +126,22 @@ async fn sync_repos<C: PlatformClient + Clone + 'static>(
 
 async fn sync_repos_streaming<C: PlatformClient + Clone + 'static>(
     client: &C,
+    namespace: &str,
     repos: Vec<PlatformRepo>,
     options: &SyncOptions,
     rate_limiter: Option<&ApiRateLimiter>,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
-    let streaming_result =
-        persist::process_streaming_repos(client, &repos, options, &model_tx, on_progress).await;
+    let streaming_result = persist::process_streaming_repos(
+        client,
+        namespace,
+        &repos,
+        options,
+        &model_tx,
+        on_progress,
+    )
+    .await;
     let mut result = streaming_result.result;
 
     if options.star && !streaming_result.repos_to_star.is_empty() {
@@ -183,7 +194,7 @@ pub async fn sync_namespace<C: PlatformClient + Clone + 'static>(
     fetch::wait_for_rate_limit(rate_limiter).await;
     let repos = client.list_org_repos(namespace, db, on_progress).await?;
 
-    sync_repos(client, repos, options, rate_limiter, on_progress).await
+    sync_repos(client, namespace, repos, options, rate_limiter, on_progress).await
 }
 
 /// Sync a namespace with streaming persistence.
@@ -215,7 +226,16 @@ pub async fn sync_namespace_streaming<C: PlatformClient + Clone + 'static>(
     fetch::wait_for_rate_limit(rate_limiter).await;
     let repos = client.list_org_repos(namespace, db, on_progress).await?;
 
-    sync_repos_streaming(client, repos, options, rate_limiter, model_tx, on_progress).await
+    sync_repos_streaming(
+        client,
+        namespace,
+        repos,
+        options,
+        rate_limiter,
+        model_tx,
+        on_progress,
+    )
+    .await
 }
 
 /// Sync multiple namespaces concurrently.
@@ -476,7 +496,7 @@ pub async fn sync_user<C: PlatformClient + Clone + 'static>(
     fetch::wait_for_rate_limit(rate_limiter).await;
     let repos = client.list_user_repos(username, db, on_progress).await?;
 
-    sync_repos(client, repos, options, rate_limiter, on_progress).await
+    sync_repos(client, username, repos, options, rate_limiter, on_progress).await
 }
 
 /// Sync a user's repositories with streaming persistence.
@@ -508,7 +528,16 @@ pub async fn sync_user_streaming<C: PlatformClient + Clone + 'static>(
     fetch::wait_for_rate_limit(rate_limiter).await;
     let repos = client.list_user_repos(username, db, on_progress).await?;
 
-    sync_repos_streaming(client, repos, options, rate_limiter, model_tx, on_progress).await
+    sync_repos_streaming(
+        client,
+        username,
+        repos,
+        options,
+        rate_limiter,
+        model_tx,
+        on_progress,
+    )
+    .await
 }
 
 /// Sync multiple users' repositories concurrently with streaming persistence.
@@ -859,6 +888,7 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     emit(
         on_progress,
         SyncProgress::FilterComplete {
+            namespace: "starred".to_string(),
             matched: final_matched,
             total: final_processed,
         },
@@ -1234,10 +1264,13 @@ mod tests {
         let callback: ProgressCallback = Box::new(move |event| {
             call_count_clone.fetch_add(1, Ordering::SeqCst);
             // Just verify we can match on the event
-            if let SyncProgress::FetchComplete { total: _ } = event {}
+            if let SyncProgress::FetchComplete { total: _, .. } = event {}
         });
 
-        callback(SyncProgress::FetchComplete { total: 42 });
+        callback(SyncProgress::FetchComplete {
+            namespace: "test".to_string(),
+            total: 42,
+        });
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 }

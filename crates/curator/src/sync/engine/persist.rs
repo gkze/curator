@@ -25,6 +25,7 @@ pub(super) fn build_models<C: PlatformClient>(
 
 pub(super) async fn process_streaming_repos<C: PlatformClient>(
     client: &C,
+    namespace: &str,
     repos: &[PlatformRepo],
     options: &SyncOptions,
     model_tx: &mpsc::Sender<CodeRepositoryActiveModel>,
@@ -35,6 +36,7 @@ pub(super) async fn process_streaming_repos<C: PlatformClient>(
     emit(
         on_progress,
         SyncProgress::FilteringByActivity {
+            namespace: namespace.to_string(),
             days: options.active_within.num_days(),
         },
     );
@@ -75,6 +77,7 @@ pub(super) async fn process_streaming_repos<C: PlatformClient>(
     emit(
         on_progress,
         SyncProgress::FilterComplete {
+            namespace: namespace.to_string(),
             matched: result.matched,
             total: result.processed,
         },

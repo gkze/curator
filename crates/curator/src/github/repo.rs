@@ -57,6 +57,7 @@ pub async fn list_org_repos(
         emit(
             on_progress,
             SyncProgress::FetchedPage {
+                namespace: org.to_string(),
                 page,
                 count,
                 total_so_far: all_repos.len(),
@@ -75,6 +76,7 @@ pub async fn list_org_repos(
     emit(
         on_progress,
         SyncProgress::FetchComplete {
+            namespace: org.to_string(),
             total: all_repos.len(),
         },
     );
@@ -191,6 +193,7 @@ pub async fn list_starred_repos(
         emit(
             on_progress,
             SyncProgress::FetchedPage {
+                namespace: "starred".to_string(),
                 page,
                 count,
                 total_so_far: all_repos.len(),
@@ -209,6 +212,7 @@ pub async fn list_starred_repos(
     emit(
         on_progress,
         SyncProgress::FetchComplete {
+            namespace: "starred".to_string(),
             total: all_repos.len(),
         },
     );

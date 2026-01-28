@@ -24,24 +24,29 @@ impl LoggingReporter {
             }
 
             SyncProgress::FetchedPage {
+                namespace,
                 page,
                 count,
                 total_so_far,
                 expected_pages,
             } => {
-                tracing::debug!(page, count, total_so_far, expected_pages = ?expected_pages, "Fetched page");
+                tracing::debug!(namespace = %namespace, page, count, total_so_far, expected_pages = ?expected_pages, "Fetched page");
             }
 
-            SyncProgress::FetchComplete { total } => {
-                tracing::info!(total, "Fetch complete");
+            SyncProgress::FetchComplete { namespace, total } => {
+                tracing::info!(namespace = %namespace, total, "Fetch complete");
             }
 
-            SyncProgress::FilteringByActivity { days } => {
-                tracing::debug!(days, "Filtering by activity");
+            SyncProgress::FilteringByActivity { namespace, days } => {
+                tracing::debug!(namespace = %namespace, days, "Filtering by activity");
             }
 
-            SyncProgress::FilterComplete { matched, total } => {
-                tracing::info!(matched, total, "Filtered by activity");
+            SyncProgress::FilterComplete {
+                namespace,
+                matched,
+                total,
+            } => {
+                tracing::info!(namespace = %namespace, matched, total, "Filtered by activity");
             }
 
             SyncProgress::FilteredPage {

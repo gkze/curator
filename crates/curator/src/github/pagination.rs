@@ -182,6 +182,7 @@ impl GitHubClient {
                     emit(
                         on_progress,
                         SyncProgress::FetchedPage {
+                            namespace: config.namespace.to_string(),
                             page,
                             count: 0,
                             total_so_far: all_items.len(),
@@ -237,6 +238,7 @@ impl GitHubClient {
                     emit(
                         on_progress,
                         SyncProgress::FetchedPage {
+                            namespace: config.namespace.to_string(),
                             page,
                             count,
                             total_so_far: all_items.len(),
@@ -266,6 +268,7 @@ impl GitHubClient {
         emit(
             on_progress,
             SyncProgress::FetchComplete {
+                namespace: config.namespace.to_string(),
                 total: all_items.len(),
             },
         );
@@ -359,6 +362,7 @@ impl GitHubClient {
                 emit(
                     on_progress,
                     SyncProgress::FetchedPage {
+                        namespace: config.namespace.to_string(),
                         page: 1,
                         count: 0,
                         total_so_far: 0,
@@ -409,6 +413,7 @@ impl GitHubClient {
                 emit(
                     on_progress,
                     SyncProgress::FetchedPage {
+                        namespace: config.namespace.to_string(),
                         page: 1,
                         count,
                         total_so_far: total_sent.load(Ordering::Relaxed),
@@ -421,6 +426,7 @@ impl GitHubClient {
                     emit(
                         on_progress,
                         SyncProgress::FetchComplete {
+                            namespace: config.namespace.to_string(),
                             total: total_sent.load(Ordering::Relaxed),
                         },
                     );
@@ -533,6 +539,7 @@ impl GitHubClient {
                     emit(
                         on_progress,
                         SyncProgress::FetchedPage {
+                            namespace: config.namespace.to_string(),
                             page,
                             count,
                             total_so_far: total_sent.load(Ordering::Relaxed),
@@ -549,6 +556,7 @@ impl GitHubClient {
         emit(
             on_progress,
             SyncProgress::FetchComplete {
+                namespace: config.namespace.to_string(),
                 total: total_sent.load(Ordering::Relaxed),
             },
         );

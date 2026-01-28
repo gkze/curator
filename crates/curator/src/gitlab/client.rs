@@ -783,6 +783,7 @@ impl PlatformClient for GitLabClient {
                 emit(
                     on_progress,
                     SyncProgress::FetchComplete {
+                        namespace: org.to_string(),
                         total: cached_repos.len(),
                     },
                 );
@@ -793,6 +794,7 @@ impl PlatformClient for GitLabClient {
         emit(
             on_progress,
             SyncProgress::FetchComplete {
+                namespace: org.to_string(),
                 total: projects.len(),
             },
         );
@@ -839,6 +841,7 @@ impl PlatformClient for GitLabClient {
                 emit(
                     on_progress,
                     SyncProgress::FetchComplete {
+                        namespace: username.to_string(),
                         total: cached_repos.len(),
                     },
                 );
@@ -849,6 +852,7 @@ impl PlatformClient for GitLabClient {
         emit(
             on_progress,
             SyncProgress::FetchComplete {
+                namespace: username.to_string(),
                 total: projects.len(),
             },
         );
@@ -983,6 +987,7 @@ impl PlatformClient for GitLabClient {
                 emit(
                     on_progress,
                     SyncProgress::FetchComplete {
+                        namespace: "starred".to_string(),
                         total: cached_repos.len(),
                     },
                 );
@@ -997,6 +1002,7 @@ impl PlatformClient for GitLabClient {
         emit(
             on_progress,
             SyncProgress::FetchComplete {
+                namespace: "starred".to_string(),
                 total: projects.len(),
             },
         );
@@ -1057,7 +1063,13 @@ impl PlatformClient for GitLabClient {
                     }
                 }
 
-                emit(on_progress, SyncProgress::FetchComplete { total: sent });
+                emit(
+                    on_progress,
+                    SyncProgress::FetchComplete {
+                        namespace: "starred".to_string(),
+                        total: sent,
+                    },
+                );
                 return Ok(sent);
             }
         }
@@ -1070,7 +1082,13 @@ impl PlatformClient for GitLabClient {
             }
         }
 
-        emit(on_progress, SyncProgress::FetchComplete { total: sent });
+        emit(
+            on_progress,
+            SyncProgress::FetchComplete {
+                namespace: "starred".to_string(),
+                total: sent,
+            },
+        );
 
         Ok(sent)
     }

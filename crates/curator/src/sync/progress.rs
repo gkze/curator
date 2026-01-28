@@ -23,6 +23,8 @@ pub enum SyncProgress {
 
     /// Fetched a page of repositories.
     FetchedPage {
+        /// The namespace this page belongs to.
+        namespace: String,
         /// Page number (1-indexed).
         page: u32,
         /// Number of repos on this page.
@@ -35,18 +37,24 @@ pub enum SyncProgress {
 
     /// Finished fetching all repositories.
     FetchComplete {
+        /// The namespace that finished fetching.
+        namespace: String,
         /// Total number of repositories fetched.
         total: usize,
     },
 
     /// Starting activity filter.
     FilteringByActivity {
+        /// The namespace being filtered.
+        namespace: String,
         /// Number of days to filter by.
         days: i64,
     },
 
     /// Activity filter complete.
     FilterComplete {
+        /// The namespace that finished filtering.
+        namespace: String,
         /// Number of repos that matched the filter.
         matched: usize,
         /// Total repos before filtering.
@@ -262,10 +270,17 @@ mod tests {
             count_clone.fetch_add(1, Ordering::SeqCst);
         });
 
-        emit(Some(&callback), SyncProgress::FetchComplete { total: 10 });
+        emit(
+            Some(&callback),
+            SyncProgress::FetchComplete {
+                namespace: "test".to_string(),
+                total: 10,
+            },
+        );
         emit(
             Some(&callback),
             SyncProgress::FilterComplete {
+                namespace: "test".to_string(),
                 matched: 5,
                 total: 10,
             },
@@ -277,7 +292,13 @@ mod tests {
     #[test]
     fn test_emit_without_callback() {
         // Should not panic when callback is None
-        emit(None, SyncProgress::FetchComplete { total: 10 });
+        emit(
+            None,
+            SyncProgress::FetchComplete {
+                namespace: "test".to_string(),
+                total: 10,
+            },
+        );
     }
 
     #[test]
@@ -309,6 +330,7 @@ mod tests {
     #[test]
     fn test_sync_progress_fetched_page() {
         let event = SyncProgress::FetchedPage {
+            namespace: "test".to_string(),
             page: 1,
             count: 50,
             total_so_far: 50,
@@ -452,10 +474,13 @@ mod tests {
 
     #[test]
     fn test_sync_progress_clone() {
-        let event = SyncProgress::FetchComplete { total: 42 };
+        let event = SyncProgress::FetchComplete {
+            namespace: "test".to_string(),
+            total: 42,
+        };
         let cloned = event.clone();
 
-        if let SyncProgress::FetchComplete { total } = cloned {
+        if let SyncProgress::FetchComplete { total, .. } = cloned {
             assert_eq!(total, 42);
         } else {
             panic!("Clone produced wrong variant");
@@ -482,13 +507,20 @@ mod tests {
         emit(
             Some(&callback),
             SyncProgress::FetchedPage {
+                namespace: "org".to_string(),
                 page: 1,
                 count: 100,
                 total_so_far: 100,
                 expected_pages: None,
             },
         );
-        emit(Some(&callback), SyncProgress::FetchComplete { total: 100 });
+        emit(
+            Some(&callback),
+            SyncProgress::FetchComplete {
+                namespace: "org".to_string(),
+                total: 100,
+            },
+        );
 
         let recorded = events.lock().unwrap();
         assert_eq!(recorded.len(), 3);
@@ -507,14 +539,22 @@ mod tests {
                 expected_pages: Some(1),
             },
             SyncProgress::FetchedPage {
+                namespace: "ns".to_string(),
                 page: 1,
                 count: 10,
                 total_so_far: 10,
                 expected_pages: Some(1),
             },
-            SyncProgress::FetchComplete { total: 10 },
-            SyncProgress::FilteringByActivity { days: 60 },
+            SyncProgress::FetchComplete {
+                namespace: "ns".to_string(),
+                total: 10,
+            },
+            SyncProgress::FilteringByActivity {
+                namespace: "ns".to_string(),
+                days: 60,
+            },
             SyncProgress::FilterComplete {
+                namespace: "ns".to_string(),
                 matched: 5,
                 total: 10,
             },
