@@ -26,7 +26,9 @@ pub async fn list_group_projects(
         },
     );
 
-    let projects: Vec<GitLabProject> = client.list_group_projects(group, include_subgroups).await?;
+    let (projects, _stats) = client
+        .list_group_projects(group, include_subgroups, None)
+        .await?;
 
     emit(
         on_progress,
