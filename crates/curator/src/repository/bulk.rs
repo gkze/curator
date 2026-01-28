@@ -206,13 +206,13 @@ fn is_retryable_error(err: &RepositoryError) -> bool {
     }
 }
 
-/// Internal bulk upsert implementation.
-async fn bulk_upsert_inner(db: &DatabaseConnection, models: Vec<ActiveModel>) -> Result<u64> {
-    if models.is_empty() {
-        return Ok(0);
-    }
-
-    let on_conflict = OnConflict::columns([Column::Platform, Column::PlatformId])
+/// Build the ON CONFLICT clause used by bulk upsert.
+///
+/// Conflict detection uses (platform, platform_id) as the natural key.
+/// Only updates rows where `updated_at` has changed (content-based deduplication),
+/// preventing unnecessary writes when the API returns the same data.
+pub(crate) fn build_upsert_on_conflict() -> OnConflict {
+    OnConflict::columns([Column::Platform, Column::PlatformId])
         .update_columns([
             Column::Owner,
             Column::Name,
@@ -243,7 +243,6 @@ async fn bulk_upsert_inner(db: &DatabaseConnection, models: Vec<ActiveModel>) ->
             Column::SyncedAt,
         ])
         // Only update if updated_at has changed (content-based deduplication).
-        // This prevents unnecessary writes when the API returns the same data.
         // The condition is: existing.updated_at IS NULL OR existing.updated_at != new.updated_at
         .action_and_where(
             Condition::any()
@@ -254,10 +253,17 @@ async fn bulk_upsert_inner(db: &DatabaseConnection, models: Vec<ActiveModel>) ->
                 )
                 .into(),
         )
-        .to_owned();
+        .to_owned()
+}
+
+/// Internal bulk upsert implementation.
+async fn bulk_upsert_inner(db: &DatabaseConnection, models: Vec<ActiveModel>) -> Result<u64> {
+    if models.is_empty() {
+        return Ok(0);
+    }
 
     CodeRepository::insert_many(models)
-        .on_conflict(on_conflict)
+        .on_conflict(build_upsert_on_conflict())
         .exec_without_returning(db)
         .await
         .map_err(RepositoryError::from)

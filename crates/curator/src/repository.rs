@@ -25,14 +25,14 @@ pub use single::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bulk::build_upsert_on_conflict;
     use chrono::Utc;
-    use sea_orm::sea_query::{Alias, Expr, OnConflict};
-    use sea_orm::{Condition, DbErr, EntityTrait, QueryTrait, Set};
+    use sea_orm::{DbErr, EntityTrait, QueryTrait, Set};
     use serde_json::json;
     use uuid::Uuid;
 
     use crate::entity::code_platform::CodePlatform;
-    use crate::entity::code_repository::{ActiveModel, Column, Entity as CodeRepository};
+    use crate::entity::code_repository::{ActiveModel, Entity as CodeRepository};
     use crate::entity::code_visibility::CodeVisibility;
 
     #[test]
@@ -213,8 +213,8 @@ mod tests {
 
     /// Test that the OnConflict with action_and_where generates correct SQL.
     ///
-    /// This is a compile-time sanity check that the query builder accepts
-    /// our conditional update syntax.
+    /// Uses the shared `build_upsert_on_conflict()` function to ensure the test
+    /// exercises the exact same conflict resolution logic as production code.
     #[test]
     fn test_bulk_upsert_query_builds() {
         // Create a minimal active model
@@ -252,49 +252,9 @@ mod tests {
             etag: Set(None),
         };
 
-        // Build the query (same logic as bulk_upsert)
-        let on_conflict = OnConflict::columns([Column::Platform, Column::Owner, Column::Name])
-            .update_columns([
-                Column::PlatformId,
-                Column::Description,
-                Column::DefaultBranch,
-                Column::Topics,
-                Column::PrimaryLanguage,
-                Column::LicenseSpdx,
-                Column::Homepage,
-                Column::Visibility,
-                Column::IsFork,
-                Column::IsMirror,
-                Column::IsArchived,
-                Column::IsTemplate,
-                Column::IsEmpty,
-                Column::Stars,
-                Column::Forks,
-                Column::OpenIssues,
-                Column::Watchers,
-                Column::SizeKb,
-                Column::HasIssues,
-                Column::HasWiki,
-                Column::HasPullRequests,
-                Column::CreatedAt,
-                Column::UpdatedAt,
-                Column::PushedAt,
-                Column::PlatformMetadata,
-                Column::SyncedAt,
-            ])
-            .action_and_where(
-                Condition::any()
-                    .add(Expr::col((CodeRepository, Column::UpdatedAt)).is_null())
-                    .add(
-                        Expr::col((CodeRepository, Column::UpdatedAt))
-                            .ne(Expr::col((Alias::new("excluded"), Column::UpdatedAt))),
-                    )
-                    .into(),
-            )
-            .to_owned();
-
+        // Use the shared on_conflict builder (same as production bulk_upsert)
         let query = CodeRepository::insert_many(vec![model])
-            .on_conflict(on_conflict)
+            .on_conflict(build_upsert_on_conflict())
             .build(sea_orm::DatabaseBackend::Sqlite);
 
         // Verify the SQL contains our conditional WHERE clause
@@ -322,6 +282,12 @@ mod tests {
         assert!(
             sql.contains("updated_at"),
             "SQL should reference updated_at column: {}",
+            sql
+        );
+        // Verify the conflict keys match production: (platform, platform_id)
+        assert!(
+            sql.contains("\"platform_id\""),
+            "SQL ON CONFLICT should reference platform_id: {}",
             sql
         );
     }

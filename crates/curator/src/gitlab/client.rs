@@ -234,13 +234,12 @@ impl GitLabClient {
         let include_sub = if include_subgroups { "true" } else { "false" };
 
         // Try to load stored total_pages from the DB
-        if let Some(db) = db {
-            if let Ok(Some(stored)) =
+        if let Some(db) = db
+            && let Ok(Some(stored)) =
                 api_cache::get_total_pages(db, CodePlatform::GitLab, EndpointType::OrgRepos, group)
                     .await
-            {
-                known_total_pages = Some(stored as u32);
-            }
+        {
+            known_total_pages = Some(stored as u32);
         }
 
         loop {
@@ -351,17 +350,16 @@ impl GitLabClient {
         let mut known_total_pages: Option<u32> = None;
 
         // Try to load stored total_pages from the DB
-        if let Some(db) = db {
-            if let Ok(Some(stored)) = api_cache::get_total_pages(
+        if let Some(db) = db
+            && let Ok(Some(stored)) = api_cache::get_total_pages(
                 db,
                 CodePlatform::GitLab,
                 EndpointType::UserRepos,
                 username,
             )
             .await
-            {
-                known_total_pages = Some(stored as u32);
-            }
+        {
+            known_total_pages = Some(stored as u32);
         }
 
         loop {
@@ -526,12 +524,11 @@ impl GitLabClient {
         let mut known_total_pages: Option<u32> = None;
 
         // Try to load stored total_pages from the DB
-        if let Some(db) = db {
-            if let Ok(Some(stored)) =
+        if let Some(db) = db
+            && let Ok(Some(stored)) =
                 api_cache::get_starred_total_pages(db, CodePlatform::GitLab, username).await
-            {
-                known_total_pages = Some(stored as u32);
-            }
+        {
+            known_total_pages = Some(stored as u32);
         }
 
         loop {
@@ -766,29 +763,30 @@ impl PlatformClient for GitLabClient {
         let (projects, stats) = self.list_group_projects(org, true, db).await?;
 
         // Cache-hit fallback: if every page was 304, load from the local DB.
-        if stats.all_cached() && projects.is_empty() {
-            if let Some(db) = db {
-                let cached_repos =
-                    repository::find_all_by_platform_and_owner(db, CodePlatform::GitLab, org)
-                        .await
-                        .map_err(|e| PlatformError::internal(e.to_string()))?;
+        if stats.all_cached()
+            && projects.is_empty()
+            && let Some(db) = db
+        {
+            let cached_repos =
+                repository::find_all_by_platform_and_owner(db, CodePlatform::GitLab, org)
+                    .await
+                    .map_err(|e| PlatformError::internal(e.to_string()))?;
 
-                if !cached_repos.is_empty() {
-                    emit(
-                        on_progress,
-                        SyncProgress::CacheHit {
-                            namespace: org.to_string(),
-                            cached_count: cached_repos.len(),
-                        },
-                    );
-                    emit(
-                        on_progress,
-                        SyncProgress::FetchComplete {
-                            total: cached_repos.len(),
-                        },
-                    );
-                    return Ok(cached_repos.iter().map(PlatformRepo::from_model).collect());
-                }
+            if !cached_repos.is_empty() {
+                emit(
+                    on_progress,
+                    SyncProgress::CacheHit {
+                        namespace: org.to_string(),
+                        cached_count: cached_repos.len(),
+                    },
+                );
+                emit(
+                    on_progress,
+                    SyncProgress::FetchComplete {
+                        total: cached_repos.len(),
+                    },
+                );
+                return Ok(cached_repos.iter().map(PlatformRepo::from_model).collect());
             }
         }
 
@@ -821,29 +819,30 @@ impl PlatformClient for GitLabClient {
         let (projects, stats) = self.list_user_projects(username, db).await?;
 
         // Cache-hit fallback
-        if stats.all_cached() && projects.is_empty() {
-            if let Some(db) = db {
-                let cached_repos =
-                    repository::find_all_by_platform_and_owner(db, CodePlatform::GitLab, username)
-                        .await
-                        .map_err(|e| PlatformError::internal(e.to_string()))?;
+        if stats.all_cached()
+            && projects.is_empty()
+            && let Some(db) = db
+        {
+            let cached_repos =
+                repository::find_all_by_platform_and_owner(db, CodePlatform::GitLab, username)
+                    .await
+                    .map_err(|e| PlatformError::internal(e.to_string()))?;
 
-                if !cached_repos.is_empty() {
-                    emit(
-                        on_progress,
-                        SyncProgress::CacheHit {
-                            namespace: username.to_string(),
-                            cached_count: cached_repos.len(),
-                        },
-                    );
-                    emit(
-                        on_progress,
-                        SyncProgress::FetchComplete {
-                            total: cached_repos.len(),
-                        },
-                    );
-                    return Ok(cached_repos.iter().map(PlatformRepo::from_model).collect());
-                }
+            if !cached_repos.is_empty() {
+                emit(
+                    on_progress,
+                    SyncProgress::CacheHit {
+                        namespace: username.to_string(),
+                        cached_count: cached_repos.len(),
+                    },
+                );
+                emit(
+                    on_progress,
+                    SyncProgress::FetchComplete {
+                        total: cached_repos.len(),
+                    },
+                );
+                return Ok(cached_repos.iter().map(PlatformRepo::from_model).collect());
             }
         }
 
@@ -965,32 +964,33 @@ impl PlatformClient for GitLabClient {
             .await?;
 
         // Cache-hit fallback
-        if stats.all_cached() && projects.is_empty() {
-            if let Some(db) = db {
-                let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitLab)
-                    .await
-                    .map_err(|e| PlatformError::internal(e.to_string()))?;
+        if stats.all_cached()
+            && projects.is_empty()
+            && let Some(db) = db
+        {
+            let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitLab)
+                .await
+                .map_err(|e| PlatformError::internal(e.to_string()))?;
 
-                if !cached_repos.is_empty() {
-                    emit(
-                        on_progress,
-                        SyncProgress::CacheHit {
-                            namespace: "starred".to_string(),
-                            cached_count: cached_repos.len(),
-                        },
-                    );
-                    emit(
-                        on_progress,
-                        SyncProgress::FetchComplete {
-                            total: cached_repos.len(),
-                        },
-                    );
+            if !cached_repos.is_empty() {
+                emit(
+                    on_progress,
+                    SyncProgress::CacheHit {
+                        namespace: "starred".to_string(),
+                        cached_count: cached_repos.len(),
+                    },
+                );
+                emit(
+                    on_progress,
+                    SyncProgress::FetchComplete {
+                        total: cached_repos.len(),
+                    },
+                );
 
-                    // Still update the in-memory starred cache from DB results
-                    let repos: Vec<PlatformRepo> =
-                        cached_repos.iter().map(PlatformRepo::from_model).collect();
-                    return Ok(repos);
-                }
+                // Still update the in-memory starred cache from DB results
+                let repos: Vec<PlatformRepo> =
+                    cached_repos.iter().map(PlatformRepo::from_model).collect();
+                return Ok(repos);
             }
         }
 
@@ -1032,32 +1032,33 @@ impl PlatformClient for GitLabClient {
         self.update_starred_cache(user.id, &projects).await;
 
         // Cache-hit fallback for streaming
-        if stats.all_cached() && projects.is_empty() {
-            if let Some(db) = db {
-                let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitLab)
-                    .await
-                    .map_err(|e| PlatformError::internal(e.to_string()))?;
+        if stats.all_cached()
+            && projects.is_empty()
+            && let Some(db) = db
+        {
+            let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitLab)
+                .await
+                .map_err(|e| PlatformError::internal(e.to_string()))?;
 
-                if !cached_repos.is_empty() {
-                    emit(
-                        on_progress,
-                        SyncProgress::CacheHit {
-                            namespace: "starred".to_string(),
-                            cached_count: cached_repos.len(),
-                        },
-                    );
+            if !cached_repos.is_empty() {
+                emit(
+                    on_progress,
+                    SyncProgress::CacheHit {
+                        namespace: "starred".to_string(),
+                        cached_count: cached_repos.len(),
+                    },
+                );
 
-                    let mut sent = 0usize;
-                    for model in &cached_repos {
-                        let repo = PlatformRepo::from_model(model);
-                        if repo_tx.send(repo).await.is_ok() {
-                            sent += 1;
-                        }
+                let mut sent = 0usize;
+                for model in &cached_repos {
+                    let repo = PlatformRepo::from_model(model);
+                    if repo_tx.send(repo).await.is_ok() {
+                        sent += 1;
                     }
-
-                    emit(on_progress, SyncProgress::FetchComplete { total: sent });
-                    return Ok(sent);
                 }
+
+                emit(on_progress, SyncProgress::FetchComplete { total: sent });
+                return Ok(sent);
             }
         }
 
