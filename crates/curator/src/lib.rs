@@ -30,6 +30,9 @@ pub mod repository;
 pub mod sync;
 
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+pub mod oauth;
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 pub mod retry;
 
 #[cfg(feature = "github")]

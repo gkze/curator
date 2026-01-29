@@ -28,10 +28,10 @@
 //! println!("Access token: {}", token.access_token);
 //! ```
 
+use crate::oauth::OAuthError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use thiserror::Error;
 
 /// The Client ID for the Curator OAuth App.
 ///
@@ -44,38 +44,6 @@ const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 
 /// GitHub's OAuth token endpoint.
 const TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
-
-/// Errors that can occur during OAuth Device Flow.
-#[derive(Debug, Error)]
-pub enum OAuthError {
-    /// HTTP request failed.
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
-
-    /// Failed to parse response from GitHub.
-    #[error("Failed to parse response: {0}")]
-    Parse(String),
-
-    /// User did not authorize in time.
-    #[error("Authorization expired. Please try again.")]
-    Expired,
-
-    /// User denied the authorization request.
-    #[error("Authorization was denied by the user.")]
-    AccessDenied,
-
-    /// The device code was not recognized (may have been used already).
-    #[error("Invalid device code. Please restart the login process.")]
-    InvalidDeviceCode,
-
-    /// Too many polling requests (should not happen with proper interval).
-    #[error("Too many requests. Please wait and try again.")]
-    SlowDown,
-
-    /// Unexpected error from GitHub.
-    #[error("GitHub error: {0}")]
-    GitHub(String),
-}
 
 /// Response from GitHub's device code endpoint.
 #[derive(Debug, Clone, Deserialize)]
@@ -154,7 +122,7 @@ pub async fn request_device_code(scope: &str) -> Result<DeviceCodeResponse, OAut
 
     if !response.status().is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(OAuthError::GitHub(format!(
+        return Err(OAuthError::github(format!(
             "Failed to get device code: {}",
             text
         )));
@@ -216,7 +184,7 @@ pub async fn poll_for_token(
 
         if !response.status().is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(OAuthError::GitHub(format!(
+            return Err(OAuthError::github(format!(
                 "Token request failed: {}",
                 text
             )));
@@ -247,7 +215,7 @@ pub async fn poll_for_token(
                 "access_denied" => return Err(OAuthError::AccessDenied),
                 "incorrect_device_code" => return Err(OAuthError::InvalidDeviceCode),
                 _ => {
-                    return Err(OAuthError::GitHub(
+                    return Err(OAuthError::github(
                         err.error_description.unwrap_or(err.error),
                     ));
                 }

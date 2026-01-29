@@ -18,9 +18,19 @@ all-databases = ["postgres", "sqlite"]
 # Migration support (combine with database backend(s))
 migrate = ["dep:sea-orm-migration"]
 # Platform clients
-github = ["dep:octocrab", "dep:backon", "dep:reqwest"]
-gitlab = ["dep:progenitor-client", "dep:reqwest", "dep:backon"]
-gitea = ["dep:reqwest", "dep:backon"]
+github = ["dep:octocrab", "dep:backon", "dep:reqwest", "dep:oauth2"]
+gitlab = ["dep:progenitor-client", "dep:reqwest", "dep:backon", "dep:oauth2"]
+gitea = [
+  "dep:reqwest",
+  "dep:backon",
+  "dep:oauth2",
+  "dep:axum",
+  "dep:sha2",
+  "dep:base64",
+  "dep:rand",
+  "dep:urlencoding",
+  "dep:open",
+]
 
 [dependencies]
 sea-orm = { version = "1.1", default-features = false, features = [
@@ -41,6 +51,20 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
 ], optional = true }
 backon = { version = "1.6", optional = true }
+oauth2 = { version = "5.0", default-features = false, features = [
+  "reqwest",
+], optional = true }
+axum = { version = "0.8", default-features = false, features = [
+  "tokio",
+  "http1",
+  "query",
+], optional = true }
+# PKCE OAuth dependencies (for gitea feature)
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+rand = { version = "0.9", optional = true }
+urlencoding = { version = "2.1", optional = true }
+open = { version = "5", optional = true }
 tracing = "0.1"
 governor = "0.10"
 serde = { version = "1", features = ["derive"] }

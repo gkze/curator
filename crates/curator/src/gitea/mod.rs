@@ -34,6 +34,7 @@
 mod client;
 mod convert;
 mod error;
+pub mod oauth;
 mod types;
 
 // Re-export error types

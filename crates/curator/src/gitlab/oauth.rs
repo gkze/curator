@@ -30,44 +30,16 @@
 //! println!("Access token: {}", token.access_token);
 //! ```
 
+use crate::oauth::OAuthError;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use thiserror::Error;
 
 /// The Client ID for the Curator OAuth App on gitlab.com.
 ///
 /// This is a public identifier and is safe to embed in the source code.
 /// It identifies the Curator application to GitLab during OAuth flows.
 pub const CLIENT_ID: &str = "eba8ea9cbb5e8ddd455a3b3db35871963d8aa6b0a344a4b8c8e34ae8d71f336f";
-
-/// Errors that can occur during OAuth Device Flow.
-#[derive(Debug, Error)]
-pub enum OAuthError {
-    /// HTTP request failed.
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
-
-    /// Failed to parse response from GitLab.
-    #[error("Failed to parse response: {0}")]
-    Parse(String),
-
-    /// User did not authorize in time.
-    #[error("Authorization expired. Please try again.")]
-    Expired,
-
-    /// User denied the authorization request.
-    #[error("Authorization was denied by the user.")]
-    AccessDenied,
-
-    /// Too many polling requests (should not happen with proper interval).
-    #[error("Too many requests. Please wait and try again.")]
-    SlowDown,
-
-    /// Unexpected error from GitLab.
-    #[error("GitLab error: {0}")]
-    GitLab(String),
-}
 
 /// Response from GitLab's device authorization endpoint.
 #[derive(Debug, Clone, Deserialize)]
@@ -172,7 +144,7 @@ pub async fn request_device_code(
 
     if !response.status().is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(OAuthError::GitLab(format!(
+        return Err(OAuthError::gitlab(format!(
             "Failed to get device code: {}",
             text
         )));
@@ -242,13 +214,13 @@ pub async fn poll_for_token(
                     "expired_token" => return Err(OAuthError::Expired),
                     "access_denied" => return Err(OAuthError::AccessDenied),
                     _ => {
-                        return Err(OAuthError::GitLab(
+                        return Err(OAuthError::gitlab(
                             err.error_description.unwrap_or(err.error),
                         ));
                     }
                 }
             }
-            return Err(OAuthError::GitLab(format!(
+            return Err(OAuthError::gitlab(format!(
                 "Token request failed: {}",
                 text
             )));
@@ -270,7 +242,7 @@ pub async fn poll_for_token(
                 "expired_token" => return Err(OAuthError::Expired),
                 "access_denied" => return Err(OAuthError::AccessDenied),
                 _ => {
-                    return Err(OAuthError::GitLab(
+                    return Err(OAuthError::gitlab(
                         err.error_description.unwrap_or(err.error),
                     ));
                 }
@@ -314,7 +286,7 @@ pub async fn refresh_access_token(
 
     if !response.status().is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(OAuthError::GitLab(format!(
+        return Err(OAuthError::gitlab(format!(
             "Token refresh failed: {}",
             text
         )));
@@ -327,7 +299,7 @@ pub async fn refresh_access_token(
 
     match token_response {
         TokenResponse::Success(token) => Ok(token),
-        TokenResponse::Error(err) => Err(OAuthError::GitLab(
+        TokenResponse::Error(err) => Err(OAuthError::gitlab(
             err.error_description.unwrap_or(err.error),
         )),
     }
