@@ -189,6 +189,83 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
         self.options.dry_run
     }
 
+    /// Execute an async operation with automatic persist task management.
+    ///
+    /// This helper handles the common pattern of:
+    /// 1. Creating a channel for streaming models
+    /// 2. Spawning a persist task (if not dry_run)
+    /// 3. Executing the provided async operation with the sender
+    /// 4. Awaiting the persist task and returning the result
+    ///
+    /// Use this for fallible operations that return `Result`.
+    async fn with_persist_task<F, Fut, T, E>(
+        &self,
+        f: F,
+    ) -> std::result::Result<(T, PersistTaskResult), E>
+    where
+        F: FnOnce(mpsc::Sender<CodeRepositoryActiveModel>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    {
+        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
+
+        let persist_handle = if !self.options.dry_run {
+            let db = self
+                .database
+                .clone()
+                .expect("database required for non-dry-run sync");
+            let (handle, _counter) =
+                spawn_persist_task(db, rx, self.shutdown_flag.clone(), self.progress.clone());
+            Some(handle)
+        } else {
+            drop(rx);
+            None
+        };
+
+        let result = f(tx).await?;
+
+        let persist_result = if let Some(handle) = persist_handle {
+            await_persist_task(handle).await
+        } else {
+            PersistTaskResult::default()
+        };
+
+        Ok((result, persist_result))
+    }
+
+    /// Execute an async operation with automatic persist task management (infallible version).
+    ///
+    /// Similar to [`with_persist_task`] but for operations that don't return `Result`.
+    async fn with_persist_task_infallible<F, Fut, T>(&self, f: F) -> (T, PersistTaskResult)
+    where
+        F: FnOnce(mpsc::Sender<CodeRepositoryActiveModel>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
+
+        let persist_handle = if !self.options.dry_run {
+            let db = self
+                .database
+                .clone()
+                .expect("database required for non-dry-run sync");
+            let (handle, _counter) =
+                spawn_persist_task(db, rx, self.shutdown_flag.clone(), self.progress.clone());
+            Some(handle)
+        } else {
+            drop(rx);
+            None
+        };
+
+        let result = f(tx).await;
+
+        let persist_result = if let Some(handle) = persist_handle {
+            await_persist_task(handle).await
+        } else {
+            PersistTaskResult::default()
+        };
+
+        (result, persist_result)
+    }
+
     /// Sync a single namespace (organization/group).
     ///
     /// This is the simplest sync method - it fetches, filters, and returns results
@@ -216,42 +293,21 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
         &self,
         namespace: &str,
     ) -> std::result::Result<SyncStreamingResult, PlatformError> {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
+        let (sync, persist) = self
+            .with_persist_task(|tx| {
+                sync_namespace_streaming(
+                    &self.client,
+                    namespace,
+                    &self.options,
+                    self.rate_limiter.as_ref(),
+                    self.database.as_ref().map(|db| db.as_ref()),
+                    tx,
+                    self.progress.as_ref().map(|p| p.as_ref()),
+                )
+            })
+            .await?;
 
-        let persist_handle = if !self.options.dry_run {
-            let db = self
-                .database
-                .clone()
-                .expect("database required for non-dry-run sync");
-            let (handle, counter) =
-                spawn_persist_task(db, rx, self.shutdown_flag.clone(), self.progress.clone());
-            Some((handle, counter))
-        } else {
-            drop(rx);
-            None
-        };
-
-        let sync_result = sync_namespace_streaming(
-            &self.client,
-            namespace,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            self.database.as_ref().map(|db| db.as_ref()),
-            tx,
-            self.progress.as_ref().map(|p| p.as_ref()),
-        )
-        .await?;
-
-        let persist_result = if let Some((handle, _counter)) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
-
-        Ok(SyncStreamingResult {
-            sync: sync_result,
-            persist: persist_result,
-        })
+        Ok(SyncStreamingResult { sync, persist })
     }
 
     /// Sync multiple namespaces concurrently with streaming persistence.
@@ -259,39 +315,18 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
         &self,
         namespaces: &[String],
     ) -> (Vec<NamespaceSyncResultStreaming>, PersistTaskResult) {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
-
-        let persist_handle = if !self.options.dry_run {
-            let db = self
-                .database
-                .clone()
-                .expect("database required for non-dry-run sync");
-            let (handle, _counter) =
-                spawn_persist_task(db, rx, self.shutdown_flag.clone(), self.progress.clone());
-            Some(handle)
-        } else {
-            drop(rx);
-            None
-        };
-
-        let ns_results = sync_namespaces_streaming(
-            &self.client,
-            namespaces,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            self.database.clone(), // Pass Arc for ETag caching in concurrent syncs
-            tx,
-            self.progress.as_ref().map(|p| p.as_ref()),
-        )
-        .await;
-
-        let persist_result = if let Some(handle) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
-
-        (ns_results, persist_result)
+        self.with_persist_task_infallible(|tx| {
+            sync_namespaces_streaming(
+                &self.client,
+                namespaces,
+                &self.options,
+                self.rate_limiter.as_ref(),
+                self.database.clone(),
+                tx,
+                self.progress.as_ref().map(|p| p.as_ref()),
+            )
+        })
+        .await
     }
 
     /// Sync a single user's repositories with streaming persistence.
@@ -299,42 +334,21 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
         &self,
         username: &str,
     ) -> std::result::Result<SyncStreamingResult, PlatformError> {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
+        let (sync, persist) = self
+            .with_persist_task(|tx| {
+                sync_user_streaming(
+                    &self.client,
+                    username,
+                    &self.options,
+                    self.rate_limiter.as_ref(),
+                    self.database.as_ref().map(|db| db.as_ref()),
+                    tx,
+                    self.progress.as_ref().map(|p| p.as_ref()),
+                )
+            })
+            .await?;
 
-        let persist_handle = if !self.options.dry_run {
-            let db = self
-                .database
-                .clone()
-                .expect("database required for non-dry-run sync");
-            let (handle, counter) =
-                spawn_persist_task(db, rx, self.shutdown_flag.clone(), self.progress.clone());
-            Some((handle, counter))
-        } else {
-            drop(rx);
-            None
-        };
-
-        let sync_result = sync_user_streaming(
-            &self.client,
-            username,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            self.database.as_ref().map(|db| db.as_ref()),
-            tx,
-            self.progress.as_ref().map(|p| p.as_ref()),
-        )
-        .await?;
-
-        let persist_result = if let Some((handle, _counter)) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
-
-        Ok(SyncStreamingResult {
-            sync: sync_result,
-            persist: persist_result,
-        })
+        Ok(SyncStreamingResult { sync, persist })
     }
 
     /// Sync multiple users' repositories concurrently with streaming persistence.
@@ -342,39 +356,18 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
         &self,
         usernames: &[String],
     ) -> (Vec<NamespaceSyncResultStreaming>, PersistTaskResult) {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
-
-        let persist_handle = if !self.options.dry_run {
-            let db = self
-                .database
-                .clone()
-                .expect("database required for non-dry-run sync");
-            let (handle, _counter) =
-                spawn_persist_task(db, rx, self.shutdown_flag.clone(), self.progress.clone());
-            Some(handle)
-        } else {
-            drop(rx);
-            None
-        };
-
-        let user_results = sync_users_streaming(
-            &self.client,
-            usernames,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            self.database.clone(), // Pass Arc for ETag caching in concurrent syncs
-            tx,
-            self.progress.as_ref().map(|p| p.as_ref()),
-        )
-        .await;
-
-        let persist_result = if let Some(handle) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
-
-        (user_results, persist_result)
+        self.with_persist_task_infallible(|tx| {
+            sync_users_streaming(
+                &self.client,
+                usernames,
+                &self.options,
+                self.rate_limiter.as_ref(),
+                self.database.clone(),
+                tx,
+                self.progress.as_ref().map(|p| p.as_ref()),
+            )
+        })
+        .await
     }
 
     /// Sync starred repositories with streaming persistence.
@@ -384,43 +377,22 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
         &self,
         skip_rate_checks: bool,
     ) -> std::result::Result<SyncStreamingResult, PlatformError> {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
+        let (sync, persist) = self
+            .with_persist_task(|tx| {
+                sync_starred_streaming(
+                    &self.client,
+                    &self.options,
+                    self.rate_limiter.as_ref(),
+                    self.database.as_ref().map(|db| db.as_ref()),
+                    self.options.concurrency,
+                    skip_rate_checks,
+                    tx,
+                    self.progress.as_ref().map(|p| p.as_ref()),
+                )
+            })
+            .await?;
 
-        let persist_handle = if !self.options.dry_run {
-            let db = self
-                .database
-                .clone()
-                .expect("database required for non-dry-run sync");
-            let (handle, counter) =
-                spawn_persist_task(db, rx, self.shutdown_flag.clone(), self.progress.clone());
-            Some((handle, counter))
-        } else {
-            drop(rx);
-            None
-        };
-
-        let sync_result = sync_starred_streaming(
-            &self.client,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            self.database.as_ref().map(|db| db.as_ref()),
-            self.options.concurrency,
-            skip_rate_checks,
-            tx,
-            self.progress.as_ref().map(|p| p.as_ref()),
-        )
-        .await?;
-
-        let persist_result = if let Some((handle, _counter)) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
-
-        Ok(SyncStreamingResult {
-            sync: sync_result,
-            persist: persist_result,
-        })
+        Ok(SyncStreamingResult { sync, persist })
     }
 
     /// Get a real-time counter for saved repositories.

@@ -284,13 +284,22 @@ impl SyncRunner {
         self.no_rate_limit
     }
 
-    /// Run a single namespace sync (org/group).
-    pub async fn run_namespace<C: PlatformClient + Clone + 'static>(
-        &self,
-        client: &C,
-        namespace: &str,
-    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
+    /// Execute an async operation with automatic persist task management.
+    ///
+    /// This helper handles the common pattern of:
+    /// 1. Creating a channel for streaming models
+    /// 2. Spawning a persist task (if not dry_run)
+    /// 3. Executing the provided async operation with the sender
+    /// 4. Awaiting the persist task and returning the result
+    ///
+    /// Use this for fallible operations that return `Result`.
+    async fn with_persist_task<F, Fut, T, E>(&self, f: F) -> Result<(T, PersistTaskResult), E>
+    where
+        F: FnOnce(mpsc::Sender<CodeRepositoryActiveModel>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
         let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
+
         let persist_handle = if !self.options.dry_run {
             let (handle, _counter) =
                 spawn_persist_task(Arc::clone(&self.db), rx, Some(Arc::clone(&self.progress)));
@@ -300,22 +309,66 @@ impl SyncRunner {
             None
         };
 
-        let result = sync_namespace_streaming(
-            client,
-            namespace,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            Some(&*self.db),
-            tx,
-            Some(&*self.progress),
-        )
-        .await?;
+        let result = f(tx).await?;
 
         let persist_result = if let Some(handle) = persist_handle {
             await_persist_task(handle).await
         } else {
             PersistTaskResult::default()
         };
+
+        Ok((result, persist_result))
+    }
+
+    /// Execute an async operation with automatic persist task management (infallible version).
+    ///
+    /// Similar to [`with_persist_task`] but for operations that don't return `Result`.
+    async fn with_persist_task_infallible<F, Fut, T>(&self, f: F) -> (T, PersistTaskResult)
+    where
+        F: FnOnce(mpsc::Sender<CodeRepositoryActiveModel>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
+
+        let persist_handle = if !self.options.dry_run {
+            let (handle, _counter) =
+                spawn_persist_task(Arc::clone(&self.db), rx, Some(Arc::clone(&self.progress)));
+            Some(handle)
+        } else {
+            drop(rx);
+            None
+        };
+
+        let result = f(tx).await;
+
+        let persist_result = if let Some(handle) = persist_handle {
+            await_persist_task(handle).await
+        } else {
+            PersistTaskResult::default()
+        };
+
+        (result, persist_result)
+    }
+
+    /// Run a single namespace sync (org/group).
+    pub async fn run_namespace<C: PlatformClient + Clone + 'static>(
+        &self,
+        client: &C,
+        namespace: &str,
+    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
+        let (result, persist_result) = self
+            .with_persist_task(|tx| {
+                sync_namespace_streaming(
+                    client,
+                    namespace,
+                    &self.options,
+                    self.rate_limiter.as_ref(),
+                    Some(&*self.db),
+                    tx,
+                    Some(&*self.progress),
+                )
+            })
+            .await?;
 
         self.reporter.finish();
 
@@ -328,32 +381,19 @@ impl SyncRunner {
         client: &C,
         namespaces: &[String],
     ) -> AggregatedSyncResult {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
-        let persist_handle = if !self.options.dry_run {
-            let (handle, _counter) =
-                spawn_persist_task(Arc::clone(&self.db), rx, Some(Arc::clone(&self.progress)));
-            Some(handle)
-        } else {
-            drop(rx);
-            None
-        };
-
-        let results = sync_namespaces_streaming(
-            client,
-            namespaces,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            Some(Arc::clone(&self.db)), // Pass db for ETag caching in concurrent syncs
-            tx,
-            Some(&*self.progress),
-        )
-        .await;
-
-        let persist_result = if let Some(handle) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
+        let (results, persist_result) = self
+            .with_persist_task_infallible(|tx| {
+                sync_namespaces_streaming(
+                    client,
+                    namespaces,
+                    &self.options,
+                    self.rate_limiter.as_ref(),
+                    Some(Arc::clone(&self.db)),
+                    tx,
+                    Some(&*self.progress),
+                )
+            })
+            .await;
 
         self.reporter.finish();
 
@@ -366,32 +406,19 @@ impl SyncRunner {
         client: &C,
         user: &str,
     ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
-        let persist_handle = if !self.options.dry_run {
-            let (handle, _counter) =
-                spawn_persist_task(Arc::clone(&self.db), rx, Some(Arc::clone(&self.progress)));
-            Some(handle)
-        } else {
-            drop(rx);
-            None
-        };
-
-        let result = sync_user_streaming(
-            client,
-            user,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            Some(&*self.db),
-            tx,
-            Some(&*self.progress),
-        )
-        .await?;
-
-        let persist_result = if let Some(handle) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
+        let (result, persist_result) = self
+            .with_persist_task(|tx| {
+                sync_user_streaming(
+                    client,
+                    user,
+                    &self.options,
+                    self.rate_limiter.as_ref(),
+                    Some(&*self.db),
+                    tx,
+                    Some(&*self.progress),
+                )
+            })
+            .await?;
 
         self.reporter.finish();
 
@@ -404,32 +431,19 @@ impl SyncRunner {
         client: &C,
         users: &[String],
     ) -> AggregatedSyncResult {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
-        let persist_handle = if !self.options.dry_run {
-            let (handle, _counter) =
-                spawn_persist_task(Arc::clone(&self.db), rx, Some(Arc::clone(&self.progress)));
-            Some(handle)
-        } else {
-            drop(rx);
-            None
-        };
-
-        let results = sync_users_streaming(
-            client,
-            users,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            Some(Arc::clone(&self.db)), // Pass db for ETag caching in concurrent syncs
-            tx,
-            Some(&*self.progress),
-        )
-        .await;
-
-        let persist_result = if let Some(handle) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
+        let (results, persist_result) = self
+            .with_persist_task_infallible(|tx| {
+                sync_users_streaming(
+                    client,
+                    users,
+                    &self.options,
+                    self.rate_limiter.as_ref(),
+                    Some(Arc::clone(&self.db)),
+                    tx,
+                    Some(&*self.progress),
+                )
+            })
+            .await;
 
         self.reporter.finish();
 
@@ -441,33 +455,20 @@ impl SyncRunner {
         &self,
         client: &C,
     ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
-        let persist_handle = if !self.options.dry_run {
-            let (handle, _counter) =
-                spawn_persist_task(Arc::clone(&self.db), rx, Some(Arc::clone(&self.progress)));
-            Some(handle)
-        } else {
-            drop(rx);
-            None
-        };
-
-        let result = sync_starred_streaming(
-            client,
-            &self.options,
-            self.rate_limiter.as_ref(),
-            Some(&*self.db),
-            self.options.concurrency,
-            self.no_rate_limit,
-            tx,
-            Some(&*self.progress),
-        )
-        .await?;
-
-        let persist_result = if let Some(handle) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
+        let (result, persist_result) = self
+            .with_persist_task(|tx| {
+                sync_starred_streaming(
+                    client,
+                    &self.options,
+                    self.rate_limiter.as_ref(),
+                    Some(&*self.db),
+                    self.options.concurrency,
+                    self.no_rate_limit,
+                    tx,
+                    Some(&*self.progress),
+                )
+            })
+            .await?;
 
         // Delete pruned repos from database (unless dry-run)
         let deleted = if !self.options.dry_run && !result.pruned_repos.is_empty() {
