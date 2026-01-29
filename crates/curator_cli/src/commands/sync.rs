@@ -16,7 +16,9 @@ use curator::{
 
 use crate::CommonSyncOptions;
 use crate::StarredSyncOptions;
-use crate::commands::shared::{SyncKind, SyncRunner, display_final_rate_limit};
+use crate::commands::shared::{
+    SyncKind, SyncRunner, display_final_rate_limit, get_token_for_instance,
+};
 use crate::config::Config;
 
 /// Sync subcommands.
@@ -122,58 +124,6 @@ async fn get_instance(
         })
 }
 
-/// Get the token for an instance based on its platform type.
-fn get_token_for_instance(
-    instance: &InstanceModel,
-    config: &Config,
-) -> Result<String, Box<dyn std::error::Error>> {
-    match instance.platform_type {
-        #[cfg(feature = "github")]
-        PlatformType::GitHub => config.github_token().ok_or_else(|| {
-            format!(
-                "No GitHub token configured. Run 'curator login {}' or set CURATOR_GITHUB_TOKEN.",
-                instance.name
-            )
-            .into()
-        }),
-        #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => config.gitlab_token().ok_or_else(|| {
-            format!(
-                "No GitLab token configured. Run 'curator login {}' or set CURATOR_GITLAB_TOKEN.",
-                instance.name
-            )
-            .into()
-        }),
-        #[cfg(feature = "gitea")]
-        PlatformType::Gitea => {
-            // Check for Codeberg-specific token first, then generic Gitea token
-            if instance.is_codeberg() {
-                config.codeberg_token()
-            } else {
-                config.gitea_token()
-            }
-            .ok_or_else(|| {
-                let env_var = if instance.is_codeberg() {
-                    "CURATOR_CODEBERG_TOKEN"
-                } else {
-                    "CURATOR_GITEA_TOKEN"
-                };
-                format!(
-                    "No token configured for '{}'. Run 'curator login {}' or set {}.",
-                    instance.name, instance.name, env_var
-                )
-                .into()
-            })
-        }
-        #[allow(unreachable_patterns)]
-        _ => Err(format!(
-            "Platform type '{}' not supported. Enable the appropriate feature.",
-            instance.platform_type
-        )
-        .into()),
-    }
-}
-
 /// Get the default RPS for an instance's platform type.
 fn get_default_rps(instance: &InstanceModel) -> u32 {
     match instance.platform_type {
@@ -194,7 +144,7 @@ async fn sync_org(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db_conn = db::connect(database_url).await?;
     let instance = get_instance(&db_conn, instance_name).await?;
-    let token = get_token_for_instance(&instance, config)?;
+    let token = get_token_for_instance(&instance, config).await?;
 
     // Merge CLI args with config defaults
     let active_within_days = sync_opts
@@ -305,7 +255,7 @@ async fn sync_user(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db_conn = db::connect(database_url).await?;
     let instance = get_instance(&db_conn, instance_name).await?;
-    let token = get_token_for_instance(&instance, config)?;
+    let token = get_token_for_instance(&instance, config).await?;
 
     // Merge CLI args with config defaults
     let active_within_days = sync_opts
@@ -412,7 +362,7 @@ async fn sync_stars(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db_conn = db::connect(database_url).await?;
     let instance = get_instance(&db_conn, instance_name).await?;
-    let token = get_token_for_instance(&instance, config)?;
+    let token = get_token_for_instance(&instance, config).await?;
 
     // Merge CLI args with config defaults
     let active_within_days = sync_opts

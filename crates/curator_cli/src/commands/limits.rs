@@ -2,8 +2,9 @@ use clap::ValueEnum;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
-use curator::{Instance, InstanceColumn, InstanceModel, PlatformType};
+use curator::{Instance, InstanceColumn, PlatformType};
 
+use crate::commands::shared::get_token_for_instance;
 use crate::config::Config;
 
 /// Output format for rate limit display.
@@ -36,8 +37,8 @@ pub(crate) async fn handle_limits(
             )
         })?;
 
-    // Get token for instance
-    let token = get_token_for_instance(&instance, config)?;
+    // Get token for instance (with automatic refresh for OAuth tokens)
+    let token = get_token_for_instance(&instance, config).await?;
 
     match instance.platform_type {
         #[cfg(feature = "github")]
@@ -88,52 +89,6 @@ pub(crate) async fn handle_limits(
     }
 
     Ok(())
-}
-
-/// Get the token for an instance based on its platform type.
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-fn get_token_for_instance(
-    instance: &InstanceModel,
-    config: &Config,
-) -> Result<String, Box<dyn std::error::Error>> {
-    match instance.platform_type {
-        #[cfg(feature = "github")]
-        PlatformType::GitHub => config.github_token().ok_or_else(|| {
-            format!(
-                "No GitHub token configured. Run 'curator login {}' or set CURATOR_GITHUB_TOKEN.",
-                instance.name
-            )
-            .into()
-        }),
-        #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => config.gitlab_token().ok_or_else(|| {
-            format!(
-                "No GitLab token configured. Run 'curator login {}' or set CURATOR_GITLAB_TOKEN.",
-                instance.name
-            )
-            .into()
-        }),
-        #[cfg(feature = "gitea")]
-        PlatformType::Gitea => if instance.is_codeberg() {
-            config.codeberg_token()
-        } else {
-            config.gitea_token()
-        }
-        .ok_or_else(|| {
-            let env_var = if instance.is_codeberg() {
-                "CURATOR_CODEBERG_TOKEN"
-            } else {
-                "CURATOR_GITEA_TOKEN"
-            };
-            format!(
-                "No token configured for '{}'. Run 'curator login {}' or set {}.",
-                instance.name, instance.name, env_var
-            )
-            .into()
-        }),
-        #[allow(unreachable_patterns)]
-        _ => Err(format!("Platform type '{}' not supported.", instance.platform_type).into()),
-    }
 }
 
 /// Rate limit information for display.

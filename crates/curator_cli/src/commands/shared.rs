@@ -21,7 +21,9 @@ use std::sync::{
 };
 
 use console::Term;
+use curator::PlatformType;
 use curator::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
+use curator::entity::instance::Model as InstanceModel;
 use curator::platform::{ApiRateLimiter, PlatformClient};
 use curator::repository;
 use curator::sync::{
@@ -32,8 +34,13 @@ use curator::sync::{
 use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
 
+use crate::config::Config;
 use crate::progress::ProgressReporter;
 use crate::shutdown::{SHUTDOWN_FLAG, is_shutdown_requested};
+
+/// Buffer time (in seconds) before token expiry to trigger refresh.
+/// We refresh 5 minutes early to avoid race conditions.
+const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
 // Re-export types from the library for convenience
 pub use curator::sync::{
@@ -684,4 +691,133 @@ impl SyncRunner {
             display_persist_errors(&result.persist_result, self.is_tty);
         }
     }
+}
+
+/// Get the token for an instance, automatically refreshing OAuth tokens if needed.
+///
+/// For Codeberg (OAuth), this checks if the token is expired or near expiry and
+/// attempts to refresh it using the stored refresh token. The new tokens are
+/// saved to the config file.
+///
+/// For other platforms or non-OAuth tokens (PATs), this simply returns the
+/// configured token.
+///
+/// # Arguments
+///
+/// * `instance` - The instance to get the token for
+/// * `config` - The CLI configuration containing tokens
+///
+/// # Returns
+///
+/// The valid access token, or an error if no token is configured or refresh fails.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+pub async fn get_token_for_instance(
+    instance: &InstanceModel,
+    config: &Config,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match instance.platform_type {
+        #[cfg(feature = "github")]
+        PlatformType::GitHub => config.github_token().ok_or_else(|| {
+            format!(
+                "No GitHub token configured. Run 'curator login {}' or set CURATOR_GITHUB_TOKEN.",
+                instance.name
+            )
+            .into()
+        }),
+        #[cfg(feature = "gitlab")]
+        PlatformType::GitLab => config.gitlab_token().ok_or_else(|| {
+            format!(
+                "No GitLab token configured. Run 'curator login {}' or set CURATOR_GITLAB_TOKEN.",
+                instance.name
+            )
+            .into()
+        }),
+        #[cfg(feature = "gitea")]
+        PlatformType::Gitea => {
+            if instance.is_codeberg() {
+                // Check if we need to refresh the Codeberg OAuth token
+                get_codeberg_token_with_refresh(config).await
+            } else {
+                // Self-hosted Gitea uses PAT (no refresh needed)
+                config.gitea_token().ok_or_else(|| {
+                    format!(
+                        "No Gitea token configured for '{}'. Run 'curator login {}' or set CURATOR_GITEA_TOKEN.",
+                        instance.name, instance.name
+                    )
+                    .into()
+                })
+            }
+        }
+        #[allow(unreachable_patterns)]
+        _ => Err(format!(
+            "Platform type '{}' not supported. Enable the appropriate feature.",
+            instance.platform_type
+        )
+        .into()),
+    }
+}
+
+/// Get the Codeberg token, refreshing if expired or near expiry.
+///
+/// This function:
+/// 1. Checks if a token exists
+/// 2. If a refresh token exists, checks if the access token is expired/near expiry
+/// 3. If refresh is needed and possible, refreshes and saves new tokens
+/// 4. Returns the (possibly refreshed) access token
+#[cfg(feature = "gitea")]
+async fn get_codeberg_token_with_refresh(
+    config: &Config,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use curator::gitea::oauth::{CodebergAuth, refresh_access_token, token_expires_at};
+    use curator::oauth::token_is_expired;
+
+    // Get the current token (if any)
+    let current_token = config.codeberg_token();
+    let refresh_token = config.codeberg_refresh_token();
+    let expires_at = config.codeberg_token_expires_at();
+
+    // If we have a refresh token and the access token is expired/near expiry, try to refresh
+    if let Some(ref rt) = refresh_token {
+        if token_is_expired(expires_at, TOKEN_REFRESH_BUFFER_SECS) {
+            tracing::info!("Codeberg token expired or near expiry, attempting refresh...");
+
+            match refresh_access_token(&CodebergAuth::new(), rt).await {
+                Ok(new_tokens) => {
+                    // Calculate new expiry
+                    let new_expires_at = token_expires_at(&new_tokens);
+
+                    // Save the new tokens
+                    Config::save_codeberg_oauth_tokens(
+                        &new_tokens.access_token,
+                        new_tokens.refresh_token.as_deref(),
+                        new_expires_at,
+                    )?;
+
+                    tracing::info!("Successfully refreshed Codeberg token");
+                    return Ok(new_tokens.access_token);
+                }
+                Err(e) => {
+                    // If refresh fails and we have a current token, warn but try to use it
+                    // (it might still work if the expiry check was overly aggressive)
+                    if current_token.is_some() {
+                        tracing::warn!(
+                            "Failed to refresh Codeberg token: {}. Trying existing token...",
+                            e
+                        );
+                    } else {
+                        return Err(format!(
+                            "Codeberg token expired and refresh failed: {}. Run 'curator login codeberg' to re-authenticate.",
+                            e
+                        ).into());
+                    }
+                }
+            }
+        }
+    }
+
+    // Return the current token if we have one
+    current_token.ok_or_else(|| {
+        "No Codeberg token configured. Run 'curator login codeberg' or set CURATOR_CODEBERG_TOKEN."
+            .into()
+    })
 }
