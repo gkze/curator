@@ -4,7 +4,6 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::{ActiveModel, Column, Entity as CodeRepository};
 
 use super::errors::{RepositoryError, Result};
@@ -136,18 +135,18 @@ pub async fn delete_many(db: &DatabaseConnection, ids: Vec<Uuid>) -> Result<u64>
     Ok(result.rows_affected)
 }
 
-/// Delete all repositories for a given platform.
+/// Delete all repositories for a given instance.
 ///
 /// Returns the number of rows deleted.
-pub async fn delete_by_platform(db: &DatabaseConnection, platform: CodePlatform) -> Result<u64> {
+pub async fn delete_by_instance(db: &DatabaseConnection, instance_id: Uuid) -> Result<u64> {
     let result = CodeRepository::delete_many()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .exec(db)
         .await?;
     Ok(result.rows_affected)
 }
 
-/// Delete repositories by owner/name pairs for a specific platform.
+/// Delete repositories by owner/name pairs for a specific instance.
 ///
 /// This is used when pruning starred repositories - when a repo is unstarred,
 /// it should also be removed from the database.
@@ -155,7 +154,7 @@ pub async fn delete_by_platform(db: &DatabaseConnection, platform: CodePlatform)
 /// Returns the number of rows deleted.
 pub async fn delete_by_owner_name(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     repos: &[(String, String)], // (owner, name) pairs
 ) -> Result<u64> {
     if repos.is_empty() {
@@ -177,7 +176,7 @@ pub async fn delete_by_owner_name(
         }
 
         let result = CodeRepository::delete_many()
-            .filter(Column::Platform.eq(platform.clone()))
+            .filter(Column::InstanceId.eq(instance_id))
             .filter(condition)
             .exec(db)
             .await?;
@@ -208,11 +207,11 @@ fn is_retryable_error(err: &RepositoryError) -> bool {
 
 /// Build the ON CONFLICT clause used by bulk upsert.
 ///
-/// Conflict detection uses (platform, platform_id) as the natural key.
+/// Conflict detection uses (instance_id, platform_id) as the natural key.
 /// Only updates rows where `updated_at` has changed (content-based deduplication),
 /// preventing unnecessary writes when the API returns the same data.
 pub(crate) fn build_upsert_on_conflict() -> OnConflict {
-    OnConflict::columns([Column::Platform, Column::PlatformId])
+    OnConflict::columns([Column::InstanceId, Column::PlatformId])
         .update_columns([
             Column::Owner,
             Column::Name,

@@ -1,12 +1,11 @@
-//! CodeRepository entity - unified schema for GitHub, GitLab, and Codeberg repositories.
+//! CodeRepository entity - unified schema for repositories across platform instances.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_visibility::CodeVisibility;
 
-/// CodeRepository model - tracks repositories across multiple code forge platforms.
+/// CodeRepository model - tracks repositories across multiple code forge instances.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "code_repositories")]
 pub struct Model {
@@ -14,14 +13,13 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
 
-    // ─── Platform Identity ───────────────────────────────────────────────────
-    /// Source platform (github, gitlab, codeberg).
-    pub platform: CodePlatform,
+    // ─── Instance Identity ─────────────────────────────────────────────────────
+    /// Reference to the platform instance this repository belongs to.
+    pub instance_id: Uuid,
     /// Platform-specific numeric ID.
     pub platform_id: i64,
 
     // ─── Naming ──────────────────────────────────────────────────────────────
-    // Note: full_name, url, clone_url_https, clone_url_ssh are derived from (platform, owner, name)
     /// Owner login (user or organization).
     pub owner: String,
     /// Repository name (URL-safe slug).
@@ -70,7 +68,7 @@ pub struct Model {
     pub forks: Option<i32>,
     /// Open issue count.
     pub open_issues: Option<i32>,
-    /// Watcher count (GitHub/Codeberg only).
+    /// Watcher count (GitHub only).
     pub watchers: Option<i32>,
     /// Repository size in KB.
     pub size_kb: Option<i64>,
@@ -98,7 +96,7 @@ pub struct Model {
     /// Platform-specific metadata stored as JSON.
     ///
     /// This allows storing platform-specific fields that don't fit the common schema,
-    /// such as GitHub's `node_id`, GitLab's `commit_count`, or Codeberg's `release_count`.
+    /// such as GitHub's `node_id`, GitLab's `commit_count`, etc.
     #[sea_orm(column_type = "Json")]
     pub platform_metadata: serde_json::Value,
 
@@ -114,7 +112,21 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    /// A repository belongs to an instance.
+    #[sea_orm(
+        belongs_to = "super::instance::Entity",
+        from = "Column::InstanceId",
+        to = "super::instance::Column::Id"
+    )]
+    Instance,
+}
+
+impl Related<super::instance::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Instance.def()
+    }
+}
 
 impl ActiveModelBehavior for ActiveModel {}
 
@@ -122,57 +134,6 @@ impl Model {
     /// Compute the full name (owner/name).
     pub fn full_name(&self) -> String {
         format!("{}/{}", self.owner, self.name)
-    }
-
-    /// Compute the web URL for the repository.
-    ///
-    /// Note: For Gitea (self-hosted), this returns a placeholder since the actual
-    /// host is stored in platform_metadata. Use the html_url from platform_metadata instead.
-    pub fn url(&self) -> String {
-        match self.platform {
-            CodePlatform::GitHub => format!("https://github.com/{}/{}", self.owner, self.name),
-            CodePlatform::GitLab => format!("https://gitlab.com/{}/{}", self.owner, self.name),
-            CodePlatform::Codeberg => format!("https://codeberg.org/{}/{}", self.owner, self.name),
-            CodePlatform::Gitea => {
-                // For self-hosted Gitea, try to get URL from metadata
-                self.platform_metadata
-                    .get("html_url")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("gitea://{}/{}", self.owner, self.name))
-            }
-        }
-    }
-
-    /// Compute the HTTPS clone URL.
-    pub fn clone_url_https(&self) -> String {
-        format!("{}.git", self.url())
-    }
-
-    /// Compute the SSH clone URL.
-    ///
-    /// Note: For Gitea (self-hosted), this returns a placeholder since the actual
-    /// host is stored in platform_metadata. Use the ssh_url from platform_metadata instead.
-    pub fn clone_url_ssh(&self) -> String {
-        match self.platform {
-            CodePlatform::GitHub => {
-                format!("git@github.com:{}/{}.git", self.owner, self.name)
-            }
-            CodePlatform::GitLab => {
-                format!("git@gitlab.com:{}/{}.git", self.owner, self.name)
-            }
-            CodePlatform::Codeberg => {
-                format!("git@codeberg.org:{}/{}.git", self.owner, self.name)
-            }
-            CodePlatform::Gitea => {
-                // For self-hosted Gitea, try to get URL from metadata
-                self.platform_metadata
-                    .get("ssh_url")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("git@gitea:{}/{}.git", self.owner, self.name))
-            }
-        }
     }
 }
 
@@ -182,10 +143,10 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-    fn make_test_model(platform: CodePlatform, owner: &str, name: &str) -> Model {
+    fn make_test_model(owner: &str, name: &str) -> Model {
         Model {
             id: Uuid::new_v4(),
-            platform,
+            instance_id: Uuid::new_v4(),
             platform_id: 12345,
             owner: owner.to_string(),
             name: name.to_string(),
@@ -220,61 +181,7 @@ mod tests {
 
     #[test]
     fn test_full_name() {
-        let model = make_test_model(CodePlatform::GitHub, "octocat", "hello-world");
+        let model = make_test_model("octocat", "hello-world");
         assert_eq!(model.full_name(), "octocat/hello-world");
-    }
-
-    #[test]
-    fn test_github_url() {
-        let model = make_test_model(CodePlatform::GitHub, "octocat", "hello-world");
-        assert_eq!(model.url(), "https://github.com/octocat/hello-world");
-    }
-
-    #[test]
-    fn test_gitlab_url() {
-        let model = make_test_model(CodePlatform::GitLab, "gitlab-org", "gitlab");
-        assert_eq!(model.url(), "https://gitlab.com/gitlab-org/gitlab");
-    }
-
-    #[test]
-    fn test_codeberg_url() {
-        let model = make_test_model(CodePlatform::Codeberg, "forgejo", "forgejo");
-        assert_eq!(model.url(), "https://codeberg.org/forgejo/forgejo");
-    }
-
-    #[test]
-    fn test_clone_url_https() {
-        let model = make_test_model(CodePlatform::GitHub, "octocat", "hello-world");
-        assert_eq!(
-            model.clone_url_https(),
-            "https://github.com/octocat/hello-world.git"
-        );
-    }
-
-    #[test]
-    fn test_github_clone_url_ssh() {
-        let model = make_test_model(CodePlatform::GitHub, "octocat", "hello-world");
-        assert_eq!(
-            model.clone_url_ssh(),
-            "git@github.com:octocat/hello-world.git"
-        );
-    }
-
-    #[test]
-    fn test_gitlab_clone_url_ssh() {
-        let model = make_test_model(CodePlatform::GitLab, "gitlab-org", "gitlab");
-        assert_eq!(
-            model.clone_url_ssh(),
-            "git@gitlab.com:gitlab-org/gitlab.git"
-        );
-    }
-
-    #[test]
-    fn test_codeberg_clone_url_ssh() {
-        let model = make_test_model(CodePlatform::Codeberg, "forgejo", "forgejo");
-        assert_eq!(
-            model.clone_url_ssh(),
-            "git@codeberg.org:forgejo/forgejo.git"
-        );
     }
 }

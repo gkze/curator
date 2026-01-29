@@ -1,6 +1,7 @@
 //! Model conversion from GitLab API types to curator entities.
 
-use crate::entity::code_platform::CodePlatform;
+use uuid::Uuid;
+
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
 use crate::platform::{PlatformRepo, strip_null_values};
@@ -19,9 +20,9 @@ fn gitlab_visibility(project: &GitLabProject) -> CodeVisibility {
 }
 
 /// Convert a GitLab project to a CodeRepository active model.
-pub fn to_code_repository(project: &GitLabProject) -> CodeRepositoryActiveModel {
+pub fn to_code_repository(project: &GitLabProject, instance_id: Uuid) -> CodeRepositoryActiveModel {
     let platform_repo = to_platform_repo(project);
-    platform_repo.to_active_model(CodePlatform::GitLab)
+    platform_repo.to_active_model(instance_id)
 }
 
 /// Convert a GitLab project to a platform-agnostic PlatformRepo.
@@ -76,14 +77,22 @@ pub fn to_platform_repo(project: &GitLabProject) -> PlatformRepo {
 }
 
 /// Convert a PlatformRepo to a CodeRepository active model for GitLab.
-pub fn platform_repo_to_active_model(repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-    repo.to_active_model(CodePlatform::GitLab)
+pub fn platform_repo_to_active_model(
+    repo: &PlatformRepo,
+    instance_id: Uuid,
+) -> CodeRepositoryActiveModel {
+    repo.to_active_model(instance_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
+
+    /// Test instance ID for GitLab conversion tests.
+    fn test_instance_id() -> Uuid {
+        Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+    }
 
     /// Create a mock GitLabProject for testing.
     fn mock_project() -> GitLabProject {
@@ -129,9 +138,9 @@ mod tests {
     #[test]
     fn test_to_code_repository_basic_fields() {
         let project = mock_project();
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
 
-        assert_eq!(model.platform.as_ref(), &CodePlatform::GitLab);
+        assert_eq!(model.instance_id.as_ref(), &test_instance_id());
         assert_eq!(model.platform_id.as_ref(), &12345i64);
         assert_eq!(model.owner.as_ref(), "test-group/subgroup");
         assert_eq!(model.name.as_ref(), "test-project");
@@ -147,22 +156,22 @@ mod tests {
         let mut project = mock_project();
 
         project.visibility = "public".to_string();
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
         assert_eq!(model.visibility.as_ref(), &CodeVisibility::Public);
 
         project.visibility = "private".to_string();
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
         assert_eq!(model.visibility.as_ref(), &CodeVisibility::Private);
 
         project.visibility = "internal".to_string();
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
         assert_eq!(model.visibility.as_ref(), &CodeVisibility::Internal);
     }
 
     #[test]
     fn test_to_code_repository_stats() {
         let project = mock_project();
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
 
         assert_eq!(model.stars.as_ref(), &Some(42));
         assert_eq!(model.forks.as_ref(), &Some(5));
@@ -172,7 +181,7 @@ mod tests {
     #[test]
     fn test_to_code_repository_features() {
         let project = mock_project();
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
 
         assert_eq!(model.has_issues.as_ref(), &true);
         assert_eq!(model.has_wiki.as_ref(), &false);
@@ -186,19 +195,19 @@ mod tests {
         let mut project = mock_project();
 
         // Not a fork
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
         assert_eq!(model.is_fork.as_ref(), &false);
 
         // Is a fork
         project.forked_from_project = Some(Box::new(ForkedFrom { id: 999 }));
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
         assert_eq!(model.is_fork.as_ref(), &true);
     }
 
     #[test]
     fn test_to_code_repository_topics() {
         let project = mock_project();
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
 
         let topics: Vec<String> =
             serde_json::from_value(model.topics.as_ref().clone()).expect("valid JSON");
@@ -208,7 +217,7 @@ mod tests {
     #[test]
     fn test_to_code_repository_metadata() {
         let project = mock_project();
-        let model = to_code_repository(&project);
+        let model = to_code_repository(&project, test_instance_id());
 
         let metadata = model.platform_metadata.as_ref();
         assert_eq!(

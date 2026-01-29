@@ -25,6 +25,7 @@
 pub mod api_cache;
 pub mod db;
 pub mod entity;
+pub mod instance;
 pub mod platform;
 pub mod repository;
 pub mod sync;

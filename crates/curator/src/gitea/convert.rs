@@ -1,7 +1,8 @@
 //! Model conversion functions for Gitea repositories.
 
+use uuid::Uuid;
+
 use super::types::GiteaRepo;
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
 use crate::platform::{PlatformRepo, strip_null_values};
@@ -59,18 +60,13 @@ pub fn to_platform_repo(repo: &GiteaRepo) -> PlatformRepo {
 
 /// Convert a Gitea repository directly to a CodeRepository active model.
 ///
-/// Uses Codeberg as the default platform for backwards compatibility.
-pub fn to_code_repository(repo: &GiteaRepo) -> CodeRepositoryActiveModel {
-    to_code_repository_with_platform(repo, CodePlatform::Codeberg)
-}
-
-/// Convert a Gitea repository to a CodeRepository active model with specified platform.
-pub fn to_code_repository_with_platform(
-    repo: &GiteaRepo,
-    platform: CodePlatform,
-) -> CodeRepositoryActiveModel {
+/// # Arguments
+///
+/// * `repo` - The Gitea repository to convert
+/// * `instance_id` - The instance ID to associate with the repository
+pub fn to_code_repository(repo: &GiteaRepo, instance_id: Uuid) -> CodeRepositoryActiveModel {
     let platform_repo = to_platform_repo(repo);
-    platform_repo.to_active_model(platform)
+    platform_repo.to_active_model(instance_id)
 }
 
 /// Convert a PlatformRepo to a CodeRepository active model.
@@ -78,9 +74,9 @@ pub fn to_code_repository_with_platform(
 /// This is used by the PlatformClient trait implementation.
 pub fn platform_repo_to_active_model(
     repo: &PlatformRepo,
-    platform: CodePlatform,
+    instance_id: Uuid,
 ) -> CodeRepositoryActiveModel {
-    repo.to_active_model(platform)
+    repo.to_active_model(instance_id)
 }
 
 #[cfg(test)]
@@ -89,6 +85,11 @@ mod tests {
     use crate::gitea::types::GiteaUser;
     use chrono::{TimeZone, Utc};
     use sea_orm::Set;
+
+    /// Returns a consistent test instance ID for unit tests.
+    fn test_instance_id() -> Uuid {
+        Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap()
+    }
 
     fn mock_gitea_repo() -> GiteaRepo {
         GiteaRepo {
@@ -158,13 +159,14 @@ mod tests {
     #[test]
     fn test_to_code_repository() {
         let gitea_repo = mock_gitea_repo();
-        let active_model = to_code_repository(&gitea_repo);
+        let instance_id = test_instance_id();
+        let active_model = to_code_repository(&gitea_repo, instance_id);
 
         // Check key fields
-        if let Set(platform) = active_model.platform {
-            assert_eq!(platform, CodePlatform::Codeberg);
+        if let Set(id) = active_model.instance_id {
+            assert_eq!(id, instance_id);
         } else {
-            panic!("platform should be Set");
+            panic!("instance_id should be Set");
         }
 
         if let Set(ref owner) = active_model.owner {
@@ -187,23 +189,12 @@ mod tests {
     }
 
     #[test]
-    fn test_to_code_repository_with_gitea_platform() {
-        let gitea_repo = mock_gitea_repo();
-        let active_model = to_code_repository_with_platform(&gitea_repo, CodePlatform::Gitea);
-
-        if let Set(platform) = active_model.platform {
-            assert_eq!(platform, CodePlatform::Gitea);
-        } else {
-            panic!("platform should be Set");
-        }
-    }
-
-    #[test]
     fn test_private_visibility() {
         let mut gitea_repo = mock_gitea_repo();
         gitea_repo.private = true;
 
-        let active_model = to_code_repository(&gitea_repo);
+        let instance_id = test_instance_id();
+        let active_model = to_code_repository(&gitea_repo, instance_id);
 
         if let Set(visibility) = active_model.visibility {
             assert_eq!(visibility, CodeVisibility::Private);
@@ -216,10 +207,11 @@ mod tests {
     fn test_platform_repo_to_active_model() {
         let gitea_repo = mock_gitea_repo();
         let platform_repo = to_platform_repo(&gitea_repo);
-        let active_model = platform_repo_to_active_model(&platform_repo, CodePlatform::Codeberg);
+        let instance_id = test_instance_id();
+        let active_model = platform_repo_to_active_model(&platform_repo, instance_id);
 
-        if let Set(platform) = active_model.platform {
-            assert_eq!(platform, CodePlatform::Codeberg);
+        if let Set(id) = active_model.instance_id {
+            assert_eq!(id, instance_id);
         }
 
         if let Set(ref owner) = active_model.owner {

@@ -19,13 +19,14 @@ use std::time::Duration;
 
 use chrono::Utc;
 use curator::connect_and_migrate;
-use curator::entity::code_platform::CodePlatform;
 use curator::entity::code_repository::ActiveModel;
 use curator::entity::code_visibility::CodeVisibility;
+use curator::entity::instance::{ActiveModel as InstanceActiveModel, Entity as Instance};
+use curator::entity::platform_type::PlatformType;
 use curator::sync::{
     PersistTaskResult, SyncProgress, await_persist_task, create_model_channel, spawn_persist_task,
 };
-use sea_orm::Set;
+use sea_orm::{EntityTrait, Set};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -36,11 +37,33 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Shorter timeout for operations that should be nearly instant.
 const FAST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Create an in-memory SQLite database with migrations applied.
+/// Test instance ID used for all sync tests
+fn test_instance_id() -> Uuid {
+    Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+}
+
+/// Create an in-memory SQLite database with migrations applied and a test instance.
 async fn setup_test_db() -> sea_orm::DatabaseConnection {
-    connect_and_migrate("sqlite::memory:")
+    let db = connect_and_migrate("sqlite::memory:")
         .await
-        .expect("Failed to create test database")
+        .expect("Failed to create test database");
+
+    // Create a test instance for the foreign key constraint
+    let now = Utc::now();
+    let instance = InstanceActiveModel {
+        id: Set(test_instance_id()),
+        name: Set("test-github".to_string()),
+        platform_type: Set(PlatformType::GitHub),
+        host: Set("github.com".to_string()),
+        created_at: Set(now.fixed_offset()),
+    };
+
+    Instance::insert(instance)
+        .exec(&db)
+        .await
+        .expect("Failed to create test instance");
+
+    db
 }
 
 /// Generate a deterministic platform_id from owner/name.
@@ -56,7 +79,7 @@ fn create_test_model(owner: &str, name: &str) -> ActiveModel {
     let now = Utc::now();
     ActiveModel {
         id: Set(Uuid::new_v4()),
-        platform: Set(CodePlatform::GitHub),
+        instance_id: Set(test_instance_id()), // Use the test instance
         platform_id: Set(platform_id_from_name(owner, name)),
         owner: Set(owner.to_string()),
         name: Set(name.to_string()),

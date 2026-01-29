@@ -1,4 +1,10 @@
 use clap::ValueEnum;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use uuid::Uuid;
+
+use curator::{Instance, InstanceColumn, InstanceModel, PlatformType};
+
+use crate::config::Config;
 
 /// Output format for rate limit display.
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -8,6 +14,126 @@ pub(crate) enum OutputFormat {
     Table,
     /// Display as JSON
     Json,
+}
+
+/// Handle the unified limits command.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+pub(crate) async fn handle_limits(
+    instance_name: &str,
+    output: OutputFormat,
+    config: &Config,
+    db: &DatabaseConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Look up the instance
+    let instance = Instance::find()
+        .filter(InstanceColumn::Name.eq(instance_name))
+        .one(db)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "Instance '{}' not found. Add it first with: curator instance add {}",
+                instance_name, instance_name
+            )
+        })?;
+
+    // Get token for instance
+    let token = get_token_for_instance(&instance, config)?;
+
+    match instance.platform_type {
+        #[cfg(feature = "github")]
+        PlatformType::GitHub => {
+            use curator::github::GitHubClient;
+
+            let client = GitHubClient::new(&token, Uuid::nil())?;
+            let rate_limits = curator::github::get_rate_limits(client.inner()).await?;
+            let items = github_rate_limits_to_display(&rate_limits.resources);
+            RateLimitDisplay::print_many(items, output);
+        }
+        #[cfg(feature = "gitlab")]
+        PlatformType::GitLab => {
+            let info = RateLimitInfoMessage {
+                platform: format!("GitLab ({})", instance.host),
+                message: "Header-based rate limiting".to_string(),
+                default_limit: "Varies by endpoint (typically 100/min authenticated)".to_string(),
+                note: "Check RateLimit-* headers in API responses".to_string(),
+                docs_url: "https://docs.gitlab.com/ee/administration/settings/rate_limits.html"
+                    .to_string(),
+            };
+            info.print(output);
+        }
+        #[cfg(feature = "gitea")]
+        PlatformType::Gitea => {
+            let platform_name = if instance.is_codeberg() {
+                "Codeberg"
+            } else {
+                "Gitea"
+            };
+            let info = RateLimitInfoMessage {
+                platform: format!("{} ({})", platform_name, instance.host),
+                message: "Header-based rate limiting".to_string(),
+                default_limit: "Varies by endpoint".to_string(),
+                note: "Check X-RateLimit-* headers in API responses".to_string(),
+                docs_url: "https://docs.gitea.com/usage/api-usage".to_string(),
+            };
+            info.print(output);
+        }
+        #[allow(unreachable_patterns)]
+        _ => {
+            return Err(format!(
+                "Platform type '{}' not supported for limits display.",
+                instance.platform_type
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Get the token for an instance based on its platform type.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+fn get_token_for_instance(
+    instance: &InstanceModel,
+    config: &Config,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match instance.platform_type {
+        #[cfg(feature = "github")]
+        PlatformType::GitHub => config.github_token().ok_or_else(|| {
+            format!(
+                "No GitHub token configured. Run 'curator login {}' or set CURATOR_GITHUB_TOKEN.",
+                instance.name
+            )
+            .into()
+        }),
+        #[cfg(feature = "gitlab")]
+        PlatformType::GitLab => config.gitlab_token().ok_or_else(|| {
+            format!(
+                "No GitLab token configured. Run 'curator login {}' or set CURATOR_GITLAB_TOKEN.",
+                instance.name
+            )
+            .into()
+        }),
+        #[cfg(feature = "gitea")]
+        PlatformType::Gitea => if instance.is_codeberg() {
+            config.codeberg_token()
+        } else {
+            config.gitea_token()
+        }
+        .ok_or_else(|| {
+            let env_var = if instance.is_codeberg() {
+                "CURATOR_CODEBERG_TOKEN"
+            } else {
+                "CURATOR_GITEA_TOKEN"
+            };
+            format!(
+                "No token configured for '{}'. Run 'curator login {}' or set {}.",
+                instance.name, instance.name, env_var
+            )
+            .into()
+        }),
+        #[allow(unreachable_patterns)]
+        _ => Err(format!("Platform type '{}' not supported.", instance.platform_type).into()),
+    }
 }
 
 /// Rate limit information for display.

@@ -21,7 +21,6 @@ use std::sync::{
 };
 
 use console::Term;
-use curator::entity::code_platform::CodePlatform;
 use curator::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use curator::platform::{ApiRateLimiter, PlatformClient};
 use curator::repository;
@@ -274,11 +273,13 @@ impl SyncRunner {
     }
 
     /// Get whether we're running in a TTY.
+    #[allow(dead_code)]
     pub fn is_tty(&self) -> bool {
         self.is_tty
     }
 
     /// Get whether rate limiting is disabled.
+    #[allow(dead_code)]
     pub fn no_rate_limit(&self) -> bool {
         self.no_rate_limit
     }
@@ -439,7 +440,6 @@ impl SyncRunner {
     pub async fn run_starred<C: PlatformClient + Clone + 'static>(
         &self,
         client: &C,
-        platform: CodePlatform,
     ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
         let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
         let persist_handle = if !self.options.dry_run {
@@ -471,7 +471,7 @@ impl SyncRunner {
 
         // Delete pruned repos from database (unless dry-run)
         let deleted = if !self.options.dry_run && !result.pruned_repos.is_empty() {
-            repository::delete_by_owner_name(&self.db, platform, &result.pruned_repos)
+            repository::delete_by_owner_name(&self.db, client.instance_id(), &result.pruned_repos)
                 .await
                 .unwrap_or(0) as usize
         } else {

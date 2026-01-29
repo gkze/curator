@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
+use crate::entity::platform_type::PlatformType;
 use crate::sync::SyncProgress;
 
 use super::errors::Result;
@@ -110,7 +111,13 @@ pub struct UserInfo {
 /// Trait for code hosting platform clients.
 ///
 /// This trait provides a unified interface for interacting with different
-/// code hosting platforms like GitHub, GitLab, and Codeberg.
+/// code hosting platforms like GitHub, GitLab, and Gitea instances.
+///
+/// # Instance Model
+///
+/// Each platform client is associated with a specific instance (e.g., github.com,
+/// gitlab.mycompany.com, codeberg.org). The client knows its instance_id and
+/// platform_type, which are used when storing repositories in the database.
 ///
 /// # Implementation Notes
 ///
@@ -121,8 +128,11 @@ pub struct UserInfo {
 /// - Convert platform-specific errors to `PlatformError`
 #[async_trait]
 pub trait PlatformClient: Send + Sync {
-    /// Get the platform type this client connects to.
-    fn platform(&self) -> CodePlatform;
+    /// Get the platform type this client connects to (github, gitlab, gitea).
+    fn platform_type(&self) -> PlatformType;
+
+    /// Get the instance ID this client is configured for.
+    fn instance_id(&self) -> Uuid;
 
     /// Get current rate limit status.
     async fn get_rate_limit(&self) -> Result<RateLimitInfo>;
@@ -227,5 +237,7 @@ pub trait PlatformClient: Send + Sync {
     ) -> Result<usize>;
 
     /// Convert a platform repository to a curator active model.
+    ///
+    /// The implementation should use `self.instance_id()` to set the instance_id field.
     fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel;
 }

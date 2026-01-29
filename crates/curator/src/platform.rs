@@ -34,8 +34,8 @@ mod tests {
     use std::time::{Duration as StdDuration, Instant};
 
     use chrono::Utc;
+    use sea_orm::prelude::Uuid;
 
-    use crate::entity::code_platform::CodePlatform;
     use crate::entity::code_visibility::CodeVisibility;
 
     use super::*;
@@ -155,10 +155,11 @@ mod tests {
             }),
         };
 
-        let model = repo.to_active_model(CodePlatform::GitHub);
+        let instance_id = Uuid::new_v4();
+        let model = repo.to_active_model(instance_id);
 
         // Verify key fields are set correctly
-        assert_eq!(model.platform.clone().unwrap(), CodePlatform::GitHub);
+        assert_eq!(model.instance_id.clone().unwrap(), instance_id);
         assert_eq!(model.platform_id.clone().unwrap(), 12345);
         assert_eq!(model.owner.clone().unwrap(), "rust-lang");
         assert_eq!(model.name.clone().unwrap(), "rust");
@@ -207,7 +208,8 @@ mod tests {
             }),
         };
 
-        let model = repo.to_active_model(CodePlatform::GitLab);
+        let instance_id = Uuid::new_v4();
+        let model = repo.to_active_model(instance_id);
 
         // Verify metadata fields are extracted
         assert!(model.is_mirror.clone().unwrap());

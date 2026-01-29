@@ -245,6 +245,7 @@ impl Config {
 
     /// Get the GitLab host.
     #[cfg(feature = "gitlab")]
+    #[allow(dead_code)] // May be used for auto-host detection
     pub fn gitlab_host(&self) -> String {
         self.gitlab
             .host
@@ -260,12 +261,14 @@ impl Config {
 
     /// Get the GitLab OAuth refresh token.
     #[cfg(feature = "gitlab")]
+    #[allow(dead_code)] // Will be used for automatic token refresh
     pub fn gitlab_refresh_token(&self) -> Option<String> {
         self.gitlab.refresh_token.clone()
     }
 
     /// Get the GitLab OAuth token expiry (Unix timestamp).
     #[cfg(feature = "gitlab")]
+    #[allow(dead_code)] // Will be used for automatic token refresh
     pub fn gitlab_token_expires_at(&self) -> Option<u64> {
         self.gitlab.token_expires_at
     }
@@ -292,6 +295,7 @@ impl Config {
 
     /// Get the Gitea host.
     #[cfg(feature = "gitea")]
+    #[allow(dead_code)] // May be used for auto-host detection
     pub fn gitea_host(&self) -> Option<String> {
         self.gitea.host.clone()
     }

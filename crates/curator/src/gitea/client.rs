@@ -7,12 +7,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::{Client, StatusCode, header};
 use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 use super::convert::to_platform_repo;
 use super::error::{GiteaError, is_rate_limit_error, short_error_message};
 use super::types::{GiteaAuthUser, GiteaOrg, GiteaRepo};
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
+use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
 };
@@ -34,7 +35,8 @@ pub struct GiteaClient {
     client: Client,
     host: String,
     token: String,
-    platform: CodePlatform,
+    /// The instance ID this client is configured for.
+    instance_id: Uuid,
 }
 
 impl GiteaClient {
@@ -44,20 +46,21 @@ impl GiteaClient {
     ///
     /// * `host` - Gitea host URL (e.g., "https://codeberg.org")
     /// * `token` - Personal access token
-    /// * `platform` - The platform type (Codeberg or Gitea)
+    /// * `instance_id` - The instance ID this client is configured for
     ///
     /// # Example
     ///
     /// ```ignore
-    /// use curator::entity::code_platform::CodePlatform;
+    /// use uuid::Uuid;
     ///
     /// // For Codeberg
-    /// let client = GiteaClient::new("https://codeberg.org", "token", CodePlatform::Codeberg)?;
+    /// let instance_id = Uuid::new_v4();
+    /// let client = GiteaClient::new("https://codeberg.org", "token", instance_id)?;
     ///
     /// // For self-hosted Gitea/Forgejo
-    /// let client = GiteaClient::new("https://git.example.com", "token", CodePlatform::Gitea)?;
+    /// let client = GiteaClient::new("https://git.example.com", "token", instance_id)?;
     /// ```
-    pub fn new(host: &str, token: &str, platform: CodePlatform) -> Result<Self, GiteaError> {
+    pub fn new(host: &str, token: &str, instance_id: Uuid) -> Result<Self, GiteaError> {
         // Normalize host URL
         let host = host.trim_end_matches('/').to_string();
 
@@ -82,7 +85,7 @@ impl GiteaClient {
             client,
             host,
             token: token.to_string(),
-            platform,
+            instance_id,
         })
     }
 
@@ -91,9 +94,9 @@ impl GiteaClient {
         &self.host
     }
 
-    /// Get the platform type.
-    pub fn platform_type(&self) -> CodePlatform {
-        self.platform.clone()
+    /// Get the instance ID.
+    pub fn get_instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
     /// Make an authenticated GET request.
@@ -397,8 +400,12 @@ impl GiteaClient {
 
 #[async_trait]
 impl PlatformClient for GiteaClient {
-    fn platform(&self) -> CodePlatform {
-        self.platform.clone()
+    fn platform_type(&self) -> PlatformType {
+        PlatformType::Gitea
+    }
+
+    fn instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
     async fn get_rate_limit(&self) -> platform::Result<RateLimitInfo> {
@@ -730,7 +737,7 @@ impl PlatformClient for GiteaClient {
     }
 
     fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-        repo.to_active_model(self.platform())
+        repo.to_active_model(self.instance_id)
     }
 }
 
@@ -740,13 +747,13 @@ impl PlatformClient for GiteaClient {
 ///
 /// * `host` - Gitea host URL (e.g., "https://codeberg.org")
 /// * `token` - Personal access token
-/// * `platform` - The platform type (Codeberg or Gitea)
+/// * `instance_id` - The instance ID this client is configured for
 pub fn create_client(
     host: &str,
     token: &str,
-    platform: CodePlatform,
+    instance_id: Uuid,
 ) -> Result<GiteaClient, GiteaError> {
-    GiteaClient::new(host, token, platform)
+    GiteaClient::new(host, token, instance_id)
 }
 
 #[cfg(test)]

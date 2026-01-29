@@ -1,8 +1,8 @@
 //! Model conversion from GitHub API types to curator entities.
 
 use octocrab::models::Repository as GitHubRepo;
+use uuid::Uuid;
 
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
 use crate::platform::{PlatformRepo, strip_null_values};
@@ -21,9 +21,9 @@ fn github_visibility(repo: &GitHubRepo) -> CodeVisibility {
 }
 
 /// Convert a GitHub repository to a CodeRepository active model.
-pub fn to_code_repository(repo: &GitHubRepo) -> CodeRepositoryActiveModel {
+pub fn to_code_repository(repo: &GitHubRepo, instance_id: Uuid) -> CodeRepositoryActiveModel {
     let platform_repo = to_platform_repo(repo);
-    platform_repo.to_active_model(CodePlatform::GitHub)
+    platform_repo.to_active_model(instance_id)
 }
 
 /// Convert a GitHub repository to a platform-agnostic PlatformRepo.
@@ -85,7 +85,10 @@ pub fn to_platform_repo(repo: &GitHubRepo) -> PlatformRepo {
     }
 }
 
-/// Convert a PlatformRepo to a CodeRepository active model for GitHub.
-pub fn platform_repo_to_active_model(repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-    repo.to_active_model(CodePlatform::GitHub)
+/// Convert a PlatformRepo to a CodeRepository active model for a specific instance.
+pub fn platform_repo_to_active_model(
+    repo: &PlatformRepo,
+    instance_id: Uuid,
+) -> CodeRepositoryActiveModel {
+    repo.to_active_model(instance_id)
 }

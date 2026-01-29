@@ -7,9 +7,10 @@ use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
+use crate::entity::platform_type::PlatformType;
 
 use super::errors::Result;
 use super::types::{
@@ -27,6 +28,16 @@ pub mod rate_limits {
     pub const GITLAB_DEFAULT_RPS: u32 = 5;
     /// Gitea/Codeberg: varies by instance, conservative default.
     pub const GITEA_DEFAULT_RPS: u32 = 5;
+}
+
+/// Get the default rate limit for a platform type.
+#[allow(dead_code)] // Reserved for future use in dynamic rate limiting
+pub fn default_rps_for_platform(platform_type: PlatformType) -> u32 {
+    match platform_type {
+        PlatformType::GitHub => rate_limits::GITHUB_DEFAULT_RPS,
+        PlatformType::GitLab => rate_limits::GITLAB_DEFAULT_RPS,
+        PlatformType::Gitea => rate_limits::GITEA_DEFAULT_RPS,
+    }
 }
 
 /// A standalone API rate limiter using the governor crate.
@@ -88,7 +99,7 @@ impl ApiRateLimiter {
 /// use curator::platform::{RateLimitedClient, rate_limits};
 /// use curator::github::GitHubClient;
 ///
-/// let client = GitHubClient::new(token)?;
+/// let client = GitHubClient::new(token, instance_id)?;
 /// let client = RateLimitedClient::new(client, rate_limits::GITHUB_DEFAULT_RPS);
 ///
 /// // All operations are now rate-limited
@@ -139,8 +150,12 @@ impl<C: Clone> Clone for RateLimitedClient<C> {
 
 #[async_trait]
 impl<C: PlatformClient> PlatformClient for RateLimitedClient<C> {
-    fn platform(&self) -> CodePlatform {
-        self.inner.platform()
+    fn platform_type(&self) -> PlatformType {
+        self.inner.platform_type()
+    }
+
+    fn instance_id(&self) -> Uuid {
+        self.inner.instance_id()
     }
 
     async fn get_rate_limit(&self) -> Result<RateLimitInfo> {

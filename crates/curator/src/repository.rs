@@ -10,13 +10,13 @@ mod single;
 
 pub use bulk::{
     DEFAULT_BULK_UPSERT_BACKOFF_MS, DEFAULT_BULK_UPSERT_RETRIES, bulk_upsert,
-    bulk_upsert_with_retry, delete_by_owner_name, delete_by_platform, delete_many, insert_many,
+    bulk_upsert_with_retry, delete_by_instance, delete_by_owner_name, delete_many, insert_many,
     upsert_many,
 };
 pub use errors::{RepositoryError, Result};
 pub use query::{
-    PaginatedResult, Pagination, count, count_by_platform, find_all, find_all_by_platform,
-    find_all_by_platform_and_owner, find_by_owner, find_by_platform, find_stale,
+    PaginatedResult, Pagination, count, count_by_instance, find_all, find_all_by_instance,
+    find_all_by_instance_and_owner, find_by_instance, find_by_owner, find_stale,
 };
 pub use single::{
     delete, find_by_id, find_by_natural_key, find_by_platform_id, insert, update, upsert,
@@ -31,7 +31,6 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::entity::code_platform::CodePlatform;
     use crate::entity::code_repository::{ActiveModel, Entity as CodeRepository};
     use crate::entity::code_visibility::CodeVisibility;
 
@@ -46,33 +45,36 @@ mod tests {
 
     #[test]
     fn test_repository_error_not_found_by_key() {
-        let err = RepositoryError::not_found_by_key(CodePlatform::GitHub, "owner", "repo");
+        let instance_id = Uuid::new_v4();
+        let err = RepositoryError::not_found_by_key(instance_id, "owner", "repo");
         let msg = err.to_string();
         assert!(msg.contains("not found"));
-        assert!(msg.contains("GitHub"));
+        assert!(msg.contains(&instance_id.to_string()));
         assert!(msg.contains("owner"));
         assert!(msg.contains("repo"));
     }
 
     #[test]
     fn test_repository_error_not_found_by_platform_id() {
-        let err = RepositoryError::not_found_by_platform_id(CodePlatform::GitLab, 12345);
+        let instance_id = Uuid::new_v4();
+        let err = RepositoryError::not_found_by_platform_id(instance_id, 12345);
         let msg = err.to_string();
         assert!(msg.contains("not found"));
-        assert!(msg.contains("GitLab"));
+        assert!(msg.contains(&instance_id.to_string()));
         assert!(msg.contains("12345"));
     }
 
     #[test]
     fn test_repository_error_duplicate() {
+        let instance_id = Uuid::new_v4();
         let err = RepositoryError::Duplicate {
-            platform: CodePlatform::Codeberg,
+            instance_id,
             owner: "myorg".to_string(),
             name: "myrepo".to_string(),
         };
         let msg = err.to_string();
         assert!(msg.contains("already exists"));
-        assert!(msg.contains("codeberg")); // lowercase per Display impl
+        assert!(msg.contains(&instance_id.to_string()));
         assert!(msg.contains("myorg"));
         assert!(msg.contains("myrepo"));
     }
@@ -140,12 +142,13 @@ mod tests {
     #[test]
     fn test_repository_error_variants_debug() {
         // Ensure all error variants implement Debug
+        let instance_id = Uuid::new_v4();
         let errors: Vec<RepositoryError> = vec![
             RepositoryError::not_found_by_id(Uuid::new_v4()),
-            RepositoryError::not_found_by_key(CodePlatform::GitHub, "o", "r"),
-            RepositoryError::not_found_by_platform_id(CodePlatform::GitLab, 1),
+            RepositoryError::not_found_by_key(instance_id, "o", "r"),
+            RepositoryError::not_found_by_platform_id(instance_id, 1),
             RepositoryError::Duplicate {
-                platform: CodePlatform::Codeberg,
+                instance_id,
                 owner: "o".to_string(),
                 name: "r".to_string(),
             },
@@ -220,7 +223,7 @@ mod tests {
         // Create a minimal active model
         let model = ActiveModel {
             id: Set(Uuid::new_v4()),
-            platform: Set(CodePlatform::GitHub),
+            instance_id: Set(Uuid::new_v4()),
             platform_id: Set(12345),
             owner: Set("test-owner".to_string()),
             name: Set("test-repo".to_string()),

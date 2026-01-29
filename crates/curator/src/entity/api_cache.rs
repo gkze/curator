@@ -7,8 +7,6 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::entity::code_platform::CodePlatform;
-
 /// Type of API endpoint being cached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
@@ -35,8 +33,8 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
 
-    /// Source platform (github, gitlab, codeberg, gitea).
-    pub platform: CodePlatform,
+    /// Reference to the platform instance this cache entry belongs to.
+    pub instance_id: Uuid,
 
     /// Type of endpoint being cached.
     pub endpoint_type: EndpointType,
@@ -57,7 +55,21 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    /// A cache entry belongs to an instance.
+    #[sea_orm(
+        belongs_to = "super::instance::Entity",
+        from = "Column::InstanceId",
+        to = "super::instance::Column::Id"
+    )]
+    Instance,
+}
+
+impl Related<super::instance::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Instance.def()
+    }
+}
 
 impl ActiveModelBehavior for ActiveModel {}
 

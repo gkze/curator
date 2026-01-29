@@ -2,7 +2,6 @@ use chrono::Utc;
 use sea_orm::Set;
 use uuid::Uuid;
 
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::{
     ActiveModel as CodeRepositoryActiveModel, Model as CodeRepositoryModel,
 };
@@ -52,8 +51,8 @@ impl PlatformRepo {
     ///
     /// # Arguments
     ///
-    /// * `platform` - The platform this repository came from
-    pub fn to_active_model(&self, platform: CodePlatform) -> CodeRepositoryActiveModel {
+    /// * `instance_id` - The UUID of the instance this repository belongs to
+    pub fn to_active_model(&self, instance_id: Uuid) -> CodeRepositoryActiveModel {
         let now = Utc::now().fixed_offset();
         let topics = serde_json::json!(self.topics);
 
@@ -94,7 +93,7 @@ impl PlatformRepo {
 
         CodeRepositoryActiveModel {
             id: Set(Uuid::new_v4()),
-            platform: Set(platform),
+            instance_id: Set(instance_id),
             platform_id: Set(self.platform_id),
             owner: Set(self.owner.clone()),
             name: Set(self.name.clone()),

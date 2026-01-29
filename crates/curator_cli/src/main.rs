@@ -23,17 +23,29 @@ platforms (GitHub, GitLab, Gitea/Codeberg). It maintains a local database of \
 repositories, can star active repos, and prune inactive ones."
 )]
 #[command(after_long_help = r#"EXAMPLES
+    Add a well-known instance (github.com):
+        $ curator instance add github
+
+    Add a self-hosted GitLab instance:
+        $ curator instance add my-gitlab -t gitlab -H gitlab.mycompany.com
+
+    Authenticate with an instance:
+        $ curator login github
+
     Sync all repos from a GitHub organization:
-        $ curator github org rust-lang
+        $ curator sync org github rust-lang
 
     Sync starred repos and prune inactive ones:
-        $ curator github stars
+        $ curator sync stars github
 
     Sync from multiple GitLab groups:
-        $ curator gitlab group my-company/team-a my-company/team-b
+        $ curator sync org gitlab gitlab-org my-company/team
 
     Dry run to see what would happen:
-        $ curator github org kubernetes --dry-run
+        $ curator sync org github kubernetes --dry-run
+
+    Show rate limits for an instance:
+        $ curator limits github
 
     Generate shell completions:
         $ curator completions bash > ~/.local/share/bash-completion/completions/curator
@@ -48,9 +60,7 @@ ENVIRONMENT VARIABLES
     CURATOR_DATABASE_URL      Database connection string (default: ~/.local/state/curator/curator.db)
     CURATOR_GITHUB_TOKEN      GitHub personal access token
     CURATOR_GITLAB_TOKEN      GitLab personal access token
-    CURATOR_GITLAB_HOST       GitLab host (default: gitlab.com)
     CURATOR_GITEA_TOKEN       Gitea/Forgejo personal access token
-    CURATOR_GITEA_HOST        Gitea/Forgejo host URL
     CURATOR_CODEBERG_TOKEN    Codeberg personal access token
 "#)]
 struct Cli {
@@ -65,29 +75,43 @@ enum Commands {
         #[command(subcommand)]
         action: MigrateAction,
     },
-    /// GitHub operations
-    #[cfg(feature = "github")]
-    Github {
+    /// Manage platform instances (github.com, gitlab.com, self-hosted, etc.)
+    Instance {
         #[command(subcommand)]
-        action: GithubAction,
+        action: commands::instance::InstanceAction,
     },
-    /// GitLab operations
-    #[cfg(feature = "gitlab")]
-    Gitlab {
-        #[command(subcommand)]
-        action: GitlabAction,
+    /// Authenticate with a platform instance
+    ///
+    /// Logs in to the specified instance using the appropriate OAuth flow.
+    /// For well-known instances (github, gitlab, codeberg), the instance
+    /// is auto-created if it doesn't exist.
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    Login {
+        /// Instance name (e.g., "github", "gitlab", "codeberg", or a custom name)
+        instance: String,
     },
-    /// Codeberg operations (codeberg.org)
-    #[cfg(feature = "gitea")]
-    Codeberg {
+    /// Sync repositories from a platform instance
+    ///
+    /// Syncs repositories from organizations, groups, users, or starred lists.
+    /// The instance must be added first with `curator instance add`.
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    Sync {
         #[command(subcommand)]
-        action: CodebergAction,
+        action: commands::sync::SyncAction,
     },
-    /// Gitea operations (self-hosted Gitea/Forgejo)
-    #[cfg(feature = "gitea")]
-    Gitea {
-        #[command(subcommand)]
-        action: GiteaAction,
+    /// Show rate limit status for a platform instance
+    ///
+    /// Displays current API rate limit information.
+    /// For GitHub: shows detailed per-resource rate limits.
+    /// For GitLab/Gitea: shows informational rate limiting guidance.
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    Limits {
+        /// Instance name (e.g., "github", "gitlab", "codeberg", or a custom name)
+        instance: String,
+
+        /// Output format
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
     /// Generate shell completion scripts
     Completions {
@@ -164,190 +188,6 @@ struct StarredSyncOptions {
     no_rate_limit: bool,
 }
 
-#[cfg(feature = "github")]
-#[derive(Subcommand)]
-enum GithubAction {
-    /// Authenticate with GitHub using OAuth Device Flow
-    ///
-    /// Opens your browser to authorize Curator with GitHub.
-    /// The token is saved to your config file for future use.
-    Login,
-    /// Sync repositories from a GitHub organization
-    Org {
-        /// Organization name(s) - can specify multiple
-        #[arg(required = true)]
-        orgs: Vec<String>,
-
-        #[command(flatten)]
-        sync_opts: CommonSyncOptions,
-    },
-    /// Sync repositories from a GitHub user
-    User {
-        /// Username(s) - can specify multiple
-        #[arg(required = true)]
-        users: Vec<String>,
-
-        #[command(flatten)]
-        sync_opts: CommonSyncOptions,
-    },
-    /// Sync your starred repositories (and prune inactive ones)
-    Stars {
-        #[command(flatten)]
-        sync_opts: StarredSyncOptions,
-    },
-    /// Show current rate limit status
-    Limits {
-        /// Output format
-        #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
-        output: OutputFormat,
-    },
-}
-
-#[cfg(feature = "gitlab")]
-#[derive(Subcommand)]
-enum GitlabAction {
-    /// Authenticate with GitLab using OAuth Device Flow
-    ///
-    /// Opens your browser to authorize Curator with GitLab.
-    /// The token is saved to your config file for future use.
-    /// Supports self-hosted GitLab instances via --host.
-    Login {
-        /// GitLab host (default: gitlab.com, or from config/env)
-        #[arg(short = 'H', long)]
-        host: Option<String>,
-    },
-    /// Sync projects from a GitLab group
-    Group {
-        /// Group path(s) - can specify multiple (e.g., "gitlab-org" or "my-company/team")
-        #[arg(required = true)]
-        groups: Vec<String>,
-
-        /// GitLab host (default: gitlab.com, or from config/env)
-        #[arg(short = 'H', long)]
-        host: Option<String>,
-
-        /// Don't include projects from subgroups
-        #[arg(short = 's', long)]
-        no_subgroups: bool,
-
-        #[command(flatten)]
-        sync_opts: CommonSyncOptions,
-    },
-    /// Sync projects from a GitLab user
-    User {
-        /// Username(s) - can specify multiple
-        #[arg(required = true)]
-        users: Vec<String>,
-
-        /// GitLab host (default: gitlab.com, or from config/env)
-        #[arg(short = 'H', long)]
-        host: Option<String>,
-
-        #[command(flatten)]
-        sync_opts: CommonSyncOptions,
-    },
-    /// Sync your starred projects (and prune inactive ones)
-    Stars {
-        /// GitLab host (default: gitlab.com, or from config/env)
-        #[arg(short = 'H', long)]
-        host: Option<String>,
-
-        #[command(flatten)]
-        sync_opts: StarredSyncOptions,
-    },
-    /// Show current rate limit status (approximate)
-    Limits {
-        /// Output format
-        #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
-        output: OutputFormat,
-    },
-}
-
-#[cfg(feature = "gitea")]
-#[derive(Subcommand)]
-enum CodebergAction {
-    /// Authenticate with Codeberg using OAuth PKCE flow
-    ///
-    /// Opens your browser to authorize Curator with Codeberg.
-    /// The token is saved to your config file for future use.
-    Login,
-    /// Sync repositories from a Codeberg organization
-    Org {
-        /// Organization name(s) - can specify multiple
-        #[arg(required = true)]
-        orgs: Vec<String>,
-
-        #[command(flatten)]
-        sync_opts: CommonSyncOptions,
-    },
-    /// Sync repositories from a Codeberg user
-    User {
-        /// Username(s) - can specify multiple
-        #[arg(required = true)]
-        users: Vec<String>,
-
-        #[command(flatten)]
-        sync_opts: CommonSyncOptions,
-    },
-    /// Sync your starred repositories (and prune inactive ones)
-    Stars {
-        #[command(flatten)]
-        sync_opts: StarredSyncOptions,
-    },
-    /// Show current rate limit status (approximate)
-    Limits {
-        /// Output format
-        #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
-        output: OutputFormat,
-    },
-}
-
-#[cfg(feature = "gitea")]
-#[derive(Subcommand)]
-enum GiteaAction {
-    /// Sync repositories from a Gitea/Forgejo organization
-    Org {
-        /// Organization name(s) - can specify multiple
-        #[arg(required = true)]
-        orgs: Vec<String>,
-
-        /// Gitea host URL (required, or from CURATOR_GITEA_HOST env/config)
-        #[arg(short = 'H', long)]
-        host: Option<String>,
-
-        #[command(flatten)]
-        sync_opts: CommonSyncOptions,
-    },
-    /// Sync repositories from a Gitea user
-    User {
-        /// Username(s) - can specify multiple
-        #[arg(required = true)]
-        users: Vec<String>,
-
-        /// Gitea host URL (required, or from CURATOR_GITEA_HOST env/config)
-        #[arg(short = 'H', long)]
-        host: Option<String>,
-
-        #[command(flatten)]
-        sync_opts: CommonSyncOptions,
-    },
-    /// Sync your starred repositories (and prune inactive ones)
-    Stars {
-        /// Gitea host URL (required, or from CURATOR_GITEA_HOST env/config)
-        #[arg(short = 'H', long)]
-        host: Option<String>,
-
-        #[command(flatten)]
-        sync_opts: StarredSyncOptions,
-    },
-    /// Show current rate limit status (approximate)
-    Limits {
-        /// Output format
-        #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
-        output: OutputFormat,
-    },
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -419,21 +259,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Migrate { action } => {
             commands::migrate::handle_migrate(action, &database_url).await?;
         }
-        #[cfg(feature = "github")]
-        Commands::Github { action } => {
-            commands::github::handle_github(action, &config, &database_url).await?;
+        Commands::Instance { action } => {
+            let db = curator::db::connect_and_migrate(&database_url).await?;
+            commands::instance::handle_instance(action, &db).await?;
         }
-        #[cfg(feature = "gitlab")]
-        Commands::Gitlab { action } => {
-            commands::gitlab::handle_gitlab(action, &config, &database_url).await?;
+        #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+        Commands::Login { instance } => {
+            let db = curator::db::connect_and_migrate(&database_url).await?;
+            commands::login::handle_login(&instance, &db, &config).await?;
         }
-        #[cfg(feature = "gitea")]
-        Commands::Codeberg { action } => {
-            commands::gitea::handle_codeberg(action, &config, &database_url).await?;
+        #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+        Commands::Sync { action } => {
+            commands::sync::handle_sync(action, &config, &database_url).await?;
         }
-        #[cfg(feature = "gitea")]
-        Commands::Gitea { action } => {
-            commands::gitea::handle_gitea(action, &config, &database_url).await?;
+        #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+        Commands::Limits { instance, output } => {
+            let db = curator::db::connect_and_migrate(&database_url).await?;
+            commands::limits::handle_limits(&instance, output, &config, &db).await?;
         }
         Commands::Completions { .. } | Commands::Man { .. } => {}
     }

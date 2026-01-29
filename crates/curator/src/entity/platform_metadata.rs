@@ -13,12 +13,12 @@
 //! let metadata: GitHubMetadata = serde_json::from_value(repo.platform_metadata.clone())?;
 //!
 //! // Or use the unified enum
-//! let metadata = PlatformMetadata::from_json(CodePlatform::GitHub, &repo.platform_metadata)?;
+//! let metadata = PlatformMetadata::from_json(PlatformType::GitHub, &repo.platform_metadata)?;
 //! ```
 
 use serde::{Deserialize, Serialize};
 
-use super::code_platform::CodePlatform;
+use super::platform_type::PlatformType;
 
 /// GitHub-specific repository metadata.
 ///
@@ -115,10 +115,10 @@ pub struct GitLabMetadata {
     pub has_pull_requests: Option<bool>,
 }
 
-/// Gitea/Codeberg-specific repository metadata.
+/// Gitea-specific repository metadata.
 ///
-/// Gitea and Codeberg (which runs Forgejo, a Gitea fork) share the same API structure.
-/// This struct is used for both platforms.
+/// Gitea, Forgejo, and Codeberg all share the same API structure.
+/// This struct is used for all Gitea-compatible instances.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GiteaMetadata {
@@ -167,9 +167,7 @@ pub enum PlatformMetadata {
     GitHub(GitHubMetadata),
     /// GitLab project metadata.
     GitLab(GitLabMetadata),
-    /// Codeberg repository metadata (uses Gitea API).
-    Codeberg(GiteaMetadata),
-    /// Gitea repository metadata.
+    /// Gitea/Forgejo/Codeberg repository metadata.
     Gitea(GiteaMetadata),
 }
 
@@ -178,7 +176,7 @@ impl PlatformMetadata {
     ///
     /// # Arguments
     ///
-    /// * `platform` - The code platform this metadata came from
+    /// * `platform_type` - The platform type this metadata came from
     /// * `json` - The JSON value containing the metadata
     ///
     /// # Returns
@@ -189,23 +187,19 @@ impl PlatformMetadata {
     ///
     /// Returns an error if the JSON cannot be deserialized into the expected struct.
     pub fn from_json(
-        platform: CodePlatform,
+        platform_type: PlatformType,
         json: &serde_json::Value,
     ) -> Result<Self, serde_json::Error> {
-        match platform {
-            CodePlatform::GitHub => {
+        match platform_type {
+            PlatformType::GitHub => {
                 let metadata: GitHubMetadata = serde_json::from_value(json.clone())?;
                 Ok(PlatformMetadata::GitHub(metadata))
             }
-            CodePlatform::GitLab => {
+            PlatformType::GitLab => {
                 let metadata: GitLabMetadata = serde_json::from_value(json.clone())?;
                 Ok(PlatformMetadata::GitLab(metadata))
             }
-            CodePlatform::Codeberg => {
-                let metadata: GiteaMetadata = serde_json::from_value(json.clone())?;
-                Ok(PlatformMetadata::Codeberg(metadata))
-            }
-            CodePlatform::Gitea => {
+            PlatformType::Gitea => {
                 let metadata: GiteaMetadata = serde_json::from_value(json.clone())?;
                 Ok(PlatformMetadata::Gitea(metadata))
             }
@@ -224,19 +218,18 @@ impl PlatformMetadata {
             PlatformMetadata::GitLab(m) => {
                 serde_json::to_value(m).unwrap_or(serde_json::Value::Null)
             }
-            PlatformMetadata::Codeberg(m) | PlatformMetadata::Gitea(m) => {
+            PlatformMetadata::Gitea(m) => {
                 serde_json::to_value(m).unwrap_or(serde_json::Value::Null)
             }
         }
     }
 
     /// Get the platform type for this metadata.
-    pub fn platform(&self) -> CodePlatform {
+    pub fn platform_type(&self) -> PlatformType {
         match self {
-            PlatformMetadata::GitHub(_) => CodePlatform::GitHub,
-            PlatformMetadata::GitLab(_) => CodePlatform::GitLab,
-            PlatformMetadata::Codeberg(_) => CodePlatform::Codeberg,
-            PlatformMetadata::Gitea(_) => CodePlatform::Gitea,
+            PlatformMetadata::GitHub(_) => PlatformType::GitHub,
+            PlatformMetadata::GitLab(_) => PlatformType::GitLab,
+            PlatformMetadata::Gitea(_) => PlatformType::Gitea,
         }
     }
 
@@ -245,7 +238,7 @@ impl PlatformMetadata {
         match self {
             PlatformMetadata::GitHub(_) => None, // GitHub uses computed URLs
             PlatformMetadata::GitLab(m) => m.web_url.as_deref(),
-            PlatformMetadata::Codeberg(m) | PlatformMetadata::Gitea(m) => m.html_url.as_deref(),
+            PlatformMetadata::Gitea(m) => m.html_url.as_deref(),
         }
     }
 
@@ -254,7 +247,7 @@ impl PlatformMetadata {
         match self {
             PlatformMetadata::GitHub(_) => None, // GitHub uses computed URLs
             PlatformMetadata::GitLab(m) => m.ssh_url_to_repo.as_deref(),
-            PlatformMetadata::Codeberg(m) | PlatformMetadata::Gitea(m) => m.ssh_url.as_deref(),
+            PlatformMetadata::Gitea(m) => m.ssh_url.as_deref(),
         }
     }
 
@@ -263,7 +256,7 @@ impl PlatformMetadata {
         match self {
             PlatformMetadata::GitHub(m) => m.has_issues,
             PlatformMetadata::GitLab(m) => m.has_issues,
-            PlatformMetadata::Codeberg(m) | PlatformMetadata::Gitea(m) => m.has_issues,
+            PlatformMetadata::Gitea(m) => m.has_issues,
         }
     }
 
@@ -272,7 +265,7 @@ impl PlatformMetadata {
         match self {
             PlatformMetadata::GitHub(m) => m.has_wiki,
             PlatformMetadata::GitLab(m) => m.has_wiki,
-            PlatformMetadata::Codeberg(m) | PlatformMetadata::Gitea(m) => m.has_wiki,
+            PlatformMetadata::Gitea(m) => m.has_wiki,
         }
     }
 
@@ -281,7 +274,7 @@ impl PlatformMetadata {
         match self {
             PlatformMetadata::GitHub(m) => m.has_pull_requests,
             PlatformMetadata::GitLab(m) => m.has_pull_requests,
-            PlatformMetadata::Codeberg(m) | PlatformMetadata::Gitea(m) => m.has_pull_requests,
+            PlatformMetadata::Gitea(m) => m.has_pull_requests,
         }
     }
 }
@@ -381,7 +374,7 @@ mod tests {
             "has_issues": true
         });
 
-        let metadata = PlatformMetadata::from_json(CodePlatform::GitHub, &json).unwrap();
+        let metadata = PlatformMetadata::from_json(PlatformType::GitHub, &json).unwrap();
 
         match metadata {
             PlatformMetadata::GitHub(m) => {
@@ -399,7 +392,7 @@ mod tests {
             "namespace_kind": "group"
         });
 
-        let metadata = PlatformMetadata::from_json(CodePlatform::GitLab, &json).unwrap();
+        let metadata = PlatformMetadata::from_json(PlatformType::GitLab, &json).unwrap();
 
         match metadata {
             PlatformMetadata::GitLab(m) => {
@@ -411,20 +404,20 @@ mod tests {
     }
 
     #[test]
-    fn test_platform_metadata_from_json_codeberg() {
+    fn test_platform_metadata_from_json_gitea() {
         let json = json!({
             "html_url": "https://codeberg.org/test",
             "template": false
         });
 
-        let metadata = PlatformMetadata::from_json(CodePlatform::Codeberg, &json).unwrap();
+        let metadata = PlatformMetadata::from_json(PlatformType::Gitea, &json).unwrap();
 
         match metadata {
-            PlatformMetadata::Codeberg(m) => {
+            PlatformMetadata::Gitea(m) => {
                 assert_eq!(m.html_url, Some("https://codeberg.org/test".to_string()));
                 assert_eq!(m.template, Some(false));
             }
-            _ => panic!("Expected Codeberg metadata"),
+            _ => panic!("Expected Gitea metadata"),
         }
     }
 
@@ -442,22 +435,18 @@ mod tests {
     }
 
     #[test]
-    fn test_platform_metadata_platform() {
+    fn test_platform_metadata_platform_type() {
         assert_eq!(
-            PlatformMetadata::GitHub(Default::default()).platform(),
-            CodePlatform::GitHub
+            PlatformMetadata::GitHub(Default::default()).platform_type(),
+            PlatformType::GitHub
         );
         assert_eq!(
-            PlatformMetadata::GitLab(Default::default()).platform(),
-            CodePlatform::GitLab
+            PlatformMetadata::GitLab(Default::default()).platform_type(),
+            PlatformType::GitLab
         );
         assert_eq!(
-            PlatformMetadata::Codeberg(Default::default()).platform(),
-            CodePlatform::Codeberg
-        );
-        assert_eq!(
-            PlatformMetadata::Gitea(Default::default()).platform(),
-            CodePlatform::Gitea
+            PlatformMetadata::Gitea(Default::default()).platform_type(),
+            PlatformType::Gitea
         );
     }
 
@@ -472,11 +461,11 @@ mod tests {
         });
         assert_eq!(gitlab.web_url(), Some("https://gitlab.com/test"));
 
-        let codeberg = PlatformMetadata::Codeberg(GiteaMetadata {
+        let gitea = PlatformMetadata::Gitea(GiteaMetadata {
             html_url: Some("https://codeberg.org/test".to_string()),
             ..Default::default()
         });
-        assert_eq!(codeberg.web_url(), Some("https://codeberg.org/test"));
+        assert_eq!(gitea.web_url(), Some("https://codeberg.org/test"));
     }
 
     #[test]

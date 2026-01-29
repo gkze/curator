@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
 };
+use uuid::Uuid;
 
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::{Column, Entity as CodeRepository, Model};
 
 use super::errors::{RepositoryError, Result};
@@ -64,14 +64,14 @@ pub async fn find_all(
     })
 }
 
-/// Find all repositories for a given platform with pagination.
-pub async fn find_by_platform(
+/// Find all repositories for a given instance with pagination.
+pub async fn find_by_instance(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     pagination: Pagination,
 ) -> Result<PaginatedResult<Model>> {
     let paginator = CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .order_by_asc(Column::Owner)
         .order_by_asc(Column::Name)
         .paginate(db, pagination.per_page);
@@ -139,26 +139,26 @@ pub async fn count(db: &DatabaseConnection) -> Result<u64> {
         .map_err(RepositoryError::from)
 }
 
-/// Count repositories for a given platform.
-pub async fn count_by_platform(db: &DatabaseConnection, platform: CodePlatform) -> Result<u64> {
+/// Count repositories for a given instance.
+pub async fn count_by_instance(db: &DatabaseConnection, instance_id: Uuid) -> Result<u64> {
     CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .count(db)
         .await
         .map_err(RepositoryError::from)
 }
 
-/// Find all repositories for a given platform without pagination.
+/// Find all repositories for a given instance without pagination.
 ///
-/// This returns all repos for the platform in a single query. Use with caution
-/// for platforms with many repos - prefer `find_by_platform` with pagination
+/// This returns all repos for the instance in a single query. Use with caution
+/// for instances with many repos - prefer `find_by_instance` with pagination
 /// for large result sets.
-pub async fn find_all_by_platform(
+pub async fn find_all_by_instance(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
 ) -> Result<Vec<Model>> {
     CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .order_by_asc(Column::Owner)
         .order_by_asc(Column::Name)
         .all(db)
@@ -166,17 +166,17 @@ pub async fn find_all_by_platform(
         .map_err(RepositoryError::from)
 }
 
-/// Find all repositories for a given platform and owner without pagination.
+/// Find all repositories for a given instance and owner without pagination.
 ///
 /// This is used when loading cached repos on a full cache hit, where we need
 /// all repos for a specific org/owner to avoid re-fetching from the API.
-pub async fn find_all_by_platform_and_owner(
+pub async fn find_all_by_instance_and_owner(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     owner: &str,
 ) -> Result<Vec<Model>> {
     CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .filter(Column::Owner.eq(owner))
         .order_by_asc(Column::Name)
         .all(db)

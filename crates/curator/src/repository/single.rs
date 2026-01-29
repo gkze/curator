@@ -1,7 +1,6 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use uuid::Uuid;
 
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::{ActiveModel, Column, Entity as CodeRepository, Model};
 
 use super::errors::{RepositoryError, Result};
@@ -24,15 +23,15 @@ pub async fn find_by_id(db: &DatabaseConnection, id: Uuid) -> Result<Option<Mode
         .map_err(RepositoryError::from)
 }
 
-/// Find a repository by its natural key (platform + owner + name).
+/// Find a repository by its natural key (instance_id + owner + name).
 pub async fn find_by_natural_key(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     owner: &str,
     name: &str,
 ) -> Result<Option<Model>> {
     CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .filter(Column::Owner.eq(owner))
         .filter(Column::Name.eq(name))
         .one(db)
@@ -40,14 +39,14 @@ pub async fn find_by_natural_key(
         .map_err(RepositoryError::from)
 }
 
-/// Find a repository by platform and platform_id (numeric ID from the platform).
+/// Find a repository by instance and platform_id (numeric ID from the platform).
 pub async fn find_by_platform_id(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     platform_id: i64,
 ) -> Result<Option<Model>> {
     CodeRepository::find()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .filter(Column::PlatformId.eq(platform_id))
         .one(db)
         .await
@@ -62,18 +61,18 @@ pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Model
     model.update(db).await.map_err(RepositoryError::from)
 }
 
-/// Insert or update a repository by its natural key (platform + owner + name).
+/// Insert or update a repository by its natural key (instance_id + owner + name).
 ///
-/// If a repository with the same platform, owner, and name exists, it will be updated.
+/// If a repository with the same instance_id, owner, and name exists, it will be updated.
 /// Otherwise, a new repository will be inserted.
 pub async fn upsert(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
     // Extract natural key from the active model
-    let platform = model.platform.clone().unwrap();
+    let instance_id = model.instance_id.clone().unwrap();
     let owner = model.owner.clone().unwrap();
     let name = model.name.clone().unwrap();
 
     // Check if exists
-    let existing = find_by_natural_key(db, platform, &owner, &name).await?;
+    let existing = find_by_natural_key(db, instance_id, &owner, &name).await?;
 
     match existing {
         Some(existing) => {

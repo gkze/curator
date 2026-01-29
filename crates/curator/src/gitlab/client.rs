@@ -12,14 +12,16 @@ use reqwest::header::{self, HeaderMap, HeaderValue};
 use sea_orm::DatabaseConnection;
 use tokio::sync::Mutex;
 
+use uuid::Uuid;
+
 use super::api;
 use super::convert::to_platform_repo;
 use super::error::{GitLabError, is_rate_limit_error, short_error_message};
 use super::types::{GitLabGroup, GitLabProject, GitLabUser};
 use crate::api_cache;
 use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
+use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient, PlatformError,
     PlatformRepo, RateLimitInfo, UserInfo,
@@ -43,6 +45,8 @@ pub struct GitLabClient {
     host: String,
     /// Starred projects cache to avoid re-fetching.
     starred_projects_cache: Arc<Mutex<Option<StarredProjectsCache>>>,
+    /// The instance ID this client is configured for.
+    instance_id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +60,7 @@ impl GitLabClient {
     ///
     /// Builds a [`reqwest::Client`] with the supplied token and passes it to
     /// the Progenitor-generated client via [`api::Client::new_with_client`].
-    pub async fn new(host: &str, token: &str) -> Result<Self, GitLabError> {
+    pub async fn new(host: &str, token: &str, instance_id: Uuid) -> Result<Self, GitLabError> {
         let host_only = host
             .trim_start_matches("https://")
             .trim_start_matches("http://")
@@ -90,6 +94,7 @@ impl GitLabClient {
             api,
             host: normalized_host,
             starred_projects_cache: Arc::new(Mutex::new(None)),
+            instance_id,
         })
     }
 
@@ -215,13 +220,9 @@ impl GitLabClient {
 
         // Try to load stored total_pages from the DB
         if let Some(db) = db
-            && let Ok(Some(stored)) = api_cache::get_total_pages(
-                db,
-                CodePlatform::GitLab,
-                endpoint_type,
-                cache_key_prefix,
-            )
-            .await
+            && let Ok(Some(stored)) =
+                api_cache::get_total_pages(db, self.instance_id, endpoint_type, cache_key_prefix)
+                    .await
         {
             known_total_pages = Some(stored as u32);
         }
@@ -232,7 +233,7 @@ impl GitLabClient {
 
             // Look up cached ETag
             let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(db, CodePlatform::GitLab, endpoint_type, &cache_key)
+                api_cache::get_etag(db, self.instance_id, endpoint_type, &cache_key)
                     .await
                     .ok()
                     .flatten()
@@ -275,7 +276,7 @@ impl GitLabClient {
                         };
                         let _ = api_cache::upsert_with_pagination(
                             db,
-                            CodePlatform::GitLab,
+                            self.instance_id,
                             endpoint_type,
                             &cache_key,
                             etag,
@@ -572,8 +573,12 @@ impl GitLabClient {
 
 #[async_trait]
 impl PlatformClient for GitLabClient {
-    fn platform(&self) -> CodePlatform {
-        CodePlatform::GitLab
+    fn platform_type(&self) -> PlatformType {
+        PlatformType::GitLab
+    }
+
+    fn instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
     async fn get_rate_limit(&self) -> platform::Result<RateLimitInfo> {
@@ -620,7 +625,7 @@ impl PlatformClient for GitLabClient {
             && let Some(db) = db
         {
             let cached_repos =
-                repository::find_all_by_platform_and_owner(db, CodePlatform::GitLab, org)
+                repository::find_all_by_instance_and_owner(db, self.instance_id, org)
                     .await
                     .map_err(|e| PlatformError::internal(e.to_string()))?;
 
@@ -678,7 +683,7 @@ impl PlatformClient for GitLabClient {
             && let Some(db) = db
         {
             let cached_repos =
-                repository::find_all_by_platform_and_owner(db, CodePlatform::GitLab, username)
+                repository::find_all_by_instance_and_owner(db, self.instance_id, username)
                     .await
                     .map_err(|e| PlatformError::internal(e.to_string()))?;
 
@@ -824,7 +829,7 @@ impl PlatformClient for GitLabClient {
             && projects.is_empty()
             && let Some(db) = db
         {
-            let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitLab)
+            let cached_repos = repository::find_all_by_instance(db, self.instance_id)
                 .await
                 .map_err(|e| PlatformError::internal(e.to_string()))?;
 
@@ -894,7 +899,7 @@ impl PlatformClient for GitLabClient {
             && projects.is_empty()
             && let Some(db) = db
         {
-            let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitLab)
+            let cached_repos = repository::find_all_by_instance(db, self.instance_id)
                 .await
                 .map_err(|e| PlatformError::internal(e.to_string()))?;
 
@@ -946,13 +951,17 @@ impl PlatformClient for GitLabClient {
     }
 
     fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-        repo.to_active_model(self.platform())
+        repo.to_active_model(self.instance_id)
     }
 }
 
 /// Create a GitLab client (convenience function).
-pub async fn create_client(host: &str, token: &str) -> Result<GitLabClient, GitLabError> {
-    GitLabClient::new(host, token).await
+pub async fn create_client(
+    host: &str,
+    token: &str,
+    instance_id: Uuid,
+) -> Result<GitLabClient, GitLabError> {
+    GitLabClient::new(host, token, instance_id).await
 }
 
 #[cfg(test)]

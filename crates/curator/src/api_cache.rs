@@ -11,7 +11,6 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::entity::api_cache::{ActiveModel, Column, EndpointType, Entity as ApiCache, Model};
-use crate::entity::code_platform::CodePlatform;
 
 /// Errors that can occur during API cache operations.
 #[derive(Debug, Error)]
@@ -21,9 +20,9 @@ pub enum CacheError {
     Database(#[from] DbErr),
 
     /// Cache entry not found.
-    #[error("Cache entry not found: {platform:?}/{endpoint_type:?}/{cache_key}")]
+    #[error("Cache entry not found: {instance_id}/{endpoint_type:?}/{cache_key}")]
     NotFound {
-        platform: CodePlatform,
+        instance_id: Uuid,
         endpoint_type: EndpointType,
         cache_key: String,
     },
@@ -37,12 +36,12 @@ pub type Result<T> = std::result::Result<T, CacheError>;
 /// Returns `None` if no cache entry exists.
 pub async fn get_etag(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     endpoint_type: EndpointType,
     cache_key: &str,
 ) -> Result<Option<String>> {
     let entry = ApiCache::find()
-        .filter(Column::Platform.eq(platform.clone()))
+        .filter(Column::InstanceId.eq(instance_id))
         .filter(Column::EndpointType.eq(endpoint_type))
         .filter(Column::CacheKey.eq(cache_key))
         .one(db)
@@ -54,12 +53,12 @@ pub async fn get_etag(
 /// Get a cache entry by its lookup key.
 pub async fn get(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     endpoint_type: EndpointType,
     cache_key: &str,
 ) -> Result<Option<Model>> {
     let entry = ApiCache::find()
-        .filter(Column::Platform.eq(platform.clone()))
+        .filter(Column::InstanceId.eq(instance_id))
         .filter(Column::EndpointType.eq(endpoint_type))
         .filter(Column::CacheKey.eq(cache_key))
         .one(db)
@@ -73,12 +72,12 @@ pub async fn get(
 /// This performs an upsert - inserting a new entry or updating an existing one.
 pub async fn upsert(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     endpoint_type: EndpointType,
     cache_key: &str,
     etag: Option<String>,
 ) -> Result<()> {
-    upsert_with_pagination(db, platform, endpoint_type, cache_key, etag, None).await
+    upsert_with_pagination(db, instance_id, endpoint_type, cache_key, etag, None).await
 }
 
 /// Store or update a cache entry with ETag and pagination info.
@@ -87,7 +86,7 @@ pub async fn upsert(
 /// The `total_pages` field is typically only set for page 1 entries.
 pub async fn upsert_with_pagination(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     endpoint_type: EndpointType,
     cache_key: &str,
     etag: Option<String>,
@@ -97,7 +96,7 @@ pub async fn upsert_with_pagination(
 
     let model = ActiveModel {
         id: Set(Uuid::new_v4()),
-        platform: Set(platform),
+        instance_id: Set(instance_id),
         endpoint_type: Set(endpoint_type),
         cache_key: Set(cache_key.to_string()),
         etag: Set(etag),
@@ -107,7 +106,7 @@ pub async fn upsert_with_pagination(
 
     ApiCache::insert(model)
         .on_conflict(
-            OnConflict::columns([Column::Platform, Column::EndpointType, Column::CacheKey])
+            OnConflict::columns([Column::InstanceId, Column::EndpointType, Column::CacheKey])
                 .update_columns([Column::Etag, Column::TotalPages, Column::CachedAt])
                 .to_owned(),
         )
@@ -123,7 +122,7 @@ pub async fn upsert_with_pagination(
 /// Keys not found in the database will have None values.
 pub async fn get_etags_batch(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     endpoint_type: EndpointType,
     cache_keys: &[String],
 ) -> Result<std::collections::HashMap<String, Option<String>>> {
@@ -134,7 +133,7 @@ pub async fn get_etags_batch(
     }
 
     let entries = ApiCache::find()
-        .filter(Column::Platform.eq(platform.clone()))
+        .filter(Column::InstanceId.eq(instance_id))
         .filter(Column::EndpointType.eq(endpoint_type))
         .filter(Column::CacheKey.is_in(cache_keys.iter().map(|s| s.as_str())))
         .all(db)
@@ -161,13 +160,13 @@ pub async fn get_etags_batch(
 /// For starred repos, use `get_starred_total_pages` instead.
 pub async fn get_total_pages(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     endpoint_type: EndpointType,
     namespace: &str,
 ) -> Result<Option<i32>> {
     // Page 1 cache key stores the total pages
     let page1_key = format!("{}/page/1", namespace);
-    let entry = get(db, platform, endpoint_type, &page1_key).await?;
+    let entry = get(db, instance_id, endpoint_type, &page1_key).await?;
     Ok(entry.and_then(|e| e.total_pages))
 }
 
@@ -176,25 +175,25 @@ pub async fn get_total_pages(
 /// Uses the starred-specific cache key format `{username}/starred/page/1`.
 pub async fn get_starred_total_pages(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     username: &str,
 ) -> Result<Option<i32>> {
     use crate::entity::api_cache::Model as ApiCacheModel;
 
     let page1_key = ApiCacheModel::starred_key(username, 1);
-    let entry = get(db, platform, EndpointType::Starred, &page1_key).await?;
+    let entry = get(db, instance_id, EndpointType::Starred, &page1_key).await?;
     Ok(entry.and_then(|e| e.total_pages))
 }
 
 /// Delete a specific cache entry.
 pub async fn delete(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     endpoint_type: EndpointType,
     cache_key: &str,
 ) -> Result<bool> {
     let result = ApiCache::delete_many()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .filter(Column::EndpointType.eq(endpoint_type))
         .filter(Column::CacheKey.eq(cache_key))
         .exec(db)
@@ -203,24 +202,24 @@ pub async fn delete(
     Ok(result.rows_affected > 0)
 }
 
-/// Delete all cache entries for a platform.
-pub async fn delete_by_platform(db: &DatabaseConnection, platform: CodePlatform) -> Result<u64> {
+/// Delete all cache entries for an instance.
+pub async fn delete_by_instance(db: &DatabaseConnection, instance_id: Uuid) -> Result<u64> {
     let result = ApiCache::delete_many()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .exec(db)
         .await?;
 
     Ok(result.rows_affected)
 }
 
-/// Delete all cache entries for a platform and endpoint type.
+/// Delete all cache entries for an instance and endpoint type.
 pub async fn delete_by_endpoint_type(
     db: &DatabaseConnection,
-    platform: CodePlatform,
+    instance_id: Uuid,
     endpoint_type: EndpointType,
 ) -> Result<u64> {
     let result = ApiCache::delete_many()
-        .filter(Column::Platform.eq(platform))
+        .filter(Column::InstanceId.eq(instance_id))
         .filter(Column::EndpointType.eq(endpoint_type))
         .exec(db)
         .await?;
@@ -338,14 +337,15 @@ mod tests {
 
     #[test]
     fn test_cache_error_not_found_display() {
+        let test_id = Uuid::new_v4();
         let err = CacheError::NotFound {
-            platform: CodePlatform::GitHub,
+            instance_id: test_id,
             endpoint_type: EndpointType::OrgRepos,
             cache_key: "rust-lang/page/1".to_string(),
         };
         let msg = err.to_string();
         assert!(msg.contains("Cache entry not found"));
-        assert!(msg.contains("GitHub"));
+        assert!(msg.contains(&test_id.to_string()));
         assert!(msg.contains("OrgRepos"));
         assert!(msg.contains("rust-lang/page/1"));
     }

@@ -1,4 +1,7 @@
 //! Initial migration to create the curator database schema.
+//!
+//! This schema uses an instance-based model where platforms (GitHub, GitLab, Gitea)
+//! can have multiple instances (e.g., github.com, gitlab.com, gitlab.mycompany.com).
 
 use sea_orm_migration::prelude::*;
 
@@ -8,6 +11,8 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Create tables in dependency order
+        self.create_instances(manager).await?;
         // Box::pin to avoid large future on the stack (30KB+)
         Box::pin(self.create_code_repositories(manager)).await?;
         self.create_api_cache(manager).await?;
@@ -21,11 +26,77 @@ impl MigrationTrait for Migration {
         manager
             .drop_table(Table::drop().table(CodeRepositories::Table).to_owned())
             .await?;
+        manager
+            .drop_table(Table::drop().table(Instances::Table).to_owned())
+            .await?;
         Ok(())
     }
 }
 
 impl Migration {
+    /// Create the instances table for tracking platform instances.
+    ///
+    /// An instance represents a specific deployment of a platform type, e.g.:
+    /// - name: "github", platform_type: "github", host: "github.com"
+    /// - name: "work-gitlab", platform_type: "gitlab", host: "gitlab.mycompany.com"
+    /// - name: "codeberg", platform_type: "gitea", host: "codeberg.org"
+    async fn create_instances(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Instances::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Instances::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Instances::Name)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(Instances::PlatformType).string().not_null())
+                    .col(ColumnDef::new(Instances::Host).string().not_null())
+                    .col(
+                        ColumnDef::new(Instances::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Index on platform_type for filtering by type
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_instances_platform_type")
+                    .table(Instances::Table)
+                    .col(Instances::PlatformType)
+                    .to_owned(),
+            )
+            .await?;
+
+        // Unique constraint on (platform_type, host) to prevent duplicate instances
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_instances_platform_type_host")
+                    .table(Instances::Table)
+                    .col(Instances::PlatformType)
+                    .col(Instances::Host)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
     async fn create_code_repositories(&self, manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager
             .create_table(
@@ -39,12 +110,20 @@ impl Migration {
                             .not_null()
                             .primary_key(),
                     )
-                    // Platform identity
+                    // Instance reference (replaces platform column)
                     .col(
-                        ColumnDef::new(CodeRepositories::Platform)
-                            .string()
+                        ColumnDef::new(CodeRepositories::InstanceId)
+                            .uuid()
                             .not_null(),
                     )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_code_repos_instance")
+                            .from(CodeRepositories::Table, CodeRepositories::InstanceId)
+                            .to(Instances::Table, Instances::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    // Platform-specific ID (unique within the instance)
                     .col(
                         ColumnDef::new(CodeRepositories::PlatformId)
                             .big_integer()
@@ -184,13 +263,13 @@ impl Migration {
             )
             .await?;
 
-        // Unique constraint on (platform, owner, name)
+        // Unique constraint on (instance_id, owner, name)
         manager
             .create_index(
                 Index::create()
-                    .name("idx_code_repos_platform_owner_name")
+                    .name("idx_code_repos_instance_owner_name")
                     .table(CodeRepositories::Table)
-                    .col(CodeRepositories::Platform)
+                    .col(CodeRepositories::InstanceId)
                     .col(CodeRepositories::Owner)
                     .col(CodeRepositories::Name)
                     .unique()
@@ -198,13 +277,13 @@ impl Migration {
             )
             .await?;
 
-        // Index on platform
+        // Index on instance_id
         manager
             .create_index(
                 Index::create()
-                    .name("idx_code_repos_platform")
+                    .name("idx_code_repos_instance")
                     .table(CodeRepositories::Table)
-                    .col(CodeRepositories::Platform)
+                    .col(CodeRepositories::InstanceId)
                     .to_owned(),
             )
             .await?;
@@ -264,26 +343,26 @@ impl Migration {
             )
             .await?;
 
-        // Composite index on (platform, platform_id)
+        // Composite index on (instance_id, platform_id) - unique within instance
         manager
             .create_index(
                 Index::create()
-                    .name("idx_code_repos_platform_platform_id")
+                    .name("idx_code_repos_instance_platform_id")
                     .table(CodeRepositories::Table)
-                    .col(CodeRepositories::Platform)
+                    .col(CodeRepositories::InstanceId)
                     .col(CodeRepositories::PlatformId)
                     .unique()
                     .to_owned(),
             )
             .await?;
 
-        // Composite index on (platform, owner)
+        // Composite index on (instance_id, owner)
         manager
             .create_index(
                 Index::create()
-                    .name("idx_code_repos_platform_owner")
+                    .name("idx_code_repos_instance_owner")
                     .table(CodeRepositories::Table)
-                    .col(CodeRepositories::Platform)
+                    .col(CodeRepositories::InstanceId)
                     .col(CodeRepositories::Owner)
                     .to_owned(),
             )
@@ -299,7 +378,14 @@ impl Migration {
                     .table(ApiCache::Table)
                     .if_not_exists()
                     .col(ColumnDef::new(ApiCache::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(ApiCache::Platform).string().not_null())
+                    .col(ColumnDef::new(ApiCache::InstanceId).uuid().not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_api_cache_instance")
+                            .from(ApiCache::Table, ApiCache::InstanceId)
+                            .to(Instances::Table, Instances::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
                     .col(ColumnDef::new(ApiCache::EndpointType).string().not_null())
                     .col(ColumnDef::new(ApiCache::CacheKey).string().not_null())
                     .col(ColumnDef::new(ApiCache::Etag).text().null())
@@ -314,13 +400,13 @@ impl Migration {
             )
             .await?;
 
-        // Unique constraint on (platform, endpoint_type, cache_key)
+        // Unique constraint on (instance_id, endpoint_type, cache_key)
         manager
             .create_index(
                 Index::create()
                     .name("idx_api_cache_lookup")
                     .table(ApiCache::Table)
-                    .col(ApiCache::Platform)
+                    .col(ApiCache::InstanceId)
                     .col(ApiCache::EndpointType)
                     .col(ApiCache::CacheKey)
                     .unique()
@@ -344,11 +430,22 @@ impl Migration {
 }
 
 #[derive(DeriveIden)]
+#[sea_orm(iden = "instances")]
+enum Instances {
+    Table,
+    Id,
+    Name,
+    PlatformType,
+    Host,
+    CreatedAt,
+}
+
+#[derive(DeriveIden)]
 #[sea_orm(iden = "code_repositories")]
 enum CodeRepositories {
     Table,
     Id,
-    Platform,
+    InstanceId,
     PlatformId,
     Owner,
     Name,
@@ -385,7 +482,7 @@ enum CodeRepositories {
 enum ApiCache {
     Table,
     Id,
-    Platform,
+    InstanceId,
     EndpointType,
     CacheKey,
     Etag,

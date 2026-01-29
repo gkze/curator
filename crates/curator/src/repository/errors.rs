@@ -2,8 +2,6 @@ use sea_orm::DbErr;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::entity::code_platform::CodePlatform;
-
 /// Errors that can occur during repository operations.
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -16,9 +14,9 @@ pub enum RepositoryError {
     NotFound { context: String },
 
     /// Duplicate repository (natural key conflict).
-    #[error("Repository already exists: {platform}/{owner}/{name}")]
+    #[error("Repository already exists: {instance_id}/{owner}/{name}")]
     Duplicate {
-        platform: CodePlatform,
+        instance_id: Uuid,
         owner: String,
         name: String,
     },
@@ -41,16 +39,16 @@ impl RepositoryError {
     }
 
     /// Create a NotFound error for a natural key lookup.
-    pub fn not_found_by_key(platform: CodePlatform, owner: &str, name: &str) -> Self {
+    pub fn not_found_by_key(instance_id: Uuid, owner: &str, name: &str) -> Self {
         Self::NotFound {
-            context: format!("{:?}/{}/{}", platform, owner, name),
+            context: format!("{}/{}/{}", instance_id, owner, name),
         }
     }
 
     /// Create a NotFound error for a platform_id lookup.
-    pub fn not_found_by_platform_id(platform: CodePlatform, platform_id: i64) -> Self {
+    pub fn not_found_by_platform_id(instance_id: Uuid, platform_id: i64) -> Self {
         Self::NotFound {
-            context: format!("{:?} platform_id={}", platform, platform_id),
+            context: format!("{} platform_id={}", instance_id, platform_id),
         }
     }
 }

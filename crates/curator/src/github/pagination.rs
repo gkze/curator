@@ -10,8 +10,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::api_cache;
 use crate::entity::api_cache::EndpointType;
-use crate::entity::code_platform::CodePlatform;
-use crate::platform::{self, CacheStats, FetchResult, ProgressCallback};
+use crate::platform::{self, CacheStats, FetchResult, PlatformClient, ProgressCallback};
 use crate::sync::{SyncProgress, emit};
 
 use super::client::{GitHubClient, check_rate_limit};
@@ -121,7 +120,7 @@ impl GitHubClient {
         if let Some(db) = db
             && let Ok(Some(stored_total)) = api_cache::get_total_pages(
                 db,
-                CodePlatform::GitHub,
+                self.instance_id(),
                 config.endpoint_type,
                 config.namespace,
             )
@@ -156,7 +155,7 @@ impl GitHubClient {
 
             // Try to get cached ETag
             let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(db, CodePlatform::GitHub, config.endpoint_type, &cache_key)
+                api_cache::get_etag(db, self.instance_id(), config.endpoint_type, &cache_key)
                     .await
                     .ok()
                     .flatten()
@@ -219,7 +218,7 @@ impl GitHubClient {
 
                         let _ = api_cache::upsert_with_pagination(
                             db,
-                            CodePlatform::GitHub,
+                            self.instance_id(),
                             config.endpoint_type,
                             &cache_key,
                             etag,
@@ -305,7 +304,7 @@ impl GitHubClient {
         if let Some(db) = db
             && let Ok(Some(stored_total)) = api_cache::get_total_pages(
                 db,
-                CodePlatform::GitHub,
+                self.instance_id(),
                 config.endpoint_type,
                 config.namespace,
             )
@@ -327,7 +326,7 @@ impl GitHubClient {
         let first_etag = if let Some(db) = db {
             api_cache::get_etag(
                 db,
-                CodePlatform::GitHub,
+                self.instance_id(),
                 config.endpoint_type,
                 &first_cache_key,
             )
@@ -380,7 +379,7 @@ impl GitHubClient {
                 if let Some(db) = db {
                     let _ = api_cache::upsert_with_pagination(
                         db,
-                        CodePlatform::GitHub,
+                        self.instance_id(),
                         config.endpoint_type,
                         &first_cache_key,
                         etag,
@@ -440,7 +439,7 @@ impl GitHubClient {
             let etags_map = if let Some(db) = db {
                 api_cache::get_etags_batch(
                     db,
-                    CodePlatform::GitHub,
+                    self.instance_id(),
                     config.endpoint_type,
                     &page_cache_keys,
                 )
@@ -519,7 +518,7 @@ impl GitHubClient {
                             let cache_key = (config.cache_key_fn)(page);
                             let _ = api_cache::upsert_with_pagination(
                                 db,
-                                CodePlatform::GitHub,
+                                self.instance_id(),
                                 config.endpoint_type,
                                 &cache_key,
                                 new_etag,

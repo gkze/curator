@@ -10,10 +10,12 @@ use reqwest::header::{HeaderMap, IF_NONE_MATCH};
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
+use uuid::Uuid;
+
 use super::convert::to_platform_repo;
 use super::error::{GitHubError, is_rate_limit_error_from_github, short_error_message};
-use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
+use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient, PlatformError,
     PlatformRepo, RateLimitInfo, UserInfo,
@@ -196,15 +198,18 @@ pub struct GitHubClient {
     inner: Arc<Octocrab>,
     /// The authentication token, stored for making raw conditional requests.
     token: Arc<String>,
+    /// The instance ID this client is configured for.
+    instance_id: Uuid,
 }
 
 impl GitHubClient {
     /// Create a new GitHub client from an authentication token.
-    pub fn new(token: &str) -> Result<Self, GitHubError> {
+    pub fn new(token: &str, instance_id: Uuid) -> Result<Self, GitHubError> {
         let client = create_client(token)?;
         Ok(Self {
             inner: Arc::new(client),
             token: Arc::new(token.to_string()),
+            instance_id,
         })
     }
 
@@ -212,10 +217,11 @@ impl GitHubClient {
     ///
     /// Note: This constructor doesn't have access to the token, so conditional
     /// requests with ETags won't work. Use `new()` instead for full functionality.
-    pub fn from_octocrab(client: Octocrab) -> Self {
+    pub fn from_octocrab(client: Octocrab, instance_id: Uuid) -> Self {
         Self {
             inner: Arc::new(client),
             token: Arc::new(String::new()),
+            instance_id,
         }
     }
 
@@ -342,7 +348,7 @@ impl GitHubClient {
             && let Some(db) = db
         {
             let cached_repos =
-                repository::find_all_by_platform_and_owner(db, CodePlatform::GitHub, org)
+                repository::find_all_by_instance_and_owner(db, self.instance_id, org)
                     .await
                     .map_err(|e| PlatformError::internal(e.to_string()))?;
 
@@ -418,7 +424,7 @@ impl GitHubClient {
             && result.stats.cache_hits > 0
             && let Some(db) = db
         {
-            let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitHub)
+            let cached_repos = repository::find_all_by_instance(db, self.instance_id)
                 .await
                 .map_err(|e| PlatformError::internal(e.to_string()))?;
 
@@ -504,7 +510,7 @@ impl GitHubClient {
             && let Some(db) = db
         {
             let cached_repos =
-                repository::find_all_by_platform_and_owner(db, CodePlatform::GitHub, username)
+                repository::find_all_by_instance_and_owner(db, self.instance_id, username)
                     .await
                     .map_err(|e| PlatformError::internal(e.to_string()))?;
 
@@ -548,8 +554,12 @@ impl From<GitHubError> for PlatformError {
 
 #[async_trait]
 impl PlatformClient for GitHubClient {
-    fn platform(&self) -> CodePlatform {
-        CodePlatform::GitHub
+    fn platform_type(&self) -> PlatformType {
+        PlatformType::GitHub
+    }
+
+    fn instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
     async fn get_rate_limit(&self) -> platform::Result<RateLimitInfo> {
@@ -1039,7 +1049,7 @@ impl PlatformClient for GitHubClient {
 
             let username = self.get_authenticated_user().await?.username;
             let mut expected_pages =
-                api_cache::get_starred_total_pages(db, CodePlatform::GitHub, &username)
+                api_cache::get_starred_total_pages(db, self.instance_id, &username)
                     .await
                     .ok()
                     .flatten()
@@ -1057,7 +1067,7 @@ impl PlatformClient for GitHubClient {
             let first_cache_key = ApiCacheModel::starred_key(&username, 1);
             let first_etag = api_cache::get_etag(
                 db,
-                CodePlatform::GitHub,
+                self.instance_id,
                 EndpointType::Starred,
                 &first_cache_key,
             )
@@ -1108,7 +1118,7 @@ impl PlatformClient for GitHubClient {
                     let total_pages_to_store = expected_pages.map(|t| t as i32);
                     let _ = api_cache::upsert_with_pagination(
                         db,
-                        CodePlatform::GitHub,
+                        self.instance_id,
                         EndpointType::Starred,
                         &first_cache_key,
                         etag,
@@ -1159,7 +1169,7 @@ impl PlatformClient for GitHubClient {
 
             if expected_pages.is_none() {
                 if all_cache_hits && total_sent.load(Ordering::Relaxed) == 0 && cache_hits > 0 {
-                    let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitHub)
+                    let cached_repos = repository::find_all_by_instance(db, self.instance_id)
                         .await
                         .map_err(|e| PlatformError::internal(e.to_string()))?;
 
@@ -1203,7 +1213,7 @@ impl PlatformClient for GitHubClient {
 
                 let etags_map = api_cache::get_etags_batch(
                     db,
-                    CodePlatform::GitHub,
+                    self.instance_id,
                     EndpointType::Starred,
                     &page_cache_keys,
                 )
@@ -1291,7 +1301,7 @@ impl PlatformClient for GitHubClient {
                 for (cache_key, etag) in etag_updates {
                     let _ = api_cache::upsert(
                         db,
-                        CodePlatform::GitHub,
+                        self.instance_id,
                         EndpointType::Starred,
                         &cache_key,
                         etag,
@@ -1301,7 +1311,7 @@ impl PlatformClient for GitHubClient {
             }
 
             if all_cache_hits && total_sent.load(Ordering::Relaxed) == 0 && cache_hits > 0 {
-                let cached_repos = repository::find_all_by_platform(db, CodePlatform::GitHub)
+                let cached_repos = repository::find_all_by_instance(db, self.instance_id)
                     .await
                     .map_err(|e| PlatformError::internal(e.to_string()))?;
 
@@ -1509,7 +1519,7 @@ impl PlatformClient for GitHubClient {
     }
 
     fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-        repo.to_active_model(self.platform())
+        repo.to_active_model(self.instance_id)
     }
 }
 
