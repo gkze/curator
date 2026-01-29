@@ -40,12 +40,126 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use std::future::Future;
+
 use sea_orm::DatabaseConnection;
 
 use super::progress::{ProgressCallback, SyncProgress, emit};
 use super::types::{NamespaceSyncResult, NamespaceSyncResultStreaming, SyncOptions, SyncResult};
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{ApiRateLimiter, PlatformClient, PlatformError, PlatformRepo};
+
+/// Trait for concurrent sync result types.
+///
+/// This trait abstracts over `NamespaceSyncResult` and `NamespaceSyncResultStreaming`,
+/// allowing `spawn_concurrent_sync` to work with both types.
+trait ConcurrentSyncResult: Send + 'static {
+    /// Create a result for when semaphore acquisition fails.
+    fn semaphore_error(name: String) -> Self;
+
+    /// Create a result for when a spawned task panics.
+    fn panic_error(error: String) -> Self;
+
+    /// Whether this result represents an error.
+    fn is_error(&self) -> bool;
+}
+
+impl ConcurrentSyncResult for NamespaceSyncResult {
+    fn semaphore_error(name: String) -> Self {
+        Self {
+            namespace: name,
+            result: SyncResult::default(),
+            models: Vec::new(),
+            error: Some("Semaphore closed unexpectedly".to_string()),
+        }
+    }
+
+    fn panic_error(error: String) -> Self {
+        Self {
+            namespace: "<unknown>".to_string(),
+            result: SyncResult::default(),
+            models: Vec::new(),
+            error: Some(format!("Task panic: {}", error)),
+        }
+    }
+
+    fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+}
+
+impl ConcurrentSyncResult for NamespaceSyncResultStreaming {
+    fn semaphore_error(name: String) -> Self {
+        Self {
+            namespace: name,
+            result: SyncResult::default(),
+            error: Some("Semaphore closed unexpectedly".to_string()),
+        }
+    }
+
+    fn panic_error(error: String) -> Self {
+        Self {
+            namespace: "<unknown>".to_string(),
+            result: SyncResult::default(),
+            error: Some(format!("Task panic: {}", error)),
+        }
+    }
+
+    fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+}
+
+/// Spawn concurrent sync tasks for items (namespaces or usernames).
+///
+/// Emits progress, creates tasks with semaphore-controlled concurrency, and
+/// collects results with proper panic handling.
+async fn spawn_concurrent_sync<R, F, Fut>(
+    items: &[String],
+    concurrency: usize,
+    make_task: F,
+    on_progress: Option<&ProgressCallback>,
+) -> Vec<R>
+where
+    R: ConcurrentSyncResult,
+    F: Fn(String, Arc<Semaphore>) -> Fut,
+    Fut: Future<Output = R> + Send + 'static,
+{
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    emit(
+        on_progress,
+        SyncProgress::SyncingNamespaces { count: items.len() },
+    );
+
+    let semaphore = Arc::new(Semaphore::new(std::cmp::max(1, concurrency / 4)));
+    let handles: Vec<_> = items
+        .iter()
+        .map(|item| tokio::spawn(make_task(item.clone(), Arc::clone(&semaphore))))
+        .collect();
+
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        results.push(
+            handle
+                .await
+                .unwrap_or_else(|e| R::panic_error(e.to_string())),
+        );
+    }
+
+    let successful = results.iter().filter(|r| !r.is_error()).count();
+    emit(
+        on_progress,
+        SyncProgress::SyncNamespacesComplete {
+            successful,
+            failed: results.len() - successful,
+        },
+    );
+
+    results
+}
 
 async fn sync_repos<C: PlatformClient + Clone + 'static>(
     client: &C,
@@ -260,96 +374,53 @@ pub async fn sync_namespaces<C: PlatformClient + Clone + 'static>(
     db: Option<Arc<DatabaseConnection>>,
     on_progress: Option<&ProgressCallback>,
 ) -> Vec<NamespaceSyncResult> {
-    if namespaces.is_empty() {
-        return Vec::new();
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::SyncingNamespaces {
-            count: namespaces.len(),
-        },
-    );
-
-    // Limit namespace concurrency to avoid overwhelming the API
-    let ns_concurrency = std::cmp::max(1, options.concurrency / 4);
-    let semaphore = Arc::new(Semaphore::new(ns_concurrency));
+    let client = client.clone();
+    let options = options.clone();
     let limiter = rate_limiter.cloned();
 
-    let mut handles = Vec::with_capacity(namespaces.len());
+    spawn_concurrent_sync(
+        namespaces,
+        options.concurrency,
+        |namespace, semaphore| {
+            let client = client.clone();
+            let options = options.clone();
+            let limiter = limiter.clone();
+            let task_db = db.clone();
 
-    for namespace in namespaces {
-        let namespace = namespace.clone();
-        let client = client.clone();
-        let options = options.clone();
-        let semaphore = Arc::clone(&semaphore);
-        let limiter = limiter.clone();
-        let task_db = db.clone();
+            async move {
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => return NamespaceSyncResult::semaphore_error(namespace),
+                };
 
-        let handle = tokio::spawn(async move {
-            let _permit = match semaphore.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    return NamespaceSyncResult {
+                match sync_namespace(
+                    &client,
+                    &namespace,
+                    &options,
+                    limiter.as_ref(),
+                    task_db.as_deref(),
+                    None,
+                )
+                .await
+                {
+                    Ok((sync_result, models)) => NamespaceSyncResult {
+                        namespace,
+                        result: sync_result,
+                        models,
+                        error: None,
+                    },
+                    Err(e) => NamespaceSyncResult {
                         namespace,
                         result: SyncResult::default(),
                         models: Vec::new(),
-                        error: Some("Semaphore closed unexpectedly".to_string()),
-                    };
+                        error: Some(e.to_string()),
+                    },
                 }
-            };
-
-            // Pass the Arc-wrapped db connection to enable ETag caching in concurrent syncs
-            let result = sync_namespace(
-                &client,
-                &namespace,
-                &options,
-                limiter.as_ref(),
-                task_db.as_deref(),
-                None,
-            )
-            .await;
-
-            match result {
-                Ok((sync_result, models)) => NamespaceSyncResult {
-                    namespace,
-                    result: sync_result,
-                    models,
-                    error: None,
-                },
-                Err(e) => NamespaceSyncResult {
-                    namespace,
-                    result: SyncResult::default(),
-                    models: Vec::new(),
-                    error: Some(e.to_string()),
-                },
             }
-        });
-
-        handles.push(handle);
-    }
-
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        match handle.await {
-            Ok(ns_result) => results.push(ns_result),
-            Err(e) => results.push(NamespaceSyncResult {
-                namespace: "<unknown>".to_string(),
-                result: SyncResult::default(),
-                models: Vec::new(),
-                error: Some(format!("Task panic: {}", e)),
-            }),
-        }
-    }
-
-    let successful = results.iter().filter(|r| r.error.is_none()).count();
-    let failed = results.iter().filter(|r| r.error.is_some()).count();
-    emit(
+        },
         on_progress,
-        SyncProgress::SyncNamespacesComplete { successful, failed },
-    );
-
-    results
+    )
+    .await
 }
 
 /// Sync multiple namespaces concurrently with streaming persistence.
@@ -391,57 +462,48 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
     let semaphore = Arc::new(Semaphore::new(ns_concurrency));
     let limiter = rate_limiter.cloned();
 
-    let mut handles = Vec::with_capacity(namespaces.len());
+    let handles: Vec<_> = namespaces
+        .iter()
+        .map(|namespace| {
+            let namespace = namespace.clone();
+            let client = client.clone();
+            let options = options.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let tx = model_tx.clone();
+            let limiter = limiter.clone();
+            let task_db = db.clone();
 
-    for namespace in namespaces {
-        let namespace = namespace.clone();
-        let client = client.clone();
-        let options = options.clone();
-        let semaphore = Arc::clone(&semaphore);
-        let tx = model_tx.clone();
-        let limiter = limiter.clone();
-        let task_db = db.clone();
+            tokio::spawn(async move {
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => return NamespaceSyncResultStreaming::semaphore_error(namespace),
+                };
 
-        let handle = tokio::spawn(async move {
-            let _permit = match semaphore.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    return NamespaceSyncResultStreaming {
+                match sync_namespace_streaming(
+                    &client,
+                    &namespace,
+                    &options,
+                    limiter.as_ref(),
+                    task_db.as_deref(),
+                    tx,
+                    None,
+                )
+                .await
+                {
+                    Ok(sync_result) => NamespaceSyncResultStreaming {
+                        namespace,
+                        result: sync_result,
+                        error: None,
+                    },
+                    Err(e) => NamespaceSyncResultStreaming {
                         namespace,
                         result: SyncResult::default(),
-                        error: Some("Semaphore closed unexpectedly".to_string()),
-                    };
+                        error: Some(e.to_string()),
+                    },
                 }
-            };
-
-            // Pass the Arc-wrapped db connection to enable ETag caching in concurrent syncs
-            let result = sync_namespace_streaming(
-                &client,
-                &namespace,
-                &options,
-                limiter.as_ref(),
-                task_db.as_deref(),
-                tx,
-                None,
-            )
-            .await;
-
-            match result {
-                Ok(sync_result) => NamespaceSyncResultStreaming {
-                    namespace,
-                    result: sync_result,
-                    error: None,
-                },
-                Err(e) => NamespaceSyncResultStreaming {
-                    namespace,
-                    result: SyncResult::default(),
-                    error: Some(e.to_string()),
-                },
-            }
-        });
-
-        handles.push(handle);
-    }
+            })
+        })
+        .collect();
 
     // Drop our copy of the sender so receivers know when all senders are done
     drop(model_tx);
@@ -449,17 +511,13 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
     let mut results = Vec::with_capacity(handles.len());
     for handle in handles {
         match handle.await {
-            Ok(ns_result) => results.push(ns_result),
-            Err(e) => results.push(NamespaceSyncResultStreaming {
-                namespace: "<unknown>".to_string(),
-                result: SyncResult::default(),
-                error: Some(format!("Task panic: {}", e)),
-            }),
+            Ok(result) => results.push(result),
+            Err(e) => results.push(NamespaceSyncResultStreaming::panic_error(e.to_string())),
         }
     }
 
-    let successful = results.iter().filter(|r| r.error.is_none()).count();
-    let failed = results.iter().filter(|r| r.error.is_some()).count();
+    let successful = results.iter().filter(|r| !r.is_error()).count();
+    let failed = results.iter().filter(|r| r.is_error()).count();
     emit(
         on_progress,
         SyncProgress::SyncNamespacesComplete { successful, failed },
@@ -579,57 +637,48 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
     let semaphore = Arc::new(Semaphore::new(ns_concurrency));
     let limiter = rate_limiter.cloned();
 
-    let mut handles = Vec::with_capacity(usernames.len());
+    let handles: Vec<_> = usernames
+        .iter()
+        .map(|username| {
+            let username = username.clone();
+            let client = client.clone();
+            let options = options.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let tx = model_tx.clone();
+            let limiter = limiter.clone();
+            let task_db = db.clone();
 
-    for username in usernames {
-        let username = username.clone();
-        let client = client.clone();
-        let options = options.clone();
-        let semaphore = Arc::clone(&semaphore);
-        let tx = model_tx.clone();
-        let limiter = limiter.clone();
-        let task_db = db.clone();
+            tokio::spawn(async move {
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => return NamespaceSyncResultStreaming::semaphore_error(username),
+                };
 
-        let handle = tokio::spawn(async move {
-            let _permit = match semaphore.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    return NamespaceSyncResultStreaming {
+                match sync_user_streaming(
+                    &client,
+                    &username,
+                    &options,
+                    limiter.as_ref(),
+                    task_db.as_deref(),
+                    tx,
+                    None,
+                )
+                .await
+                {
+                    Ok(sync_result) => NamespaceSyncResultStreaming {
+                        namespace: username,
+                        result: sync_result,
+                        error: None,
+                    },
+                    Err(e) => NamespaceSyncResultStreaming {
                         namespace: username,
                         result: SyncResult::default(),
-                        error: Some("Semaphore closed unexpectedly".to_string()),
-                    };
+                        error: Some(e.to_string()),
+                    },
                 }
-            };
-
-            // Pass the Arc-wrapped db connection to enable ETag caching in concurrent syncs
-            let result = sync_user_streaming(
-                &client,
-                &username,
-                &options,
-                limiter.as_ref(),
-                task_db.as_deref(),
-                tx,
-                None,
-            )
-            .await;
-
-            match result {
-                Ok(sync_result) => NamespaceSyncResultStreaming {
-                    namespace: username,
-                    result: sync_result,
-                    error: None,
-                },
-                Err(e) => NamespaceSyncResultStreaming {
-                    namespace: username,
-                    result: SyncResult::default(),
-                    error: Some(e.to_string()),
-                },
-            }
-        });
-
-        handles.push(handle);
-    }
+            })
+        })
+        .collect();
 
     // Drop our copy of the sender so receivers know when all senders are done
     drop(model_tx);
@@ -637,17 +686,13 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
     let mut results = Vec::with_capacity(handles.len());
     for handle in handles {
         match handle.await {
-            Ok(ns_result) => results.push(ns_result),
-            Err(e) => results.push(NamespaceSyncResultStreaming {
-                namespace: "<unknown>".to_string(),
-                result: SyncResult::default(),
-                error: Some(format!("Task panic: {}", e)),
-            }),
+            Ok(result) => results.push(result),
+            Err(e) => results.push(NamespaceSyncResultStreaming::panic_error(e.to_string())),
         }
     }
 
-    let successful = results.iter().filter(|r| r.error.is_none()).count();
-    let failed = results.iter().filter(|r| r.error.is_some()).count();
+    let successful = results.iter().filter(|r| !r.is_error()).count();
+    let failed = results.iter().filter(|r| r.is_error()).count();
     emit(
         on_progress,
         SyncProgress::SyncNamespacesComplete { successful, failed },
