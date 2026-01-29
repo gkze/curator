@@ -43,7 +43,7 @@ pub async fn get_etag(
 ) -> Result<Option<String>> {
     let entry = ApiCache::find()
         .filter(Column::Platform.eq(platform.clone()))
-        .filter(Column::EndpointType.eq(endpoint_type.clone()))
+        .filter(Column::EndpointType.eq(endpoint_type))
         .filter(Column::CacheKey.eq(cache_key))
         .one(db)
         .await?;
@@ -60,7 +60,7 @@ pub async fn get(
 ) -> Result<Option<Model>> {
     let entry = ApiCache::find()
         .filter(Column::Platform.eq(platform.clone()))
-        .filter(Column::EndpointType.eq(endpoint_type.clone()))
+        .filter(Column::EndpointType.eq(endpoint_type))
         .filter(Column::CacheKey.eq(cache_key))
         .one(db)
         .await?;
@@ -135,7 +135,7 @@ pub async fn get_etags_batch(
 
     let entries = ApiCache::find()
         .filter(Column::Platform.eq(platform.clone()))
-        .filter(Column::EndpointType.eq(endpoint_type.clone()))
+        .filter(Column::EndpointType.eq(endpoint_type))
         .filter(Column::CacheKey.is_in(cache_keys.iter().map(|s| s.as_str())))
         .all(db)
         .await?;

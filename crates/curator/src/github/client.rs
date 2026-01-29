@@ -15,7 +15,8 @@ use super::error::{GitHubError, is_rate_limit_error_from_github, short_error_mes
 use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{
-    self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
+    self, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient, PlatformError,
+    PlatformRepo, RateLimitInfo, UserInfo,
 };
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
@@ -30,19 +31,30 @@ pub fn extract_etag(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
-/// Pagination information extracted from the Link header.
+/// Pagination information extracted from GitHub's Link header.
+///
+/// This is a GitHub-specific type for parsing the Link header format.
+/// Use `to_pagination_info()` to convert to the shared `PaginationInfo` type.
 #[derive(Debug, Clone, Default)]
-pub struct PaginationInfo {
+pub struct LinkPagination {
     /// The last page number (from rel="last" link).
     pub last_page: Option<u32>,
     /// The next page number (from rel="next" link).
     pub next_page: Option<u32>,
 }
 
-impl PaginationInfo {
+impl LinkPagination {
     /// Returns the total number of pages if known.
     pub fn total_pages(&self) -> Option<u32> {
         self.last_page
+    }
+
+    /// Convert to the shared PaginationInfo type.
+    pub fn to_pagination_info(&self) -> PaginationInfo {
+        PaginationInfo {
+            total_pages: self.last_page,
+            next_page: self.next_page,
+        }
     }
 }
 
@@ -50,8 +62,8 @@ impl PaginationInfo {
 ///
 /// GitHub Link headers look like:
 /// `<https://api.github.com/organizations/123/repos?per_page=100&page=2>; rel="next", <...&page=3>; rel="last"`
-pub fn parse_link_header(link_header: &str) -> PaginationInfo {
-    let mut info = PaginationInfo::default();
+pub fn parse_link_header(link_header: &str) -> LinkPagination {
+    let mut info = LinkPagination::default();
 
     for part in link_header.split(',') {
         let part = part.trim();
@@ -98,50 +110,6 @@ fn extract_page_from_url(url: &str) -> Option<u32> {
     }
 
     None
-}
-
-/// Result of a conditional fetch operation.
-#[derive(Debug, Clone)]
-pub enum FetchResult<T> {
-    /// The resource was not modified (304 response).
-    NotModified,
-    /// The resource was fetched successfully with optional ETag and pagination info.
-    Fetched {
-        data: T,
-        etag: Option<String>,
-        pagination: PaginationInfo,
-    },
-}
-
-impl<T> FetchResult<T> {
-    /// Returns true if the result indicates not modified (cache hit).
-    pub fn is_not_modified(&self) -> bool {
-        matches!(self, FetchResult::NotModified)
-    }
-
-    /// Extract data if fetched, returning None if not modified.
-    pub fn into_data(self) -> Option<T> {
-        match self {
-            FetchResult::NotModified => None,
-            FetchResult::Fetched { data, .. } => Some(data),
-        }
-    }
-
-    /// Get ETag if fetched, None otherwise.
-    pub fn etag(&self) -> Option<&str> {
-        match self {
-            FetchResult::NotModified => None,
-            FetchResult::Fetched { etag, .. } => etag.as_deref(),
-        }
-    }
-
-    /// Get pagination info if fetched, None otherwise.
-    pub fn pagination(&self) -> Option<&PaginationInfo> {
-        match self {
-            FetchResult::NotModified => None,
-            FetchResult::Fetched { pagination, .. } => Some(pagination),
-        }
-    }
 }
 
 /// Create an authenticated Octocrab instance from a GitHub token.
@@ -294,11 +262,11 @@ impl GitHubClient {
             StatusCode::OK => {
                 let etag = extract_etag(&headers);
 
-                // Parse pagination from Link header
+                // Parse pagination from Link header and convert to shared type
                 let pagination = headers
                     .get("link")
                     .and_then(|v| v.to_str().ok())
-                    .map(parse_link_header)
+                    .map(|h| parse_link_header(h).to_pagination_info())
                     .unwrap_or_default();
 
                 let data: T = response
@@ -563,32 +531,6 @@ impl GitHubClient {
         }
 
         Ok((repos, result.stats))
-    }
-}
-
-/// Statistics about cache usage during a fetch operation.
-#[derive(Debug, Clone, Default)]
-pub struct CacheStats {
-    /// Number of pages that were cache hits (304 Not Modified).
-    pub cache_hits: u32,
-    /// Number of pages that were actually fetched.
-    pub pages_fetched: u32,
-}
-
-impl CacheStats {
-    /// Returns true if all requests were cache hits.
-    pub fn all_cached(&self) -> bool {
-        self.pages_fetched == 0 && self.cache_hits > 0
-    }
-
-    /// Returns the cache hit ratio (0.0 to 1.0).
-    pub fn hit_ratio(&self) -> f64 {
-        let total = self.cache_hits + self.pages_fetched;
-        if total == 0 {
-            0.0
-        } else {
-            self.cache_hits as f64 / total as f64
-        }
     }
 }
 
@@ -1159,7 +1101,7 @@ impl PlatformClient for GitHubClient {
                     all_cache_hits = false;
                     let count = repos.len();
 
-                    if let Some(total) = pagination.total_pages() {
+                    if let Some(total) = pagination.total_pages {
                         expected_pages = Some(total);
                     }
 
@@ -1418,7 +1360,7 @@ impl PlatformClient for GitHubClient {
             return Ok(0);
         };
 
-        let expected_pages = pagination.total_pages();
+        let expected_pages = pagination.total_pages;
         let first_page_count = first_page_repos.len();
 
         // Emit FetchingRepos with expected_pages from Link header
@@ -1658,17 +1600,28 @@ mod tests {
     }
 
     #[test]
-    fn test_pagination_info_total_pages() {
-        let info = PaginationInfo {
+    fn test_link_pagination_total_pages() {
+        let info = LinkPagination {
             last_page: Some(10),
             next_page: Some(2),
         };
         assert_eq!(info.total_pages(), Some(10));
 
-        let info = PaginationInfo {
+        let info = LinkPagination {
             last_page: None,
             next_page: Some(2),
         };
         assert_eq!(info.total_pages(), None);
+    }
+
+    #[test]
+    fn test_link_pagination_to_pagination_info() {
+        let link = LinkPagination {
+            last_page: Some(5),
+            next_page: Some(2),
+        };
+        let pagination = link.to_pagination_info();
+        assert_eq!(pagination.total_pages, Some(5));
+        assert_eq!(pagination.next_page, Some(2));
     }
 }

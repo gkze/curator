@@ -11,10 +11,10 @@ use tokio::sync::{Semaphore, mpsc};
 use crate::api_cache;
 use crate::entity::api_cache::EndpointType;
 use crate::entity::code_platform::CodePlatform;
-use crate::platform::{self, ProgressCallback};
+use crate::platform::{self, CacheStats, FetchResult, ProgressCallback};
 use crate::sync::{SyncProgress, emit};
 
-use super::client::{CacheStats, FetchResult, GitHubClient, check_rate_limit};
+use super::client::{GitHubClient, check_rate_limit};
 
 use super::error::GitHubError;
 
@@ -122,7 +122,7 @@ impl GitHubClient {
             && let Ok(Some(stored_total)) = api_cache::get_total_pages(
                 db,
                 CodePlatform::GitHub,
-                config.endpoint_type.clone(),
+                config.endpoint_type,
                 config.namespace,
             )
             .await
@@ -156,15 +156,10 @@ impl GitHubClient {
 
             // Try to get cached ETag
             let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(
-                    db,
-                    CodePlatform::GitHub,
-                    config.endpoint_type.clone(),
-                    &cache_key,
-                )
-                .await
-                .ok()
-                .flatten()
+                api_cache::get_etag(db, CodePlatform::GitHub, config.endpoint_type, &cache_key)
+                    .await
+                    .ok()
+                    .flatten()
             } else {
                 None
             };
@@ -210,7 +205,7 @@ impl GitHubClient {
                     let count = items.len();
 
                     // Update known total pages from Link header
-                    if let Some(total) = pagination.total_pages() {
+                    if let Some(total) = pagination.total_pages {
                         known_total_pages = Some(total);
                     }
 
@@ -225,7 +220,7 @@ impl GitHubClient {
                         let _ = api_cache::upsert_with_pagination(
                             db,
                             CodePlatform::GitHub,
-                            config.endpoint_type.clone(),
+                            config.endpoint_type,
                             &cache_key,
                             etag,
                             total_pages_to_store,
@@ -311,7 +306,7 @@ impl GitHubClient {
             && let Ok(Some(stored_total)) = api_cache::get_total_pages(
                 db,
                 CodePlatform::GitHub,
-                config.endpoint_type.clone(),
+                config.endpoint_type,
                 config.namespace,
             )
             .await
@@ -333,7 +328,7 @@ impl GitHubClient {
             api_cache::get_etag(
                 db,
                 CodePlatform::GitHub,
-                config.endpoint_type.clone(),
+                config.endpoint_type,
                 &first_cache_key,
             )
             .await
@@ -377,7 +372,7 @@ impl GitHubClient {
             } => {
                 let count = items.len();
 
-                if let Some(total) = pagination.total_pages() {
+                if let Some(total) = pagination.total_pages {
                     known_total_pages = Some(total);
                 }
 
@@ -386,7 +381,7 @@ impl GitHubClient {
                     let _ = api_cache::upsert_with_pagination(
                         db,
                         CodePlatform::GitHub,
-                        config.endpoint_type.clone(),
+                        config.endpoint_type,
                         &first_cache_key,
                         etag,
                         known_total_pages.map(|t| t as i32),
@@ -446,7 +441,7 @@ impl GitHubClient {
                 api_cache::get_etags_batch(
                     db,
                     CodePlatform::GitHub,
-                    config.endpoint_type.clone(),
+                    config.endpoint_type,
                     &page_cache_keys,
                 )
                 .await
@@ -525,7 +520,7 @@ impl GitHubClient {
                             let _ = api_cache::upsert_with_pagination(
                                 db,
                                 CodePlatform::GitHub,
-                                config.endpoint_type.clone(),
+                                config.endpoint_type,
                                 &cache_key,
                                 new_etag,
                                 None,

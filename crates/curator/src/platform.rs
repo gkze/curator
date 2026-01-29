@@ -17,11 +17,13 @@
 //! }
 //! ```
 
+mod conditional;
 mod convert;
 mod errors;
 mod rate_limit;
 mod types;
 
+pub use conditional::{CacheStats, FetchResult, PaginationInfo};
 pub use convert::strip_null_values;
 pub use errors::{PlatformError, Result, short_error_message};
 pub use rate_limit::{ApiRateLimiter, RateLimitedClient, rate_limits};

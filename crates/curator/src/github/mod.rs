@@ -49,9 +49,12 @@ pub use types::{DEFAULT_CONCURRENCY, DEFAULT_PAGE_FETCH_CONCURRENCY, DEFAULT_STA
 
 // Re-export client types and functions
 pub use client::{
-    CacheStats, FetchResult, GitHubClient, PaginationInfo, check_rate_limit, create_client,
-    extract_etag, get_org_info, get_rate_limit, get_rate_limits, parse_link_header,
+    GitHubClient, LinkPagination, check_rate_limit, create_client, extract_etag, get_org_info,
+    get_rate_limit, get_rate_limits, parse_link_header,
 };
+
+// Re-export shared platform types used for conditional fetching
+pub use crate::platform::{CacheStats, FetchResult, PaginationInfo};
 
 // Re-export repo operations
 pub use repo::{

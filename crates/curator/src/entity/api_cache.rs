@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::entity::code_platform::CodePlatform;
 
 /// Type of API endpoint being cached.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, EnumIter, DeriveActiveEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "String", db_type = "String(StringLen::None)")]
 pub enum EndpointType {
     /// Organization/group repositories list endpoint.

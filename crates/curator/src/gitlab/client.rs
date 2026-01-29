@@ -21,40 +21,12 @@ use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
 use crate::entity::code_platform::CodePlatform;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{
-    self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
+    self, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient, PlatformError,
+    PlatformRepo, RateLimitInfo, UserInfo,
 };
 use crate::repository;
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
-
-/// Result of a conditional GET request.
-#[derive(Debug)]
-enum FetchResult<T> {
-    /// Server returned 304 Not Modified — cached data is still valid.
-    NotModified,
-    /// Server returned new data with an optional ETag.
-    Fetched {
-        data: T,
-        etag: Option<String>,
-        total_pages: Option<i32>,
-    },
-}
-
-/// Statistics about cache usage during a paginated fetch.
-#[derive(Debug, Default)]
-pub struct CacheStats {
-    /// Number of pages that returned 304 Not Modified.
-    pub(crate) cache_hits: u32,
-    /// Number of pages that were freshly fetched.
-    pub(crate) pages_fetched: u32,
-}
-
-impl CacheStats {
-    /// Returns `true` when every page was a cache hit.
-    pub fn all_cached(&self) -> bool {
-        self.cache_hits > 0 && self.pages_fetched == 0
-    }
-}
 
 /// GitLab API client backed by the Progenitor-generated typed client.
 ///
@@ -170,7 +142,7 @@ impl GitLabClient {
                 Ok(FetchResult::Fetched {
                     data,
                     etag,
-                    total_pages,
+                    pagination: PaginationInfo::from_total_pages(total_pages),
                 })
             }
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
@@ -214,48 +186,53 @@ impl GitLabClient {
     // Paginated helpers — call generated methods in a loop
     // ------------------------------------------------------------------
 
-    /// List all projects for a group with automatic pagination and optional
-    /// ETag caching.
+    /// Generic paginated fetch with ETag caching.
     ///
-    /// When a `db` is provided, each page request checks for a cached ETag and
-    /// sends an `If-None-Match` header.  Pages that return 304 are skipped.
-    pub async fn list_group_projects(
+    /// Fetches all pages of a paginated endpoint, using cached ETags when
+    /// available. Returns the collected items and cache statistics.
+    ///
+    /// # Type Parameters
+    /// - `T`: The item type to deserialize (must be `DeserializeOwned`)
+    ///
+    /// # Parameters
+    /// - `endpoint_type`: The endpoint type for cache key lookups
+    /// - `cache_key_prefix`: The prefix used to load stored total_pages from DB
+    /// - `url_fn`: Builds the URL for a given page number
+    /// - `cache_key_fn`: Builds the cache key for a given page number
+    /// - `db`: Optional database connection for ETag caching
+    async fn paginated_fetch<T: serde::de::DeserializeOwned>(
         &self,
-        group: &str,
-        include_subgroups: bool,
+        endpoint_type: EndpointType,
+        cache_key_prefix: &str,
+        url_fn: impl Fn(u32) -> String,
+        cache_key_fn: impl Fn(u32) -> String,
         db: Option<&DatabaseConnection>,
-    ) -> Result<(Vec<GitLabProject>, CacheStats), GitLabError> {
-        let mut all: Vec<GitLabProject> = Vec::new();
+    ) -> Result<(Vec<T>, CacheStats), GitLabError> {
+        let mut all: Vec<T> = Vec::new();
         let mut page = 1u32;
-        let per_page = 100;
         let mut stats = CacheStats::default();
         let mut known_total_pages: Option<u32> = None;
 
-        let include_sub = if include_subgroups { "true" } else { "false" };
-
         // Try to load stored total_pages from the DB
         if let Some(db) = db
-            && let Ok(Some(stored)) =
-                api_cache::get_total_pages(db, CodePlatform::GitLab, EndpointType::OrgRepos, group)
-                    .await
+            && let Ok(Some(stored)) = api_cache::get_total_pages(
+                db,
+                CodePlatform::GitLab,
+                endpoint_type,
+                cache_key_prefix,
+            )
+            .await
         {
             known_total_pages = Some(stored as u32);
         }
 
         loop {
-            let url = format!(
-                "{}/api/v4/groups/{}/projects?include_subgroups={}&per_page={}&page={}",
-                self.host,
-                group.replace('/', "%2F"),
-                include_sub,
-                per_page,
-                page,
-            );
-            let cache_key = ApiCacheModel::org_repos_key(group, page);
+            let url = url_fn(page);
+            let cache_key = cache_key_fn(page);
 
             // Look up cached ETag
             let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(db, CodePlatform::GitLab, EndpointType::OrgRepos, &cache_key)
+                api_cache::get_etag(db, CodePlatform::GitLab, endpoint_type, &cache_key)
                     .await
                     .ok()
                     .flatten()
@@ -263,12 +240,12 @@ impl GitLabClient {
                 None
             };
 
-            let result: FetchResult<Vec<GitLabProject>> =
+            let result: FetchResult<Vec<T>> =
                 self.get_conditional(&url, cached_etag.as_deref()).await?;
 
             match result {
                 FetchResult::NotModified => {
-                    stats.cache_hits += 1;
+                    stats.record_hit();
                     if let Some(total) = known_total_pages
                         && page < total
                     {
@@ -280,13 +257,13 @@ impl GitLabClient {
                 FetchResult::Fetched {
                     data: items,
                     etag,
-                    total_pages,
+                    pagination,
                 } => {
-                    stats.pages_fetched += 1;
+                    stats.record_fetch();
                     let is_empty = items.is_empty();
 
-                    if let Some(tp) = total_pages {
-                        known_total_pages = Some(tp as u32);
+                    if let Some(tp) = pagination.total_pages {
+                        known_total_pages = Some(tp);
                     }
 
                     // Store ETag
@@ -299,7 +276,7 @@ impl GitLabClient {
                         let _ = api_cache::upsert_with_pagination(
                             db,
                             CodePlatform::GitLab,
-                            EndpointType::OrgRepos,
+                            endpoint_type,
                             &cache_key,
                             etag,
                             tp_to_store,
@@ -323,6 +300,36 @@ impl GitLabClient {
         }
 
         Ok((all, stats))
+    }
+
+    /// List all projects for a group with automatic pagination and optional
+    /// ETag caching.
+    ///
+    /// When a `db` is provided, each page request checks for a cached ETag and
+    /// sends an `If-None-Match` header.  Pages that return 304 are skipped.
+    pub async fn list_group_projects(
+        &self,
+        group: &str,
+        include_subgroups: bool,
+        db: Option<&DatabaseConnection>,
+    ) -> Result<(Vec<GitLabProject>, CacheStats), GitLabError> {
+        let include_sub = if include_subgroups { "true" } else { "false" };
+        let encoded_group = group.replace('/', "%2F");
+        let host = self.host.clone();
+
+        self.paginated_fetch(
+            EndpointType::OrgRepos,
+            group,
+            |page| {
+                format!(
+                    "{}/api/v4/groups/{}/projects?include_subgroups={}&per_page=100&page={}",
+                    host, encoded_group, include_sub, page,
+                )
+            },
+            |page| ApiCacheModel::org_repos_key(group, page),
+            db,
+        )
+        .await
     }
 
     /// Get information about the authenticated user.
@@ -343,105 +350,21 @@ impl GitLabClient {
         db: Option<&DatabaseConnection>,
     ) -> Result<(Vec<GitLabProject>, CacheStats), GitLabError> {
         let user_id = self.resolve_user_id(username).await?;
-        let mut all: Vec<GitLabProject> = Vec::new();
-        let mut page = 1u32;
-        let per_page = 100;
-        let mut stats = CacheStats::default();
-        let mut known_total_pages: Option<u32> = None;
+        let host = self.host.clone();
 
-        // Try to load stored total_pages from the DB
-        if let Some(db) = db
-            && let Ok(Some(stored)) = api_cache::get_total_pages(
-                db,
-                CodePlatform::GitLab,
-                EndpointType::UserRepos,
-                username,
-            )
-            .await
-        {
-            known_total_pages = Some(stored as u32);
-        }
-
-        loop {
-            let url = format!(
-                "{}/api/v4/users/{}/projects?per_page={}&page={}",
-                self.host, user_id, per_page, page,
-            );
-            let cache_key = ApiCacheModel::user_repos_key(username, page);
-
-            let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(
-                    db,
-                    CodePlatform::GitLab,
-                    EndpointType::UserRepos,
-                    &cache_key,
+        self.paginated_fetch(
+            EndpointType::UserRepos,
+            username,
+            |page| {
+                format!(
+                    "{}/api/v4/users/{}/projects?per_page=100&page={}",
+                    host, user_id, page,
                 )
-                .await
-                .ok()
-                .flatten()
-            } else {
-                None
-            };
-
-            let result: FetchResult<Vec<GitLabProject>> =
-                self.get_conditional(&url, cached_etag.as_deref()).await?;
-
-            match result {
-                FetchResult::NotModified => {
-                    stats.cache_hits += 1;
-                    if let Some(total) = known_total_pages
-                        && page < total
-                    {
-                        page += 1;
-                        continue;
-                    }
-                    break;
-                }
-                FetchResult::Fetched {
-                    data: items,
-                    etag,
-                    total_pages,
-                } => {
-                    stats.pages_fetched += 1;
-                    let is_empty = items.is_empty();
-
-                    if let Some(tp) = total_pages {
-                        known_total_pages = Some(tp as u32);
-                    }
-
-                    if let Some(db) = db {
-                        let tp_to_store = if page == 1 {
-                            known_total_pages.map(|t| t as i32)
-                        } else {
-                            None
-                        };
-                        let _ = api_cache::upsert_with_pagination(
-                            db,
-                            CodePlatform::GitLab,
-                            EndpointType::UserRepos,
-                            &cache_key,
-                            etag,
-                            tp_to_store,
-                        )
-                        .await;
-                    }
-
-                    all.extend(items);
-
-                    if is_empty {
-                        break;
-                    }
-                    if let Some(total) = known_total_pages
-                        && page >= total
-                    {
-                        break;
-                    }
-                    page += 1;
-                }
-            }
-        }
-
-        Ok((all, stats))
+            },
+            |page| ApiCacheModel::user_repos_key(username, page),
+            db,
+        )
+        .await
     }
 
     /// Resolve a username to a user ID.
@@ -517,95 +440,24 @@ impl GitLabClient {
         username: &str,
         db: Option<&DatabaseConnection>,
     ) -> Result<(Vec<GitLabProject>, CacheStats), GitLabError> {
-        let mut all: Vec<GitLabProject> = Vec::new();
-        let mut page = 1u32;
-        let per_page = 100;
-        let mut stats = CacheStats::default();
-        let mut known_total_pages: Option<u32> = None;
+        let host = self.host.clone();
+        // Cache key prefix for starred uses "{username}/starred" format
+        // so get_total_pages looks for "{username}/starred/page/1"
+        let cache_key_prefix = format!("{}/starred", username);
 
-        // Try to load stored total_pages from the DB
-        if let Some(db) = db
-            && let Ok(Some(stored)) =
-                api_cache::get_starred_total_pages(db, CodePlatform::GitLab, username).await
-        {
-            known_total_pages = Some(stored as u32);
-        }
-
-        loop {
-            let url = format!(
-                "{}/api/v4/users/{}/starred_projects?per_page={}&page={}",
-                self.host, user_id, per_page, page,
-            );
-            let cache_key = ApiCacheModel::starred_key(username, page);
-
-            let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(db, CodePlatform::GitLab, EndpointType::Starred, &cache_key)
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
-
-            let result: FetchResult<Vec<GitLabProject>> =
-                self.get_conditional(&url, cached_etag.as_deref()).await?;
-
-            match result {
-                FetchResult::NotModified => {
-                    stats.cache_hits += 1;
-                    if let Some(total) = known_total_pages
-                        && page < total
-                    {
-                        page += 1;
-                        continue;
-                    }
-                    break;
-                }
-                FetchResult::Fetched {
-                    data: items,
-                    etag,
-                    total_pages,
-                } => {
-                    stats.pages_fetched += 1;
-                    let is_empty = items.is_empty();
-
-                    if let Some(tp) = total_pages {
-                        known_total_pages = Some(tp as u32);
-                    }
-
-                    if let Some(db) = db {
-                        let tp_to_store = if page == 1 {
-                            known_total_pages.map(|t| t as i32)
-                        } else {
-                            None
-                        };
-                        let _ = api_cache::upsert_with_pagination(
-                            db,
-                            CodePlatform::GitLab,
-                            EndpointType::Starred,
-                            &cache_key,
-                            etag,
-                            tp_to_store,
-                        )
-                        .await;
-                    }
-
-                    all.extend(items);
-
-                    if is_empty {
-                        break;
-                    }
-                    if let Some(total) = known_total_pages
-                        && page >= total
-                    {
-                        break;
-                    }
-                    page += 1;
-                }
-            }
-        }
-
-        Ok((all, stats))
+        self.paginated_fetch(
+            EndpointType::Starred,
+            &cache_key_prefix,
+            |page| {
+                format!(
+                    "{}/api/v4/users/{}/starred_projects?per_page=100&page={}",
+                    host, user_id, page,
+                )
+            },
+            |page| ApiCacheModel::starred_key(username, page),
+            db,
+        )
+        .await
     }
 
     /// Get information about a group.
