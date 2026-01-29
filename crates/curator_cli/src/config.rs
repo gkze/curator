@@ -114,9 +114,13 @@ impl Default for GitLabConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct CodebergConfig {
-    /// Codeberg API token (personal access token).
+    /// Codeberg API token (OAuth access token or personal access token).
     /// Can also be set via CURATOR_CODEBERG_TOKEN environment variable.
     pub token: Option<String>,
+    /// OAuth refresh token for automatic token renewal.
+    pub refresh_token: Option<String>,
+    /// Unix timestamp when the OAuth token expires.
+    pub token_expires_at: Option<u64>,
 }
 
 /// Gitea configuration (for self-hosted Gitea/Forgejo instances).
@@ -272,6 +276,20 @@ impl Config {
         self.codeberg.token.clone()
     }
 
+    /// Get the Codeberg OAuth refresh token.
+    #[cfg(feature = "gitea")]
+    #[allow(dead_code)] // Will be used for automatic token refresh
+    pub fn codeberg_refresh_token(&self) -> Option<String> {
+        self.codeberg.refresh_token.clone()
+    }
+
+    /// Get the Codeberg OAuth token expiry (Unix timestamp).
+    #[cfg(feature = "gitea")]
+    #[allow(dead_code)] // Will be used for automatic token refresh
+    pub fn codeberg_token_expires_at(&self) -> Option<u64> {
+        self.codeberg.token_expires_at
+    }
+
     /// Get the Gitea host.
     #[cfg(feature = "gitea")]
     pub fn gitea_host(&self) -> Option<String> {
@@ -401,6 +419,61 @@ impl Config {
         }
         if let Some(exp) = expires_at {
             doc["gitlab"]["token_expires_at"] = value(exp as i64);
+        }
+
+        // Write back to file
+        fs::write(&config_path, doc.to_string())?;
+        Ok(config_path)
+    }
+
+    /// Save Codeberg OAuth tokens to the config file.
+    ///
+    /// Creates the config file and parent directories if they don't exist.
+    /// If a config file already exists, it updates only the `[codeberg]` section,
+    /// preserving formatting, comments, and other settings.
+    #[cfg(feature = "gitea")]
+    pub fn save_codeberg_oauth_tokens(
+        access_token: &str,
+        refresh_token: Option<&str>,
+        expires_at: Option<u64>,
+    ) -> io::Result<PathBuf> {
+        use toml_edit::{DocumentMut, value};
+
+        let config_path = Self::default_config_path().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not determine config directory",
+            )
+        })?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Read existing config or start fresh
+        let content = if config_path.exists() {
+            fs::read_to_string(&config_path)?
+        } else {
+            String::new()
+        };
+
+        // Parse as TOML document (preserves formatting and comments)
+        let mut doc: DocumentMut = content.parse().map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid TOML: {}", e))
+        })?;
+
+        // Ensure [codeberg] table exists and set the tokens
+        if !doc.contains_key("codeberg") {
+            doc["codeberg"] = toml_edit::table();
+        }
+        doc["codeberg"]["token"] = value(access_token);
+
+        if let Some(rt) = refresh_token {
+            doc["codeberg"]["refresh_token"] = value(rt);
+        }
+        if let Some(exp) = expires_at {
+            doc["codeberg"]["token_expires_at"] = value(exp as i64);
         }
 
         // Write back to file

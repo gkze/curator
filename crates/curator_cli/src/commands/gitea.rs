@@ -1,8 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use console::Term;
 use curator::db;
 use curator::entity::code_platform::CodePlatform;
-use curator::gitea::{self, GiteaClient};
+use curator::gitea::{self, GiteaClient, oauth};
 use curator::rate_limits;
 use curator::sync::{PlatformOptions, SyncOptions};
 
@@ -17,6 +19,51 @@ pub(crate) async fn handle_codeberg(
     database_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
+        CodebergAction::Login => {
+            let is_tty = Term::stdout().is_term();
+
+            if is_tty {
+                println!("Authenticating with Codeberg...\n");
+            }
+
+            // Use the PKCE OAuth flow
+            let auth = oauth::CodebergAuth::new();
+            let timeout = Duration::from_secs(300); // 5 minute timeout
+
+            let token_response = oauth::authorize(&auth, timeout).await.map_err(|e| {
+                Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error>
+            })?;
+
+            // Calculate expiry timestamp
+            let expires_at = oauth::token_expires_at(&token_response);
+
+            // Save tokens to config
+            let config_path = config::Config::save_codeberg_oauth_tokens(
+                &token_response.access_token,
+                token_response.refresh_token.as_deref(),
+                expires_at,
+            )?;
+
+            if is_tty {
+                println!();
+                println!(
+                    "Success! Codeberg token saved to: {}",
+                    config_path.display()
+                );
+                if token_response.refresh_token.is_some() {
+                    println!("Token will be automatically refreshed when it expires.");
+                }
+                println!();
+                println!("You can now use curator commands like:");
+                println!("  curator codeberg stars");
+                println!("  curator codeberg org <org-name>");
+            } else {
+                tracing::info!(
+                    config_path = %config_path.display(),
+                    "Codeberg authentication successful"
+                );
+            }
+        }
         CodebergAction::Org { orgs, sync_opts } => {
             let codeberg_host = gitea::CODEBERG_HOST;
             let codeberg_token = config.codeberg_token().expect(

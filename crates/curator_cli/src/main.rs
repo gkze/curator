@@ -266,6 +266,11 @@ enum GitlabAction {
 #[cfg(feature = "gitea")]
 #[derive(Subcommand)]
 enum CodebergAction {
+    /// Authenticate with Codeberg using OAuth PKCE flow
+    ///
+    /// Opens your browser to authorize Curator with Codeberg.
+    /// The token is saved to your config file for future use.
+    Login,
     /// Sync repositories from a Codeberg organization
     Org {
         /// Organization name(s) - can specify multiple
