@@ -226,4 +226,123 @@ mod tests {
         );
         assert_eq!(metadata["namespace_kind"], "group");
     }
+
+    #[test]
+    fn test_to_code_repository_missing_description() {
+        let mut project = mock_project();
+        project.description = None;
+
+        let model = to_code_repository(&project, test_instance_id());
+        assert_eq!(model.description.as_ref(), &None);
+    }
+
+    #[test]
+    fn test_to_code_repository_missing_default_branch() {
+        let mut project = mock_project();
+        project.default_branch = None;
+
+        let model = to_code_repository(&project, test_instance_id());
+        // Should default to "main" when not provided
+        assert_eq!(model.default_branch.as_ref(), "main");
+    }
+
+    #[test]
+    fn test_to_code_repository_unknown_visibility() {
+        let mut project = mock_project();
+        project.visibility = "unknown_value".to_string();
+
+        let model = to_code_repository(&project, test_instance_id());
+        // Unknown visibility should default to Public
+        assert_eq!(model.visibility.as_ref(), &CodeVisibility::Public);
+    }
+
+    #[test]
+    fn test_to_code_repository_single_level_namespace() {
+        use super::super::types::GitLabNamespace;
+
+        let mut project = mock_project();
+        // Single-level path: "group/project" (no subgroup)
+        project.path_with_namespace = "simple-group/test-project".to_string();
+        project.namespace = GitLabNamespace {
+            id: 1,
+            name: "simple-group".to_string(),
+            path: "simple-group".to_string(),
+            full_path: "simple-group".to_string(),
+            kind: "group".to_string(),
+        };
+
+        let model = to_code_repository(&project, test_instance_id());
+        assert_eq!(model.owner.as_ref(), "simple-group");
+    }
+
+    #[test]
+    fn test_to_code_repository_user_namespace() {
+        use super::super::types::GitLabNamespace;
+
+        let mut project = mock_project();
+        project.path_with_namespace = "johndoe/my-project".to_string();
+        project.namespace = GitLabNamespace {
+            id: 1,
+            name: "johndoe".to_string(),
+            path: "johndoe".to_string(),
+            full_path: "johndoe".to_string(),
+            kind: "user".to_string(),
+        };
+
+        let model = to_code_repository(&project, test_instance_id());
+        assert_eq!(model.owner.as_ref(), "johndoe");
+    }
+
+    #[test]
+    fn test_to_code_repository_empty_topics() {
+        let mut project = mock_project();
+        project.topics = vec![];
+
+        let model = to_code_repository(&project, test_instance_id());
+        let topics: Vec<String> =
+            serde_json::from_value(model.topics.as_ref().clone()).expect("valid JSON");
+        assert!(topics.is_empty());
+    }
+
+    #[test]
+    fn test_to_code_repository_archived() {
+        let mut project = mock_project();
+        project.archived = true;
+
+        let model = to_code_repository(&project, test_instance_id());
+        assert_eq!(model.is_archived.as_ref(), &true);
+    }
+
+    #[test]
+    fn test_to_code_repository_timestamps() {
+        let project = mock_project();
+        let model = to_code_repository(&project, test_instance_id());
+
+        // created_at and updated_at should be set
+        assert!(model.created_at.as_ref().is_some());
+        assert!(model.updated_at.as_ref().is_some());
+    }
+
+    #[test]
+    fn test_to_platform_repo_fields_not_in_gitlab_api() {
+        let project = mock_project();
+        let platform_repo = to_platform_repo(&project);
+
+        // These fields are not returned by GitLab list endpoint
+        assert!(platform_repo.language.is_none());
+        assert!(platform_repo.pushed_at.is_none());
+        assert!(platform_repo.license.is_none());
+        assert!(platform_repo.homepage.is_none());
+        assert!(platform_repo.size_kb.is_none());
+    }
+
+    #[test]
+    fn test_platform_repo_to_active_model() {
+        let project = mock_project();
+        let platform_repo = to_platform_repo(&project);
+        let model = platform_repo_to_active_model(&platform_repo, test_instance_id());
+
+        assert_eq!(model.instance_id.as_ref(), &test_instance_id());
+        assert_eq!(model.name.as_ref(), "test-project");
+    }
 }

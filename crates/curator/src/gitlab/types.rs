@@ -293,3 +293,278 @@ impl From<generated::ApiEntitiesBasicProjectDetails> for GitLabProject {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gitlab_project_deserialize_minimal() {
+        let json = r#"{
+            "id": 12345,
+            "name": "test-project",
+            "path": "test-project",
+            "path_with_namespace": "group/test-project",
+            "visibility": "public",
+            "archived": false,
+            "created_at": "2024-01-01T00:00:00Z",
+            "last_activity_at": "2024-06-01T00:00:00Z",
+            "namespace": {
+                "id": 1,
+                "name": "group",
+                "path": "group",
+                "full_path": "group",
+                "kind": "group"
+            },
+            "web_url": "https://gitlab.com/group/test-project"
+        }"#;
+
+        let project: GitLabProject = serde_json::from_str(json).unwrap();
+        assert_eq!(project.id, 12345);
+        assert_eq!(project.name, "test-project");
+        assert_eq!(project.visibility, "public");
+        assert!(!project.archived);
+        assert_eq!(project.star_count, 0); // defaults
+        assert_eq!(project.forks_count, 0); // defaults
+        assert!(project.topics.is_empty()); // defaults
+    }
+
+    #[test]
+    fn test_gitlab_project_deserialize_full() {
+        let json = r#"{
+            "id": 12345,
+            "name": "test-project",
+            "path": "test-project",
+            "path_with_namespace": "group/subgroup/test-project",
+            "description": "A test project",
+            "default_branch": "develop",
+            "visibility": "private",
+            "archived": true,
+            "topics": ["rust", "api"],
+            "star_count": 42,
+            "forks_count": 5,
+            "open_issues_count": 10,
+            "created_at": "2024-01-01T00:00:00Z",
+            "last_activity_at": "2024-06-01T00:00:00Z",
+            "namespace": {
+                "id": 1,
+                "name": "subgroup",
+                "path": "subgroup",
+                "full_path": "group/subgroup",
+                "kind": "group"
+            },
+            "forked_from_project": {"id": 999},
+            "mirror": true,
+            "issues_enabled": true,
+            "wiki_enabled": false,
+            "merge_requests_enabled": true,
+            "web_url": "https://gitlab.com/group/subgroup/test-project",
+            "ssh_url_to_repo": "git@gitlab.com:group/subgroup/test-project.git",
+            "http_url_to_repo": "https://gitlab.com/group/subgroup/test-project.git"
+        }"#;
+
+        let project: GitLabProject = serde_json::from_str(json).unwrap();
+        assert_eq!(project.id, 12345);
+        assert_eq!(project.description, Some("A test project".to_string()));
+        assert_eq!(project.default_branch, Some("develop".to_string()));
+        assert!(project.archived);
+        assert_eq!(project.topics, vec!["rust", "api"]);
+        assert_eq!(project.star_count, 42);
+        assert_eq!(project.forks_count, 5);
+        assert_eq!(project.open_issues_count, Some(10));
+        assert!(project.forked_from_project.is_some());
+        assert_eq!(project.forked_from_project.as_ref().unwrap().id, 999);
+        assert_eq!(project.mirror, Some(true));
+        assert_eq!(project.issues_enabled, Some(true));
+        assert_eq!(project.wiki_enabled, Some(false));
+    }
+
+    #[test]
+    fn test_gitlab_namespace_deserialize() {
+        let json = r#"{
+            "id": 123,
+            "name": "My Group",
+            "path": "my-group",
+            "full_path": "parent/my-group",
+            "kind": "group"
+        }"#;
+
+        let ns: GitLabNamespace = serde_json::from_str(json).unwrap();
+        assert_eq!(ns.id, 123);
+        assert_eq!(ns.name, "My Group");
+        assert_eq!(ns.path, "my-group");
+        assert_eq!(ns.full_path, "parent/my-group");
+        assert_eq!(ns.kind, "group");
+    }
+
+    #[test]
+    fn test_gitlab_namespace_user_kind() {
+        let json = r#"{
+            "id": 456,
+            "name": "johndoe",
+            "path": "johndoe",
+            "full_path": "johndoe",
+            "kind": "user"
+        }"#;
+
+        let ns: GitLabNamespace = serde_json::from_str(json).unwrap();
+        assert_eq!(ns.kind, "user");
+        assert_eq!(ns.full_path, "johndoe");
+    }
+
+    #[test]
+    fn test_gitlab_user_deserialize_minimal() {
+        let json = r#"{
+            "id": 123,
+            "username": "johndoe"
+        }"#;
+
+        let user: GitLabUser = serde_json::from_str(json).unwrap();
+        assert_eq!(user.id, 123);
+        assert_eq!(user.username, "johndoe");
+        assert!(user.name.is_none());
+        assert!(user.email.is_none());
+        assert!(user.bio.is_none());
+    }
+
+    #[test]
+    fn test_gitlab_user_deserialize_full() {
+        let json = r#"{
+            "id": 123,
+            "username": "johndoe",
+            "name": "John Doe",
+            "email": "john@example.com",
+            "bio": "Software developer",
+            "public_email": "john.public@example.com"
+        }"#;
+
+        let user: GitLabUser = serde_json::from_str(json).unwrap();
+        assert_eq!(user.id, 123);
+        assert_eq!(user.username, "johndoe");
+        assert_eq!(user.name, Some("John Doe".to_string()));
+        assert_eq!(user.email, Some("john@example.com".to_string()));
+        assert_eq!(user.bio, Some("Software developer".to_string()));
+        assert_eq!(
+            user.public_email,
+            Some("john.public@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_gitlab_group_deserialize() {
+        let json = r#"{
+            "id": 789,
+            "name": "My Group",
+            "full_path": "parent/my-group",
+            "description": "A test group",
+            "visibility": "internal"
+        }"#;
+
+        let group: GitLabGroup = serde_json::from_str(json).unwrap();
+        assert_eq!(group.id, 789);
+        assert_eq!(group.name, "My Group");
+        assert_eq!(group.full_path, "parent/my-group");
+        assert_eq!(group.description, Some("A test group".to_string()));
+        assert_eq!(group.visibility, "internal");
+    }
+
+    #[test]
+    fn test_gitlab_group_deserialize_minimal() {
+        let json = r#"{
+            "id": 789,
+            "name": "My Group",
+            "full_path": "my-group",
+            "visibility": "public"
+        }"#;
+
+        let group: GitLabGroup = serde_json::from_str(json).unwrap();
+        assert_eq!(group.id, 789);
+        assert!(group.description.is_none());
+    }
+
+    #[test]
+    fn test_forked_from_deserialize() {
+        let json = r#"{"id": 999}"#;
+
+        let forked: ForkedFrom = serde_json::from_str(json).unwrap();
+        assert_eq!(forked.id, 999);
+    }
+
+    #[test]
+    fn test_gitlab_project_clone() {
+        let project = GitLabProject {
+            id: 1,
+            name: "test".to_string(),
+            path: "test".to_string(),
+            path_with_namespace: "group/test".to_string(),
+            description: None,
+            default_branch: None,
+            visibility: "public".to_string(),
+            archived: false,
+            topics: vec![],
+            star_count: 0,
+            forks_count: 0,
+            open_issues_count: None,
+            created_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            namespace: GitLabNamespace {
+                id: 1,
+                name: "group".to_string(),
+                path: "group".to_string(),
+                full_path: "group".to_string(),
+                kind: "group".to_string(),
+            },
+            forked_from_project: None,
+            mirror: None,
+            issues_enabled: None,
+            wiki_enabled: None,
+            merge_requests_enabled: None,
+            web_url: "https://gitlab.com/group/test".to_string(),
+            ssh_url_to_repo: None,
+            http_url_to_repo: None,
+        };
+
+        let cloned = project.clone();
+        assert_eq!(cloned.id, project.id);
+        assert_eq!(cloned.name, project.name);
+    }
+
+    #[test]
+    fn test_gitlab_project_debug() {
+        let project = GitLabProject {
+            id: 1,
+            name: "test".to_string(),
+            path: "test".to_string(),
+            path_with_namespace: "group/test".to_string(),
+            description: None,
+            default_branch: None,
+            visibility: "public".to_string(),
+            archived: false,
+            topics: vec![],
+            star_count: 0,
+            forks_count: 0,
+            open_issues_count: None,
+            created_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            namespace: GitLabNamespace {
+                id: 1,
+                name: "group".to_string(),
+                path: "group".to_string(),
+                full_path: "group".to_string(),
+                kind: "group".to_string(),
+            },
+            forked_from_project: None,
+            mirror: None,
+            issues_enabled: None,
+            wiki_enabled: None,
+            merge_requests_enabled: None,
+            web_url: "https://gitlab.com/group/test".to_string(),
+            ssh_url_to_repo: None,
+            http_url_to_repo: None,
+        };
+
+        let debug_str = format!("{:?}", project);
+        assert!(debug_str.contains("GitLabProject"));
+        assert!(debug_str.contains("test"));
+    }
+}

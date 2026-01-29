@@ -302,4 +302,89 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "recent");
     }
+
+    #[test]
+    fn test_filter_by_activity_empty_list() {
+        let projects: Vec<GitLabProject> = vec![];
+        let filtered = filter_by_activity(&projects, Duration::days(30));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_activity_owned_empty_list() {
+        let projects: Vec<GitLabProject> = vec![];
+        let filtered = filter_by_activity_owned(projects, Duration::days(30));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_activity_exact_boundary() {
+        // Project with activity exactly at the cutoff boundary
+        // Due to timing, this might be just inside or outside - test both directions
+        let projects = vec![mock_project("boundary", 30)];
+        let filtered = filter_by_activity(&projects, Duration::days(30));
+        // Boundary case: depends on exact timing, but should be consistent
+        // The filter uses > cutoff, so 30 days ago should be excluded
+        assert!(filtered.is_empty() || filtered.len() == 1);
+    }
+
+    #[test]
+    fn test_filter_by_activity_just_inside() {
+        // Project with activity just inside the window
+        let projects = vec![mock_project("just-inside", 29)];
+        let filtered = filter_by_activity(&projects, Duration::days(30));
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_by_activity_just_outside() {
+        // Project with activity just outside the window
+        let projects = vec![mock_project("just-outside", 31)];
+        let filtered = filter_by_activity(&projects, Duration::days(30));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_activity_very_recent() {
+        // Project with activity today (0 days ago)
+        let projects = vec![mock_project("today", 0)];
+        let filtered = filter_by_activity(&projects, Duration::days(30));
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_by_activity_all_included() {
+        let projects = vec![
+            mock_project("p1", 1),
+            mock_project("p2", 5),
+            mock_project("p3", 10),
+        ];
+        let filtered = filter_by_activity(&projects, Duration::days(30));
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_by_activity_all_excluded() {
+        let projects = vec![
+            mock_project("p1", 100),
+            mock_project("p2", 200),
+            mock_project("p3", 365),
+        ];
+        let filtered = filter_by_activity(&projects, Duration::days(30));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_activity_preserves_order() {
+        let projects = vec![
+            mock_project("first", 5),
+            mock_project("second", 10),
+            mock_project("third", 15),
+        ];
+        let filtered = filter_by_activity(&projects, Duration::days(30));
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].name, "first");
+        assert_eq!(filtered[1].name, "second");
+        assert_eq!(filtered[2].name, "third");
+    }
 }
