@@ -630,4 +630,415 @@ mod tests {
         assert!(!encoded.contains('/'));
         assert!(!encoded.contains('='));
     }
+
+    // ========== Additional PKCE Tests ==========
+
+    #[test]
+    fn test_pkce_verifier_charset() {
+        // RFC 7636: code_verifier must be [A-Z] / [a-z] / [0-9] / "-" / "." / "_" / "~"
+        // Base64url uses [A-Za-z0-9_-] which is a subset of the allowed charset
+        let pkce = PkceVerifier::new();
+        for c in pkce.verifier().chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '_' || c == '-',
+                "Invalid character in verifier: {:?}",
+                c
+            );
+        }
+        for c in pkce.challenge().chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '_' || c == '-',
+                "Invalid character in challenge: {:?}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn test_pkce_challenge_sha256_correctness() {
+        // Test that challenge is correctly derived from verifier via SHA256
+        // We can verify by manually computing: SHA256(verifier) -> base64url
+        use sha2::{Digest, Sha256};
+
+        let pkce = PkceVerifier::new();
+
+        // Recompute the challenge manually
+        let mut hasher = Sha256::new();
+        hasher.update(pkce.verifier().as_bytes());
+        let hash = hasher.finalize();
+        let expected_challenge = base64_url_encode(&hash);
+
+        assert_eq!(pkce.challenge(), expected_challenge);
+    }
+
+    #[test]
+    fn test_pkce_known_vector() {
+        // RFC 7636 Appendix B test vector (conceptually)
+        // Verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        // Challenge: E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+        // We can't directly test our PkceVerifier with a fixed verifier,
+        // but we can verify the base64url encoding and SHA256 are correct.
+
+        // Test known SHA256 -> base64url encoding
+        let input = "test_verifier_string";
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(input.as_bytes());
+        let hash = hasher.finalize();
+        let encoded = base64_url_encode(&hash);
+
+        // SHA256("test_verifier_string") = known hash
+        // Just verify it's the right length and charset
+        assert_eq!(encoded.len(), 43); // SHA256 = 32 bytes -> 43 base64url chars
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
+    }
+
+    #[test]
+    fn test_pkce_default() {
+        let pkce = PkceVerifier::default();
+        assert_eq!(pkce.verifier().len(), 43);
+        assert_eq!(pkce.challenge().len(), 43);
+    }
+
+    // ========== State Generation Tests ==========
+
+    #[test]
+    fn test_generate_state_charset() {
+        // State should only contain base64url safe characters
+        for _ in 0..10 {
+            let state = generate_state();
+            for c in state.chars() {
+                assert!(
+                    c.is_ascii_alphanumeric() || c == '_' || c == '-',
+                    "Invalid character in state: {:?}",
+                    c
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_state_entropy() {
+        // Generate 100 states and ensure no collisions (probabilistically)
+        let states: std::collections::HashSet<String> =
+            (0..100).map(|_| generate_state()).collect();
+        assert_eq!(
+            states.len(),
+            100,
+            "State collision detected - insufficient entropy"
+        );
+    }
+
+    // ========== Auth URL Tests ==========
+
+    #[test]
+    fn test_build_auth_url_special_chars_in_scope() {
+        let auth = GiteaAuth::new("https://git.example.com", "client_id")
+            .with_scope("read:user write:repository");
+        let pkce = PkceVerifier::new();
+        let state = "test_state";
+        let redirect = "http://127.0.0.1:18484/callback";
+
+        let url = build_auth_url(&auth, &pkce, state, redirect);
+
+        // Colons and spaces should be URL-encoded
+        assert!(url.contains("scope=read%3Auser%20write%3Arepository"));
+    }
+
+    #[test]
+    fn test_build_auth_url_all_parameters_present() {
+        let auth = CodebergAuth::new();
+        let pkce = PkceVerifier::new();
+        let state = generate_state();
+        let redirect = "http://127.0.0.1:18484/callback";
+
+        let url = build_auth_url(&auth, &pkce, &state, redirect);
+
+        // Verify all required OAuth parameters are present
+        assert!(url.contains("client_id="));
+        assert!(url.contains("redirect_uri="));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("code_challenge="));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state="));
+        assert!(url.contains("scope="));
+    }
+
+    #[test]
+    fn test_build_auth_url_codeberg() {
+        let auth = CodebergAuth::new();
+        let pkce = PkceVerifier::new();
+        let state = "csrf_token";
+        let redirect = "http://127.0.0.1:18484/callback";
+
+        let url = build_auth_url(&auth, &pkce, state, redirect);
+
+        assert!(url.starts_with("https://codeberg.org/login/oauth/authorize?"));
+        assert!(url.contains(&format!("client_id={}", CODEBERG_CLIENT_ID)));
+    }
+
+    // ========== TokenErrorResponse Tests ==========
+
+    #[test]
+    fn test_token_error_response_full() {
+        let json = r#"{
+            "error": "invalid_grant",
+            "error_description": "The authorization code has expired"
+        }"#;
+
+        let err: TokenErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(err.error, "invalid_grant");
+        assert_eq!(
+            err.error_description,
+            Some("The authorization code has expired".into())
+        );
+    }
+
+    #[test]
+    fn test_token_error_response_minimal() {
+        let json = r#"{"error": "access_denied"}"#;
+
+        let err: TokenErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(err.error, "access_denied");
+        assert_eq!(err.error_description, None);
+    }
+
+    #[test]
+    fn test_token_error_response_various_errors() {
+        // Test common OAuth error codes
+        let errors = [
+            "invalid_request",
+            "unauthorized_client",
+            "access_denied",
+            "unsupported_response_type",
+            "invalid_scope",
+            "server_error",
+            "temporarily_unavailable",
+        ];
+
+        for error in errors {
+            let json = format!(r#"{{"error": "{}"}}"#, error);
+            let parsed: TokenErrorResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.error, error);
+        }
+    }
+
+    // ========== AccessTokenResponse Tests ==========
+
+    #[test]
+    fn test_access_token_response_serialize_roundtrip() {
+        let original = AccessTokenResponse {
+            access_token: "test_token_123".into(),
+            token_type: "Bearer".into(),
+            expires_in: Some(3600),
+            refresh_token: Some("refresh_456".into()),
+            scope: Some("read:user".into()),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: AccessTokenResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.access_token, original.access_token);
+        assert_eq!(parsed.token_type, original.token_type);
+        assert_eq!(parsed.expires_in, original.expires_in);
+        assert_eq!(parsed.refresh_token, original.refresh_token);
+        assert_eq!(parsed.scope, original.scope);
+    }
+
+    #[test]
+    fn test_access_token_response_clone() {
+        let original = AccessTokenResponse {
+            access_token: "token".into(),
+            token_type: "Bearer".into(),
+            expires_in: Some(7200),
+            refresh_token: None,
+            scope: None,
+        };
+
+        let cloned = original.clone();
+        assert_eq!(cloned.access_token, original.access_token);
+        assert_eq!(cloned.expires_in, original.expires_in);
+    }
+
+    #[test]
+    fn test_access_token_response_debug() {
+        let token = AccessTokenResponse {
+            access_token: "secret".into(),
+            token_type: "Bearer".into(),
+            expires_in: None,
+            refresh_token: None,
+            scope: None,
+        };
+
+        let debug_str = format!("{:?}", token);
+        assert!(debug_str.contains("AccessTokenResponse"));
+        assert!(debug_str.contains("secret")); // Debug shows the token (be careful in production logs!)
+    }
+
+    // ========== GiteaAuth Tests ==========
+
+    #[test]
+    fn test_gitea_auth_clone() {
+        let auth = GiteaAuth::new("https://git.example.com", "client_123").with_scope("read:user");
+        let cloned = auth.clone();
+
+        assert_eq!(cloned.base_url(), auth.base_url());
+        assert_eq!(cloned.client_id(), auth.client_id());
+        assert_eq!(cloned.scope(), auth.scope());
+    }
+
+    #[test]
+    fn test_gitea_auth_debug() {
+        let auth = GiteaAuth::new("https://git.example.com", "client_id");
+        let debug_str = format!("{:?}", auth);
+        assert!(debug_str.contains("GiteaAuth"));
+        assert!(debug_str.contains("git.example.com"));
+    }
+
+    #[test]
+    fn test_gitea_auth_various_hosts() {
+        // Test with various host formats
+        let cases = [
+            ("git.example.com", "https://git.example.com"),
+            ("https://git.example.com", "https://git.example.com"),
+            ("http://localhost:3000", "http://localhost:3000"),
+            ("192.168.1.1:3000", "https://192.168.1.1:3000"),
+        ];
+
+        for (input, expected) in cases {
+            let auth = GiteaAuth::new(input, "client");
+            assert_eq!(auth.base_url(), expected, "Failed for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_gitea_auth_error() {
+        let auth = GiteaAuth::new("https://git.example.com", "client");
+        let error = auth.error("test error message");
+        let error_str = format!("{}", error);
+        assert!(error_str.contains("test error message"));
+    }
+
+    // ========== CodebergAuth Tests ==========
+
+    #[test]
+    fn test_codeberg_auth_clone() {
+        let auth = CodebergAuth::new();
+        let cloned = auth.clone();
+        assert_eq!(cloned.base_url(), auth.base_url());
+        assert_eq!(cloned.client_id(), auth.client_id());
+    }
+
+    #[test]
+    fn test_codeberg_auth_debug() {
+        let auth = CodebergAuth::new();
+        let debug_str = format!("{:?}", auth);
+        assert!(debug_str.contains("CodebergAuth"));
+    }
+
+    #[test]
+    fn test_codeberg_auth_default() {
+        // Use Default trait explicitly via function syntax to test the impl
+        let auth = <CodebergAuth as Default>::default();
+        assert_eq!(auth.base_url(), CODEBERG_HOST);
+        assert_eq!(auth.client_id(), CODEBERG_CLIENT_ID);
+    }
+
+    #[test]
+    fn test_codeberg_auth_error() {
+        let auth = CodebergAuth::new();
+        let error = auth.error("codeberg-specific error");
+        let error_str = format!("{}", error);
+        assert!(error_str.contains("codeberg-specific error"));
+    }
+
+    #[test]
+    fn test_codeberg_auth_scope() {
+        let auth = CodebergAuth::new();
+        assert_eq!(auth.scope(), DEFAULT_SCOPE);
+    }
+
+    // ========== PkceVerifier Tests ==========
+
+    #[test]
+    fn test_pkce_verifier_clone() {
+        let pkce = PkceVerifier::new();
+        let cloned = pkce.clone();
+        assert_eq!(cloned.verifier(), pkce.verifier());
+        assert_eq!(cloned.challenge(), pkce.challenge());
+    }
+
+    #[test]
+    fn test_pkce_verifier_debug() {
+        let pkce = PkceVerifier::new();
+        let debug_str = format!("{:?}", pkce);
+        assert!(debug_str.contains("PkceVerifier"));
+        assert!(debug_str.contains("verifier"));
+        assert!(debug_str.contains("challenge"));
+    }
+
+    // ========== token_expires_at Tests ==========
+
+    #[test]
+    fn test_token_expires_at_zero() {
+        let token = AccessTokenResponse {
+            access_token: "t".into(),
+            token_type: "Bearer".into(),
+            expires_in: Some(0),
+            refresh_token: None,
+            scope: None,
+        };
+
+        let expires_at = token_expires_at(&token);
+        assert!(expires_at.is_some());
+
+        // Should be approximately now
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let diff = if expires_at.unwrap() >= now {
+            expires_at.unwrap() - now
+        } else {
+            now - expires_at.unwrap()
+        };
+        assert!(diff <= 1, "Expected timestamp near now");
+    }
+
+    #[test]
+    fn test_token_expires_at_large_value() {
+        let token = AccessTokenResponse {
+            access_token: "t".into(),
+            token_type: "Bearer".into(),
+            expires_in: Some(31536000), // 1 year in seconds
+            refresh_token: None,
+            scope: None,
+        };
+
+        let expires_at = token_expires_at(&token);
+        assert!(expires_at.is_some());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let diff = expires_at.unwrap() - now;
+        // Should be approximately 1 year
+        assert!((31535999..=31536001).contains(&diff));
+    }
+
+    // ========== Constants Tests ==========
+
+    #[test]
+    fn test_constants() {
+        assert!(!CODEBERG_CLIENT_ID.is_empty());
+        assert!(CODEBERG_HOST.starts_with("https://"));
+        assert!(!DEFAULT_SCOPE.is_empty());
+        assert!(DEFAULT_SCOPE.contains("read:user"));
+    }
 }
