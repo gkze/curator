@@ -43,7 +43,7 @@ config = { version = "0.15", default-features = false, features = ["toml"] }
 directories = "6"
 open = "5.3"
 arboard = "3.4"
-toml_edit = "0.22"
+toml_edit = "0.23"
 uuid = { version = "1", features = ["v4"] }
 
 [lints]
