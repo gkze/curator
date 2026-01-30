@@ -15,8 +15,9 @@ pub use bulk::{
 };
 pub use errors::{RepositoryError, Result};
 pub use query::{
-    PaginatedResult, Pagination, count, count_by_instance, find_all, find_all_by_instance,
-    find_all_by_instance_and_owner, find_by_instance, find_by_owner, find_stale,
+    PaginatedResult, Pagination, RepoSyncInfo, count, count_by_instance, find_all,
+    find_all_by_instance, find_all_by_instance_and_owner, find_by_instance, find_by_owner,
+    find_stale, get_sync_info_by_instance_and_owner,
 };
 pub use single::{
     delete, find_by_id, find_by_natural_key, find_by_platform_id, insert, update, upsert,

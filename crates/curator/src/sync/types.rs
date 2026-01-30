@@ -5,6 +5,25 @@
 
 use chrono::Duration;
 
+/// Strategy for syncing repositories.
+///
+/// This determines how the sync engine fetches repository data from the platform.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SyncStrategy {
+    /// Full sync: Fetch all repositories from the platform, regardless of
+    /// whether they've changed since the last sync. This is the default
+    /// and most thorough approach.
+    #[default]
+    Full,
+
+    /// Incremental sync: Only fetch repositories that have been updated
+    /// on the platform since the last sync. This is faster but requires
+    /// existing sync data in the database to compare against.
+    ///
+    /// When no existing data is found, falls back to Full sync behavior.
+    Incremental,
+}
+
 /// Default number of concurrent API requests for fetching.
 pub const DEFAULT_CONCURRENCY: usize = 20;
 
@@ -71,6 +90,8 @@ pub struct SyncOptions {
     pub platform_options: PlatformOptions,
     /// Whether to prune (unstar) inactive repositories during starred sync.
     pub prune: bool,
+    /// Sync strategy: Full or Incremental.
+    pub strategy: SyncStrategy,
 }
 
 impl Default for SyncOptions {
@@ -82,6 +103,7 @@ impl Default for SyncOptions {
             concurrency: DEFAULT_CONCURRENCY,
             platform_options: PlatformOptions::default(),
             prune: true, // Default to pruning inactive starred repos
+            strategy: SyncStrategy::default(),
         }
     }
 }
@@ -150,6 +172,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_sync_strategy_default() {
+        let strategy = SyncStrategy::default();
+        assert_eq!(strategy, SyncStrategy::Full);
+    }
+
+    #[test]
     fn test_sync_options_default() {
         let options = SyncOptions::default();
 
@@ -158,6 +186,7 @@ mod tests {
         assert!(!options.dry_run);
         assert_eq!(options.concurrency, DEFAULT_CONCURRENCY);
         assert!(!options.platform_options.include_subgroups);
+        assert_eq!(options.strategy, SyncStrategy::Full);
     }
 
     #[test]

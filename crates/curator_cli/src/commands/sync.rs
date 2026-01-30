@@ -11,7 +11,7 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
 use curator::{
     Instance, InstanceColumn, InstanceModel, PlatformType, db, rate_limits,
-    sync::{PlatformOptions, SyncOptions},
+    sync::{PlatformOptions, SyncOptions, SyncStrategy},
 };
 
 use crate::CommonSyncOptions;
@@ -160,6 +160,12 @@ async fn sync_org(
 
     let db = Arc::new(db_conn);
 
+    let strategy = if sync_opts.incremental {
+        SyncStrategy::Incremental
+    } else {
+        SyncStrategy::Full
+    };
+
     let options = SyncOptions {
         active_within: chrono::Duration::days(active_within_days as i64),
         star,
@@ -169,6 +175,7 @@ async fn sync_org(
             include_subgroups: !no_subgroups,
         },
         prune: false,
+        strategy,
     };
 
     let runner = SyncRunner::new(
@@ -271,6 +278,12 @@ async fn sync_user(
 
     let db = Arc::new(db_conn);
 
+    let strategy = if sync_opts.incremental {
+        SyncStrategy::Incremental
+    } else {
+        SyncStrategy::Full
+    };
+
     let options = SyncOptions {
         active_within: chrono::Duration::days(active_within_days as i64),
         star,
@@ -278,6 +291,7 @@ async fn sync_user(
         concurrency,
         platform_options: PlatformOptions::default(),
         prune: false,
+        strategy,
     };
 
     let runner = SyncRunner::new(
@@ -381,6 +395,7 @@ async fn sync_stars(
         concurrency,
         platform_options: PlatformOptions::default(),
         prune,
+        strategy: SyncStrategy::Full, // Starred sync always does full fetch
     };
 
     let runner = SyncRunner::new(

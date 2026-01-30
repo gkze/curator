@@ -777,39 +777,40 @@ async fn get_codeberg_token_with_refresh(
     let expires_at = config.codeberg_token_expires_at();
 
     // If we have a refresh token and the access token is expired/near expiry, try to refresh
-    if let Some(ref rt) = refresh_token {
-        if token_is_expired(expires_at, TOKEN_REFRESH_BUFFER_SECS) {
-            tracing::info!("Codeberg token expired or near expiry, attempting refresh...");
+    if let Some(ref rt) = refresh_token
+        && token_is_expired(expires_at, TOKEN_REFRESH_BUFFER_SECS)
+    {
+        tracing::info!("Codeberg token expired or near expiry, attempting refresh...");
 
-            match refresh_access_token(&CodebergAuth::new(), rt).await {
-                Ok(new_tokens) => {
-                    // Calculate new expiry
-                    let new_expires_at = token_expires_at(&new_tokens);
+        match refresh_access_token(&CodebergAuth::new(), rt).await {
+            Ok(new_tokens) => {
+                // Calculate new expiry
+                let new_expires_at = token_expires_at(&new_tokens);
 
-                    // Save the new tokens
-                    Config::save_codeberg_oauth_tokens(
-                        &new_tokens.access_token,
-                        new_tokens.refresh_token.as_deref(),
-                        new_expires_at,
-                    )?;
+                // Save the new tokens
+                Config::save_codeberg_oauth_tokens(
+                    &new_tokens.access_token,
+                    new_tokens.refresh_token.as_deref(),
+                    new_expires_at,
+                )?;
 
-                    tracing::info!("Successfully refreshed Codeberg token");
-                    return Ok(new_tokens.access_token);
-                }
-                Err(e) => {
-                    // If refresh fails and we have a current token, warn but try to use it
-                    // (it might still work if the expiry check was overly aggressive)
-                    if current_token.is_some() {
-                        tracing::warn!(
-                            "Failed to refresh Codeberg token: {}. Trying existing token...",
-                            e
-                        );
-                    } else {
-                        return Err(format!(
-                            "Codeberg token expired and refresh failed: {}. Run 'curator login codeberg' to re-authenticate.",
-                            e
-                        ).into());
-                    }
+                tracing::info!("Successfully refreshed Codeberg token");
+                return Ok(new_tokens.access_token);
+            }
+            Err(e) => {
+                // If refresh fails and we have a current token, warn but try to use it
+                // (it might still work if the expiry check was overly aggressive)
+                if current_token.is_some() {
+                    tracing::warn!(
+                        "Failed to refresh Codeberg token: {}. Trying existing token...",
+                        e
+                    );
+                } else {
+                    return Err(format!(
+                        "Codeberg token expired and refresh failed: {}. Run 'curator login codeberg' to re-authenticate.",
+                        e
+                    )
+                    .into());
                 }
             }
         }

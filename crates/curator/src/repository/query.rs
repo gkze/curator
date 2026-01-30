@@ -1,12 +1,31 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 use uuid::Uuid;
 
 use crate::entity::code_repository::{Column, Entity as CodeRepository, Model};
 
 use super::errors::{RepositoryError, Result};
+
+/// Information about a repository's sync state used for incremental sync.
+///
+/// This struct contains the minimum data needed to determine if a repository
+/// needs to be re-fetched during an incremental sync operation.
+#[derive(Debug, Clone)]
+pub struct RepoSyncInfo {
+    /// The platform-specific numeric ID of the repository.
+    pub platform_id: i64,
+    /// Repository name.
+    pub name: String,
+    /// When the repository was last updated on the platform.
+    pub updated_at: Option<DateTime<Utc>>,
+    /// When code was last pushed (GitHub-specific, may be None for other platforms).
+    pub pushed_at: Option<DateTime<Utc>>,
+    /// When this record was last synced from the platform.
+    pub synced_at: DateTime<Utc>,
+}
 
 /// Pagination parameters for list queries.
 #[derive(Debug, Clone, Default)]
@@ -182,4 +201,52 @@ pub async fn find_all_by_instance_and_owner(
         .all(db)
         .await
         .map_err(RepositoryError::from)
+}
+
+/// Get sync information for all repositories in a given instance and owner.
+///
+/// This returns a lightweight projection of repository data needed for
+/// incremental sync decisions. Each `RepoSyncInfo` contains the platform ID,
+/// name, last update timestamps, and last sync time.
+///
+/// Used by the sync engine to determine which repositories need refreshing
+/// based on comparing platform `updated_at`/`pushed_at` with stored `synced_at`.
+pub async fn get_sync_info_by_instance_and_owner(
+    db: &DatabaseConnection,
+    instance_id: Uuid,
+    owner: &str,
+) -> Result<Vec<RepoSyncInfo>> {
+    // Select only the columns we need for incremental sync decisions
+    let results = CodeRepository::find()
+        .filter(Column::InstanceId.eq(instance_id))
+        .filter(Column::Owner.eq(owner))
+        .select_only()
+        .column(Column::PlatformId)
+        .column(Column::Name)
+        .column(Column::UpdatedAt)
+        .column(Column::PushedAt)
+        .column(Column::SyncedAt)
+        .into_tuple::<(
+            i64,
+            String,
+            Option<chrono::DateTime<chrono::FixedOffset>>,
+            Option<chrono::DateTime<chrono::FixedOffset>>,
+            chrono::DateTime<chrono::FixedOffset>,
+        )>()
+        .all(db)
+        .await
+        .map_err(RepositoryError::from)?;
+
+    Ok(results
+        .into_iter()
+        .map(
+            |(platform_id, name, updated_at, pushed_at, synced_at)| RepoSyncInfo {
+                platform_id,
+                name,
+                updated_at: updated_at.map(|dt| dt.with_timezone(&Utc)),
+                pushed_at: pushed_at.map(|dt| dt.with_timezone(&Utc)),
+                synced_at: synced_at.with_timezone(&Utc),
+            },
+        )
+        .collect())
 }

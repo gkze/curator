@@ -31,7 +31,7 @@ mod filter;
 mod persist;
 mod star;
 
-pub use filter::filter_by_activity;
+pub use filter::{filter_by_activity, filter_for_incremental_sync};
 
 use std::sync::Arc;
 
@@ -1249,6 +1249,8 @@ mod tests {
 
     #[test]
     fn test_sync_options_custom() {
+        use super::super::types::SyncStrategy;
+
         let options = SyncOptions {
             active_within: Duration::days(90),
             star: false,
@@ -1258,6 +1260,7 @@ mod tests {
                 include_subgroups: true,
             },
             prune: false,
+            strategy: SyncStrategy::Incremental,
         };
 
         assert_eq!(options.active_within, Duration::days(90));
@@ -1266,6 +1269,7 @@ mod tests {
         assert_eq!(options.concurrency, 5);
         assert!(options.platform_options.include_subgroups);
         assert!(!options.prune);
+        assert_eq!(options.strategy, SyncStrategy::Incremental);
     }
 
     #[tokio::test]
