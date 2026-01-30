@@ -48,6 +48,9 @@ async fn setup_test_db() -> DatabaseConnection {
 
 /// Create test instances in the database.
 /// This is required because code_repository has a foreign key to instances.
+///
+/// Note: Uses unique test hosts (not github.com/gitlab.com) to avoid conflicts
+/// with the well-known instances seeded by migrations.
 async fn create_test_instances(db: &DatabaseConnection) {
     let now = Utc::now();
 
@@ -55,7 +58,7 @@ async fn create_test_instances(db: &DatabaseConnection) {
         id: Set(test_instance_id()),
         name: Set("test-github".to_string()),
         platform_type: Set(PlatformType::GitHub),
-        host: Set("github.com".to_string()),
+        host: Set("test-github.example.com".to_string()),
         created_at: Set(now.fixed_offset()),
     };
 
@@ -63,7 +66,7 @@ async fn create_test_instances(db: &DatabaseConnection) {
         id: Set(test_instance_id_2()),
         name: Set("test-gitlab".to_string()),
         platform_type: Set(PlatformType::GitLab),
-        host: Set("gitlab.com".to_string()),
+        host: Set("test-gitlab.example.com".to_string()),
         created_at: Set(now.fixed_offset()),
     };
 

@@ -43,6 +43,9 @@ fn test_instance_id() -> Uuid {
 }
 
 /// Create an in-memory SQLite database with migrations applied and a test instance.
+///
+/// Note: Uses unique test host (not github.com) to avoid conflicts
+/// with the well-known instances seeded by migrations.
 async fn setup_test_db() -> sea_orm::DatabaseConnection {
     let db = connect_and_migrate("sqlite::memory:")
         .await
@@ -54,7 +57,7 @@ async fn setup_test_db() -> sea_orm::DatabaseConnection {
         id: Set(test_instance_id()),
         name: Set("test-github".to_string()),
         platform_type: Set(PlatformType::GitHub),
-        host: Set("github.com".to_string()),
+        host: Set("test-github.example.com".to_string()),
         created_at: Set(now.fixed_offset()),
     };
 
