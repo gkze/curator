@@ -161,6 +161,72 @@ where
     results
 }
 
+/// Spawn concurrent streaming sync tasks for items (namespaces or usernames).
+///
+/// This is the streaming variant of `spawn_concurrent_sync`. The key difference is that
+/// it accepts a `model_tx` sender that is cloned for each task and dropped after all
+/// tasks are spawned to signal completion to receivers.
+///
+/// # Arguments
+///
+/// * `items` - List of items (namespace names or usernames) to sync
+/// * `concurrency` - Base concurrency level (divided by 4 for namespace-level concurrency)
+/// * `model_tx` - Channel sender for streaming model persistence (dropped after spawning)
+/// * `make_task` - Factory function that creates the sync task for each item
+/// * `on_progress` - Optional progress callback
+async fn spawn_concurrent_sync_streaming<F, Fut>(
+    items: &[String],
+    concurrency: usize,
+    model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
+    make_task: F,
+    on_progress: Option<&ProgressCallback>,
+) -> Vec<NamespaceSyncResultStreaming>
+where
+    F: Fn(String, Arc<Semaphore>, mpsc::Sender<CodeRepositoryActiveModel>) -> Fut,
+    Fut: Future<Output = NamespaceSyncResultStreaming> + Send + 'static,
+{
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    emit(
+        on_progress,
+        SyncProgress::SyncingNamespaces { count: items.len() },
+    );
+
+    let ns_concurrency = std::cmp::max(1, concurrency / 4);
+    let semaphore = Arc::new(Semaphore::new(ns_concurrency));
+
+    let handles: Vec<_> = items
+        .iter()
+        .map(|item| {
+            let task = make_task(item.clone(), Arc::clone(&semaphore), model_tx.clone());
+            tokio::spawn(task)
+        })
+        .collect();
+
+    // Drop our copy of the sender so receivers know when all senders are done
+    drop(model_tx);
+
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        results.push(
+            handle
+                .await
+                .unwrap_or_else(|e| NamespaceSyncResultStreaming::panic_error(e.to_string())),
+        );
+    }
+
+    let successful = results.iter().filter(|r| !r.is_error()).count();
+    let failed = results.iter().filter(|r| r.is_error()).count();
+    emit(
+        on_progress,
+        SyncProgress::SyncNamespacesComplete { successful, failed },
+    );
+
+    results
+}
+
 async fn sync_repos<C: PlatformClient + Clone + 'static>(
     client: &C,
     namespace: &str,
@@ -447,33 +513,21 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Vec<NamespaceSyncResultStreaming> {
-    if namespaces.is_empty() {
-        return Vec::new();
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::SyncingNamespaces {
-            count: namespaces.len(),
-        },
-    );
-
-    let ns_concurrency = std::cmp::max(1, options.concurrency / 4);
-    let semaphore = Arc::new(Semaphore::new(ns_concurrency));
+    let client = client.clone();
+    let options = options.clone();
     let limiter = rate_limiter.cloned();
 
-    let handles: Vec<_> = namespaces
-        .iter()
-        .map(|namespace| {
-            let namespace = namespace.clone();
+    spawn_concurrent_sync_streaming(
+        namespaces,
+        options.concurrency,
+        model_tx,
+        move |namespace, semaphore, tx| {
             let client = client.clone();
             let options = options.clone();
-            let semaphore = Arc::clone(&semaphore);
-            let tx = model_tx.clone();
             let limiter = limiter.clone();
             let task_db = db.clone();
 
-            tokio::spawn(async move {
+            async move {
                 let _permit = match semaphore.acquire().await {
                     Ok(permit) => permit,
                     Err(_) => return NamespaceSyncResultStreaming::semaphore_error(namespace),
@@ -501,29 +555,11 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
                         error: Some(e.to_string()),
                     },
                 }
-            })
-        })
-        .collect();
-
-    // Drop our copy of the sender so receivers know when all senders are done
-    drop(model_tx);
-
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        match handle.await {
-            Ok(result) => results.push(result),
-            Err(e) => results.push(NamespaceSyncResultStreaming::panic_error(e.to_string())),
-        }
-    }
-
-    let successful = results.iter().filter(|r| !r.is_error()).count();
-    let failed = results.iter().filter(|r| r.is_error()).count();
-    emit(
+            }
+        },
         on_progress,
-        SyncProgress::SyncNamespacesComplete { successful, failed },
-    );
-
-    results
+    )
+    .await
 }
 
 /// Sync a user's repositories.
@@ -622,33 +658,21 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Vec<NamespaceSyncResultStreaming> {
-    if usernames.is_empty() {
-        return Vec::new();
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::SyncingNamespaces {
-            count: usernames.len(),
-        },
-    );
-
-    let ns_concurrency = std::cmp::max(1, options.concurrency / 4);
-    let semaphore = Arc::new(Semaphore::new(ns_concurrency));
+    let client = client.clone();
+    let options = options.clone();
     let limiter = rate_limiter.cloned();
 
-    let handles: Vec<_> = usernames
-        .iter()
-        .map(|username| {
-            let username = username.clone();
+    spawn_concurrent_sync_streaming(
+        usernames,
+        options.concurrency,
+        model_tx,
+        move |username, semaphore, tx| {
             let client = client.clone();
             let options = options.clone();
-            let semaphore = Arc::clone(&semaphore);
-            let tx = model_tx.clone();
             let limiter = limiter.clone();
             let task_db = db.clone();
 
-            tokio::spawn(async move {
+            async move {
                 let _permit = match semaphore.acquire().await {
                     Ok(permit) => permit,
                     Err(_) => return NamespaceSyncResultStreaming::semaphore_error(username),
@@ -676,29 +700,11 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
                         error: Some(e.to_string()),
                     },
                 }
-            })
-        })
-        .collect();
-
-    // Drop our copy of the sender so receivers know when all senders are done
-    drop(model_tx);
-
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        match handle.await {
-            Ok(result) => results.push(result),
-            Err(e) => results.push(NamespaceSyncResultStreaming::panic_error(e.to_string())),
-        }
-    }
-
-    let successful = results.iter().filter(|r| !r.is_error()).count();
-    let failed = results.iter().filter(|r| r.is_error()).count();
-    emit(
+            }
+        },
         on_progress,
-        SyncProgress::SyncNamespacesComplete { successful, failed },
-    );
-
-    results
+    )
+    .await
 }
 
 /// Sync the authenticated user's starred repositories.

@@ -138,43 +138,31 @@ async fn add_instance(
         return Err(format!("Instance '{}' already exists", name).into());
     }
 
-    // Determine the instance configuration
-    let (pt, h) = match name.to_lowercase().as_str() {
-        "github" => {
-            let wk = well_known::github();
-            (wk.platform_type, wk.host)
-        }
-        "gitlab" => {
-            let wk = well_known::gitlab();
-            (wk.platform_type, wk.host)
-        }
-        "codeberg" => {
-            let wk = well_known::codeberg();
-            (wk.platform_type, wk.host)
-        }
-        _ => {
-            // Custom instance - require platform_type and host
-            let pt = platform_type
-                .ok_or_else(|| {
-                    format!(
-                        "Platform type is required for custom instance '{}'. Use -t/--platform-type (github, gitlab, gitea)",
-                        name
-                    )
-                })?
-                .parse::<PlatformType>()
-                .map_err(|e| format!("Invalid platform type: {}", e))?;
+    // Determine the instance configuration - check well-known first
+    let (pt, h) = if let Some(wk) = well_known::by_name(name) {
+        (wk.platform_type, wk.host.to_string())
+    } else {
+        // Custom instance - require platform_type and host
+        let pt = platform_type
+            .ok_or_else(|| {
+                format!(
+                    "Platform type is required for custom instance '{}'. Use -t/--platform-type (github, gitlab, gitea)",
+                    name
+                )
+            })?
+            .parse::<PlatformType>()
+            .map_err(|e| format!("Invalid platform type: {}", e))?;
 
-            let h = host
-                .ok_or_else(|| {
-                    format!(
-                        "Host is required for custom instance '{}'. Use -H/--host (e.g., gitlab.mycompany.com)",
-                        name
-                    )
-                })?
-                .to_string();
+        let h = host
+            .ok_or_else(|| {
+                format!(
+                    "Host is required for custom instance '{}'. Use -H/--host (e.g., gitlab.mycompany.com)",
+                    name
+                )
+            })?
+            .to_string();
 
-            (pt, h)
-        }
+        (pt, h)
     };
 
     // Create the instance

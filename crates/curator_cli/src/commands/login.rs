@@ -71,27 +71,13 @@ async fn get_or_create_instance(
     }
 
     // Check if this is a well-known instance name we can auto-create
-    let (pt, host) = match name.to_lowercase().as_str() {
-        "github" => {
-            let wk = well_known::github();
-            (wk.platform_type, wk.host)
-        }
-        "gitlab" => {
-            let wk = well_known::gitlab();
-            (wk.platform_type, wk.host)
-        }
-        "codeberg" => {
-            let wk = well_known::codeberg();
-            (wk.platform_type, wk.host)
-        }
-        _ => {
-            return Err(format!(
-                "Instance '{}' not found. Add it first with: curator instance add {} -t <platform> -H <host>",
-                name, name
-            )
-            .into());
-        }
-    };
+    let wk = well_known::by_name(name).ok_or_else(|| {
+        format!(
+            "Instance '{}' not found. Add it first with: curator instance add {} -t <platform> -H <host>",
+            name, name
+        )
+    })?;
+    let (pt, host) = (wk.platform_type, wk.host.to_string());
 
     // Auto-create the well-known instance
     let instance = curator::entity::instance::ActiveModel {

@@ -117,43 +117,99 @@ impl Model {
     }
 }
 
-/// Well-known instance configurations.
+/// Well-known instance definitions - the single source of truth.
+///
+/// This module centralizes all well-known instance configurations to avoid
+/// duplication across the codebase.
 pub mod well_known {
     use super::*;
     use chrono::Utc;
     use uuid::Uuid;
 
+    /// Definition of a well-known instance (compile-time data).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WellKnownInstance {
+        /// Canonical name (e.g., "github", "gitlab", "codeberg")
+        pub name: &'static str,
+        /// Platform type
+        pub platform_type: PlatformType,
+        /// Host URL without protocol
+        pub host: &'static str,
+    }
+
+    impl WellKnownInstance {
+        /// Convert to a Model instance (with nil UUID, to be replaced on insert).
+        pub fn to_model(&self) -> Model {
+            Model {
+                id: Uuid::nil(),
+                name: self.name.to_string(),
+                platform_type: self.platform_type,
+                host: self.host.to_string(),
+                created_at: Utc::now().fixed_offset(),
+            }
+        }
+    }
+
+    /// All well-known instances - the canonical source of truth.
+    pub const INSTANCES: &[WellKnownInstance] = &[
+        WellKnownInstance {
+            name: "github",
+            platform_type: PlatformType::GitHub,
+            host: "github.com",
+        },
+        WellKnownInstance {
+            name: "gitlab",
+            platform_type: PlatformType::GitLab,
+            host: "gitlab.com",
+        },
+        WellKnownInstance {
+            name: "codeberg",
+            platform_type: PlatformType::Gitea,
+            host: "codeberg.org",
+        },
+    ];
+
+    /// Look up a well-known instance by name (case-insensitive).
+    pub fn by_name(name: &str) -> Option<&'static WellKnownInstance> {
+        let lower = name.to_lowercase();
+        INSTANCES.iter().find(|i| i.name == lower)
+    }
+
+    /// Look up a well-known instance by platform type and host.
+    pub fn by_platform_and_host(
+        platform_type: PlatformType,
+        host: &str,
+    ) -> Option<&'static WellKnownInstance> {
+        INSTANCES
+            .iter()
+            .find(|i| i.platform_type == platform_type && i.host == host)
+    }
+
+    /// Check if a name refers to a well-known instance.
+    pub fn is_well_known_name(name: &str) -> bool {
+        by_name(name).is_some()
+    }
+
+    /// Check if a platform/host combo is a well-known instance.
+    pub fn is_well_known(platform_type: PlatformType, host: &str) -> bool {
+        by_platform_and_host(platform_type, host).is_some()
+    }
+
+    // Convenience functions for backward compatibility
+
     /// Create a Model for github.com
     pub fn github() -> Model {
-        Model {
-            id: Uuid::nil(), // Will be replaced when inserted
-            name: "github".to_string(),
-            platform_type: PlatformType::GitHub,
-            host: "github.com".to_string(),
-            created_at: Utc::now().fixed_offset(),
-        }
+        by_name("github").unwrap().to_model()
     }
 
     /// Create a Model for gitlab.com
     pub fn gitlab() -> Model {
-        Model {
-            id: Uuid::nil(),
-            name: "gitlab".to_string(),
-            platform_type: PlatformType::GitLab,
-            host: "gitlab.com".to_string(),
-            created_at: Utc::now().fixed_offset(),
-        }
+        by_name("gitlab").unwrap().to_model()
     }
 
     /// Create a Model for codeberg.org
     pub fn codeberg() -> Model {
-        Model {
-            id: Uuid::nil(),
-            name: "codeberg".to_string(),
-            platform_type: PlatformType::Gitea,
-            host: "codeberg.org".to_string(),
-            created_at: Utc::now().fixed_offset(),
-        }
+        by_name("codeberg").unwrap().to_model()
     }
 }
 
@@ -227,5 +283,86 @@ mod tests {
 
         let codeberg = well_known::codeberg();
         assert!(codeberg.is_codeberg());
+    }
+
+    #[test]
+    fn test_well_known_by_name() {
+        // Case-insensitive lookup
+        assert!(well_known::by_name("github").is_some());
+        assert!(well_known::by_name("GitHub").is_some());
+        assert!(well_known::by_name("GITHUB").is_some());
+        assert!(well_known::by_name("gitlab").is_some());
+        assert!(well_known::by_name("codeberg").is_some());
+
+        // Unknown names return None
+        assert!(well_known::by_name("unknown").is_none());
+        assert!(well_known::by_name("gitea").is_none()); // gitea != codeberg
+    }
+
+    #[test]
+    fn test_well_known_by_platform_and_host() {
+        // Exact matches
+        assert!(well_known::by_platform_and_host(PlatformType::GitHub, "github.com").is_some());
+        assert!(well_known::by_platform_and_host(PlatformType::GitLab, "gitlab.com").is_some());
+        assert!(well_known::by_platform_and_host(PlatformType::Gitea, "codeberg.org").is_some());
+
+        // Wrong combos return None
+        assert!(well_known::by_platform_and_host(PlatformType::GitHub, "gitlab.com").is_none());
+        assert!(well_known::by_platform_and_host(PlatformType::GitLab, "github.com").is_none());
+        assert!(well_known::by_platform_and_host(PlatformType::Gitea, "gitea.io").is_none());
+    }
+
+    #[test]
+    fn test_well_known_is_well_known() {
+        assert!(well_known::is_well_known_name("github"));
+        assert!(well_known::is_well_known_name("gitlab"));
+        assert!(well_known::is_well_known_name("codeberg"));
+        assert!(!well_known::is_well_known_name("unknown"));
+
+        assert!(well_known::is_well_known(
+            PlatformType::GitHub,
+            "github.com"
+        ));
+        assert!(well_known::is_well_known(
+            PlatformType::GitLab,
+            "gitlab.com"
+        ));
+        assert!(well_known::is_well_known(
+            PlatformType::Gitea,
+            "codeberg.org"
+        ));
+        assert!(!well_known::is_well_known(
+            PlatformType::GitHub,
+            "ghe.company.com"
+        ));
+    }
+
+    #[test]
+    fn test_well_known_instance_to_model() {
+        let wk = well_known::by_name("github").unwrap();
+        let model = wk.to_model();
+
+        assert_eq!(model.name, "github");
+        assert_eq!(model.platform_type, PlatformType::GitHub);
+        assert_eq!(model.host, "github.com");
+        assert_eq!(model.id, Uuid::nil()); // Nil until inserted
+    }
+
+    #[test]
+    fn test_well_known_instances_constant() {
+        // Verify the INSTANCES constant has exactly 3 entries
+        assert_eq!(well_known::INSTANCES.len(), 3);
+
+        // Verify each has unique name and host
+        let names: Vec<_> = well_known::INSTANCES.iter().map(|i| i.name).collect();
+        let hosts: Vec<_> = well_known::INSTANCES.iter().map(|i| i.host).collect();
+
+        assert!(names.contains(&"github"));
+        assert!(names.contains(&"gitlab"));
+        assert!(names.contains(&"codeberg"));
+
+        assert!(hosts.contains(&"github.com"));
+        assert!(hosts.contains(&"gitlab.com"));
+        assert!(hosts.contains(&"codeberg.org"));
     }
 }

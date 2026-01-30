@@ -5,7 +5,7 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use uuid::Uuid;
 
-use crate::entity::instance::{self, ActiveModel, Entity, Model};
+use crate::entity::instance::{self, ActiveModel, Entity, Model, well_known};
 use crate::entity::platform_type::PlatformType;
 
 /// Error type for instance operations.
@@ -93,24 +93,17 @@ pub async fn get_or_create_well_known(
     platform_type: PlatformType,
     host: &str,
 ) -> Result<Model, InstanceError> {
-    // Check if this is a well-known instance
-    let canonical_name = match (platform_type, host) {
-        (PlatformType::GitHub, "github.com") => Some("github"),
-        (PlatformType::GitLab, "gitlab.com") => Some("gitlab"),
-        (PlatformType::Gitea, "codeberg.org") => Some("codeberg"),
-        _ => None,
-    };
-
-    // For well-known instances, try to find by name first
-    if let Some(name) = canonical_name {
-        if let Some(instance) = find_by_name(db, name).await? {
+    // Check if this is a well-known instance using the centralized lookup
+    if let Some(wk) = well_known::by_platform_and_host(platform_type, host) {
+        // For well-known instances, try to find by name first
+        if let Some(instance) = find_by_name(db, wk.name).await? {
             return Ok(instance);
         }
 
         // Create with canonical name
         let instance = ActiveModel {
             id: Set(Uuid::new_v4()),
-            name: Set(name.to_string()),
+            name: Set(wk.name.to_string()),
             platform_type: Set(platform_type),
             host: Set(host.to_string()),
             created_at: Set(chrono::Utc::now().fixed_offset()),
@@ -126,7 +119,12 @@ pub async fn get_or_create_well_known(
 
 /// Generate an instance name from the platform type and host.
 fn generate_instance_name(platform_type: PlatformType, host: &str) -> String {
-    // Remove common TLDs and simplify
+    // Check if this is a well-known instance - use canonical name
+    if let Some(wk) = well_known::by_platform_and_host(platform_type, host) {
+        return wk.name.to_string();
+    }
+
+    // Remove common TLDs and simplify for custom instances
     let simplified = host
         .trim_end_matches(".com")
         .trim_end_matches(".org")
@@ -134,13 +132,10 @@ fn generate_instance_name(platform_type: PlatformType, host: &str) -> String {
         .replace('.', "-");
 
     // Add platform prefix for non-canonical hosts
-    match (platform_type, host) {
-        (PlatformType::GitHub, "github.com") => "github".to_string(),
-        (PlatformType::GitLab, "gitlab.com") => "gitlab".to_string(),
-        (PlatformType::Gitea, "codeberg.org") => "codeberg".to_string(),
-        (PlatformType::GitHub, _) => format!("github-{}", simplified),
-        (PlatformType::GitLab, _) => format!("gitlab-{}", simplified),
-        (PlatformType::Gitea, _) => simplified,
+    match platform_type {
+        PlatformType::GitHub => format!("github-{}", simplified),
+        PlatformType::GitLab => format!("gitlab-{}", simplified),
+        PlatformType::Gitea => simplified,
     }
 }
 
