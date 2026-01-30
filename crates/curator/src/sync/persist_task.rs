@@ -3,6 +3,7 @@
 //! This module provides a background task that receives repository models via a channel
 //! and persists them in batches using bulk upserts. Key features:
 //!
+//! - **Immediate close detection**: Flushes remaining items immediately when channel closes
 //! - **Time-based flushing**: Flushes partial batches after a timeout to prevent deadlocks
 //! - **Automatic retry**: Retries transient database errors with exponential backoff
 //! - **Graceful shutdown**: Processes current batch and exits cleanly on shutdown signal
@@ -16,9 +17,11 @@
 //! API Fetch → Filter/Process → model_tx channel → Persist Task → Database
 //! ```
 //!
-//! The time-based flushing is critical for preventing deadlocks. Without it, the persist
-//! task would wait indefinitely for a full batch, blocking the channel and causing
-//! upstream tasks to block as well.
+//! The time-based flushing is critical for preventing deadlocks mid-stream. Without it,
+//! the persist task would wait indefinitely for a full batch, blocking the channel and
+//! causing upstream tasks to block as well. However, when the channel closes (all senders
+//! dropped), the task immediately flushes any remaining items without waiting for the
+//! timeout.
 //!
 //! # Example
 //!
@@ -43,7 +46,7 @@ use std::sync::{
 
 use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio::time::{Instant, interval_at};
 
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::repository;
@@ -51,13 +54,20 @@ use crate::repository;
 use super::progress::{ProgressCallback, SyncProgress};
 
 /// Batch size for bulk database upserts.
-/// Balances memory usage with database round-trip efficiency.
-pub const PERSIST_BATCH_SIZE: usize = 100;
+/// Larger batches reduce database round-trips but increase memory usage.
+/// With SQLite WAL mode, larger batches significantly improve throughput
+/// by reducing transaction overhead (each batch is its own transaction).
+///
+/// For 23K+ items, 500 items/batch = ~47 transactions vs 234 with 100 items/batch.
+pub const PERSIST_BATCH_SIZE: usize = 500;
 
-/// Maximum time to wait before flushing a partial batch.
+/// Maximum time to wait before flushing a partial batch during streaming.
 /// This prevents deadlocks when the upstream pipeline blocks waiting for channel capacity.
 /// A partial batch blocking for too long can cause backpressure that blocks the fetch task,
 /// which prevents channels from closing, which prevents the persist task from flushing.
+///
+/// Note: This timeout only applies mid-stream. When the channel closes (all senders dropped),
+/// remaining items are flushed immediately without waiting for this timeout.
 pub const PERSIST_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Maximum time to wait for the persist task to complete after all senders are dropped.
@@ -104,15 +114,108 @@ impl PersistTaskResult {
     }
 }
 
+/// Flush a batch of models to the database.
+///
+/// This helper handles the database write, progress reporting, and error accumulation.
+/// Returns the number of rows successfully persisted.
+async fn flush_batch(
+    db: &DatabaseConnection,
+    batch: Vec<CodeRepositoryActiveModel>,
+    is_final: bool,
+    result: &mut PersistTaskResult,
+    saved_count: &AtomicUsize,
+    on_progress: &Option<Arc<ProgressCallback>>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+
+    // Extract names for progress reporting before consuming the batch
+    let batch_names: Vec<(String, String)> = batch
+        .iter()
+        .map(|model| {
+            // SAFETY: ActiveModel always has owner/name set by to_active_model()
+            (model.owner.clone().unwrap(), model.name.clone().unwrap())
+        })
+        .collect();
+
+    let batch_size = batch.len();
+
+    if let Some(cb) = on_progress {
+        cb(SyncProgress::PersistingBatch {
+            count: batch_size,
+            final_batch: is_final,
+        });
+    }
+
+    tracing::debug!(batch_size, is_final, "Flushing batch");
+
+    let flush_start = std::time::Instant::now();
+    match repository::bulk_upsert_with_retry(
+        db,
+        batch,
+        PERSIST_RETRY_ATTEMPTS,
+        PERSIST_RETRY_BACKOFF_MS,
+    )
+    .await
+    {
+        Ok(rows_affected) => {
+            let elapsed = flush_start.elapsed();
+            tracing::debug!(
+                batch_size,
+                final_batch = is_final,
+                elapsed_ms = elapsed.as_millis(),
+                "Persisted batch"
+            );
+            let count = rows_affected as usize;
+            result.saved_count += count;
+            saved_count.fetch_add(count, Ordering::Relaxed);
+            // Report progress for actually persisted items
+            if let Some(cb) = on_progress {
+                for (owner, name) in batch_names.into_iter().take(count) {
+                    cb(SyncProgress::Persisted { owner, name });
+                }
+            }
+        }
+        Err(e) => {
+            let elapsed = flush_start.elapsed();
+            tracing::warn!(
+                batch_size,
+                final_batch = is_final,
+                elapsed_ms = elapsed.as_millis(),
+                error = %e,
+                "Failed to persist batch"
+            );
+            let error = e.to_string();
+            // Accumulate errors for later reporting
+            for (owner, name) in &batch_names {
+                result
+                    .errors
+                    .push((owner.clone(), name.clone(), error.clone()));
+            }
+            // Also emit progress events for real-time feedback
+            if let Some(cb) = on_progress {
+                for (owner, name) in batch_names {
+                    cb(SyncProgress::PersistError {
+                        owner,
+                        name,
+                        error: error.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Spawn a task that persists repository models from a channel using batch upserts.
 ///
-/// Models are collected into batches using `chunks_timeout` which automatically handles:
-/// - Collecting up to `PERSIST_BATCH_SIZE` items per batch
-/// - Flushing after `PERSIST_FLUSH_TIMEOUT` if we have any pending items
-/// - Ending when the channel is closed
+/// Models are collected into batches with the following behavior:
+/// - Flushes when batch reaches `PERSIST_BATCH_SIZE` items
+/// - Flushes after `PERSIST_FLUSH_TIMEOUT` if there are pending items (prevents deadlocks)
+/// - **Immediately flushes remaining items when channel closes** (no delay at end of sync)
 ///
-/// This prevents deadlocks: if the upstream pipeline blocks waiting for channel capacity,
-/// partial batches are flushed after the timeout to relieve backpressure.
+/// The immediate close detection is important for user experience: when the sync completes
+/// and all senders are dropped, remaining items are persisted without waiting for a timeout.
 ///
 /// Features:
 /// - Automatic retry with exponential backoff for transient database errors
@@ -126,7 +229,7 @@ impl PersistTaskResult {
 /// Returns the task handle and a counter for tracking saved count in real-time.
 pub fn spawn_persist_task(
     db: Arc<DatabaseConnection>,
-    rx: mpsc::Receiver<CodeRepositoryActiveModel>,
+    mut rx: mpsc::Receiver<CodeRepositoryActiveModel>,
     shutdown_flag: Option<Arc<AtomicBool>>,
     on_progress: Option<Arc<ProgressCallback>>,
 ) -> (tokio::task::JoinHandle<PersistTaskResult>, Arc<AtomicUsize>) {
@@ -139,105 +242,75 @@ pub fn spawn_persist_task(
 
         tracing::debug!("Persist task started, waiting for models");
 
-        // Convert the receiver to a stream that yields batches.
-        // chunks_timeout collects up to PERSIST_BATCH_SIZE items, OR flushes after
-        // PERSIST_FLUSH_TIMEOUT if we have any pending items. This prevents deadlocks
-        // by ensuring partial batches don't block forever waiting for more items.
-        let stream = ReceiverStream::new(rx);
-        let batched = stream.chunks_timeout(PERSIST_BATCH_SIZE, PERSIST_FLUSH_TIMEOUT);
-        tokio::pin!(batched);
-
+        // Manual batching with explicit close detection.
+        // This approach immediately detects when the channel closes (recv returns None)
+        // and flushes remaining items without waiting for any timeout.
+        let mut batch: Vec<CodeRepositoryActiveModel> = Vec::with_capacity(PERSIST_BATCH_SIZE);
         let mut batch_count = 0u64;
-        while let Some(batch) = batched.next().await {
-            batch_count += 1;
-            // Check for shutdown between batches
+
+        // Create an interval for timeout-based flushing (deadlock prevention mid-stream).
+        // We start it in the future so it doesn't fire immediately.
+        let mut flush_interval = interval_at(
+            Instant::now() + PERSIST_FLUSH_TIMEOUT,
+            PERSIST_FLUSH_TIMEOUT,
+        );
+
+        loop {
+            // Check for shutdown
             let shutdown_requested = shutdown_flag
                 .as_ref()
                 .is_some_and(|f| f.load(Ordering::Relaxed));
 
-            // Extract names for progress reporting before consuming the batch
-            let batch_names: Vec<(String, String)> = batch
-                .iter()
-                .map(|model| {
-                    // SAFETY: ActiveModel always has owner/name set by to_active_model()
-                    (model.owner.clone().unwrap(), model.name.clone().unwrap())
-                })
-                .collect();
-
-            let batch_size = batch.len();
-            let is_final = shutdown_requested;
-
-            if batch_size > 0
-                && let Some(cb) = &on_progress
-            {
-                cb(SyncProgress::PersistingBatch {
-                    count: batch_size,
-                    final_batch: is_final,
-                });
-            }
-
-            tracing::debug!(batch_size, is_final, "Flushing batch");
-
-            let flush_start = std::time::Instant::now();
-            match repository::bulk_upsert_with_retry(
-                &db,
-                batch,
-                PERSIST_RETRY_ATTEMPTS,
-                PERSIST_RETRY_BACKOFF_MS,
-            )
-            .await
-            {
-                Ok(rows_affected) => {
-                    let elapsed = flush_start.elapsed();
-                    tracing::debug!(
-                        batch_size,
-                        final_batch = is_final,
-                        elapsed_ms = elapsed.as_millis(),
-                        "Persisted batch"
-                    );
-                    let count = rows_affected as usize;
-                    result.saved_count += count;
-                    saved_count.fetch_add(count, Ordering::Relaxed);
-                    // Report progress for actually persisted items
-                    if let Some(cb) = &on_progress {
-                        for (owner, name) in batch_names.into_iter().take(count) {
-                            cb(SyncProgress::Persisted { owner, name });
-                        }
-                    }
-                }
-                Err(e) => {
-                    let elapsed = flush_start.elapsed();
-                    tracing::warn!(
-                        batch_size,
-                        final_batch = is_final,
-                        elapsed_ms = elapsed.as_millis(),
-                        error = %e,
-                        "Failed to persist batch"
-                    );
-                    let error = e.to_string();
-                    // Accumulate errors for later reporting
-                    for (owner, name) in &batch_names {
-                        result
-                            .errors
-                            .push((owner.clone(), name.clone(), error.clone()));
-                    }
-                    // Also emit progress events for real-time feedback
-                    if let Some(cb) = &on_progress {
-                        for (owner, name) in batch_names {
-                            cb(SyncProgress::PersistError {
-                                owner,
-                                name,
-                                error: error.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Exit early if shutdown was requested
             if shutdown_requested {
-                tracing::debug!("Shutdown requested, exiting persist task");
+                tracing::debug!("Shutdown requested, flushing final batch");
+                if !batch.is_empty() {
+                    batch_count += 1;
+                    flush_batch(&db, batch, true, &mut result, &saved_count, &on_progress).await;
+                }
                 break;
+            }
+
+            tokio::select! {
+                biased;
+
+                // Prioritize receiving items over timeout
+                item = rx.recv() => {
+                    match item {
+                        Some(model) => {
+                            batch.push(model);
+                            if batch.len() >= PERSIST_BATCH_SIZE {
+                                batch_count += 1;
+                                let full_batch = std::mem::replace(
+                                    &mut batch,
+                                    Vec::with_capacity(PERSIST_BATCH_SIZE)
+                                );
+                                flush_batch(&db, full_batch, false, &mut result, &saved_count, &on_progress).await;
+                                // Reset the flush interval since we just flushed
+                                flush_interval.reset();
+                            }
+                        }
+                        None => {
+                            // Channel closed - flush remaining items immediately and exit
+                            tracing::debug!("Channel closed, flushing final batch");
+                            if !batch.is_empty() {
+                                batch_count += 1;
+                                flush_batch(&db, batch, true, &mut result, &saved_count, &on_progress).await;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // Timeout-based flush for deadlock prevention (only triggers mid-stream)
+                _ = flush_interval.tick(), if !batch.is_empty() => {
+                    tracing::debug!(batch_size = batch.len(), "Timeout flush to prevent deadlock");
+                    batch_count += 1;
+                    let partial_batch = std::mem::replace(
+                        &mut batch,
+                        Vec::with_capacity(PERSIST_BATCH_SIZE)
+                    );
+                    flush_batch(&db, partial_batch, false, &mut result, &saved_count, &on_progress).await;
+                }
             }
         }
 
@@ -247,7 +320,7 @@ pub fn spawn_persist_task(
             saved = result.saved_count,
             errors = result.errors.len(),
             elapsed_ms = task_elapsed.as_millis(),
-            "Persist stream ended, task completing"
+            "Persist task completed"
         );
         result
     });
@@ -457,7 +530,8 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert_eq!(PERSIST_BATCH_SIZE, 100);
+        // Batch size increased from 100 to 500 for better throughput with large syncs
+        assert_eq!(PERSIST_BATCH_SIZE, 500);
         assert_eq!(PERSIST_FLUSH_TIMEOUT, std::time::Duration::from_millis(500));
         assert_eq!(PERSIST_RETRY_ATTEMPTS, 3);
         assert_eq!(PERSIST_RETRY_BACKOFF_MS, 100);
