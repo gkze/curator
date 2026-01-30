@@ -180,7 +180,7 @@ struct StarredSyncOptions {
     active_within_days: Option<u64>,
 
     /// Don't prune (unstar) inactive repositories
-    #[arg(long)]
+    #[arg(short = 'P', long)]
     no_prune: bool,
 
     /// Dry run - show what would be done without making changes
