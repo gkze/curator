@@ -1,0 +1,12 @@
+---
+name: Setup Nix
+description: Install Nix with Determinate Systems installer and Magic Nix Cache
+
+runs:
+  using: composite
+  steps:
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@v21
+
+    - name: Setup Magic Nix Cache
+      uses: DeterminateSystems/magic-nix-cache-action@v13

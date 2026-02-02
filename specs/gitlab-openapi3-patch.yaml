@@ -19,32 +19,50 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: integer
-                    description: User ID
-                  username:
-                    type: string
-                    description: Username
-                  name:
-                    type: string
-                    nullable: true
-                    description: Display name
-                  email:
-                    type: string
-                    nullable: true
-                    description: Email address (may be empty based on privacy settings)
-                  bio:
-                    type: string
-                    nullable: true
-                    description: User bio
-                  public_email:
-                    type: string
-                    nullable: true
-                    description: Public email address
-                required:
-                  - id
-                  - username
+                $ref: "#/components/schemas/API_Entities_CurrentUser"
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/API_Entities_Error"
+components:
+  schemas:
+    API_Entities_CurrentUser:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: User ID
+        username:
+          type: string
+          description: Username
+        name:
+          type: string
+          nullable: true
+          description: Display name
+        email:
+          type: string
+          nullable: true
+          description: Email address (may be empty based on privacy settings)
+        bio:
+          type: string
+          nullable: true
+          description: User bio
+        public_email:
+          type: string
+          nullable: true
+          description: Public email address
+      required:
+        - id
+        - username
+      description: API_Entities_CurrentUser model
+    API_Entities_Error:
+      type: object
+      properties:
+        message:
+          type: string
+          description: Error message
+      required:
+        - message
+      description: API_Entities_Error model

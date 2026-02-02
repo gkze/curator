@@ -33,6 +33,9 @@
   },
   "author": "Mike Ralphson <mike.ralphson@gmail.com>",
   "license": "BSD-3-Clause",
+  "engines": {
+    "node": ">=12"
+  },
   "dependencies": {
     "call-me-maybe": "^1.0.1",
     "node-fetch": "^2.6.1",

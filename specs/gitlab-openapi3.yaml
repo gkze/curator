@@ -5,161 +5,157 @@ info:
   version: v4
 tags:
   - name: award_emoji
-    description: Operations about award_emoji
+    description: Operations related to award_emoji
   - name: badges
-    description: Operations about badges
+    description: Operations related to badges
   - name: custom_attributes
-    description: Operations about custom_attributes
+    description: Operations related to custom_attributes
   - name: groups
-    description: Operations about groups
+    description: Operations related to groups
   - name: ldap
-    description: Operations about ldaps
+    description: Operations related to LDAP
   - name: audit_events
-    description: Operations about audit_events
-  - name: group
-    description: Operations about groups
+    description: Operations related to audit_events
   - name: group_ssh_certificates
-    description: Operations about group_ssh_certificates
+    description: Operations related to group_ssh_certificates
   - name: runners
-    description: Operations about runners
+    description: Operations related to runners
   - name: group_avatar
-    description: Operations about group_avatars
+    description: Operations related to group_avatars
   - name: invitations
-    description: Operations about invitations
+    description: Operations related to invitations
   - name: members
-    description: Operations about members
+    description: Operations related to members
   - name: personal_access_tokens
-    description: Operations about personal_access_tokens
+    description: Operations related to personal_access_tokens
   - name: search
-    description: Operations about searches
+    description: Operations related to searches
   - name: wikis
-    description: Operations about wikis
+    description: Operations related to wikis
   - name: alert_management
-    description: Operations about alert_managements
+    description: Operations related to alert management
   - name: branches
-    description: Operations about branches
+    description: Operations related to branches
   - name: ci_catalog
-    description: Operations about ci_catalogs
+    description: Operations related to CI catalog
   - name: job_artifacts
-    description: Operations about job_artifacts
+    description: Operations related to job_artifacts
   - name: ci_jobs
-    description: Operations about ci_jobs
+    description: Operations related to ci_jobs
   - name: secure_files
-    description: Operations about secure_files
+    description: Operations related to secure_files
   - name: pipelines
-    description: Operations about pipelines
+    description: Operations related to pipelines
   - name: pipeline_schedules
-    description: Operations about pipeline_schedules
+    description: Operations related to pipeline_schedules
   - name: ci_triggers
-    description: Operations about ci_triggers
+    description: Operations related to ci_triggers
   - name: cargo_packages
-    description: Operations about cargo_packages
+    description: Operations related to cargo_packages
   - name: commits
-    description: Operations about commits
+    description: Operations related to commits
   - name: commit_statuses
-    description: Operations about commit_statuses
+    description: Operations related to commit_statuses
   - name: draft_notes
-    description: Operations about draft_notes
+    description: Operations related to draft_notes
   - name: files
-    description: Operations about files
+    description: Operations related to files
   - name: issues
-    description: Operations about issues
+    description: Operations related to issues
   - name: issue_participants
-    description: Operations about issue_participants
+    description: Operations related to issue_participants
   - name: metric_images
-    description: Operations about metric_images
+    description: Operations related to metric_images
   - name: merge_request_approvals
-    description: Operations about merge_request_approvals
+    description: Operations related to merge_request_approvals
   - name: pages
-    description: Operations about pages
+    description: Operations related to pages
   - name: pages_domains
-    description: Operations about pages_domains
+    description: Operations related to pages_domains
   - name: project_avatar
-    description: Operations about project_avatars
+    description: Operations related to project_avatars
   - name: project_events
-    description: Operations about project_events
+    description: Operations related to project_events
   - name: webhooks
-    description: Operations about webhooks
+    description: Operations related to webhooks
   - name: projects_job_token_scope
-    description: Operations about projects_job_token_scopes
+    description: Operations related to projects_job_token_scopes
   - name: project_snapshots
-    description: Operations about project_snapshots
+    description: Operations related to project_snapshots
   - name: project_snippets
-    description: Operations about project_snippets
+    description: Operations related to project_snippets
   - name: project_templates
-    description: Operations about project_templates
+    description: Operations related to project_templates
   - name: project_protected_branches
-    description: Operations about project_protected_branches
+    description: Operations related to project_protected_branches
   - name: protected_tags
-    description: Operations about protected_tags
+    description: Operations related to protected_tags
   - name: remote_mirrors
-    description: Operations about remote_mirrors
+    description: Operations related to remote_mirrors
   - name: repositories
-    description: Operations about repositories
+    description: Operations related to repositories
   - name: submodules
-    description: Operations about submodules
+    description: Operations related to submodules
   - name: attestations
-    description: Operations about attestations
+    description: Operations related to attestations
   - name: tags
-    description: Operations about tags
+    description: Operations related to tags
   - name: batched_background_migrations
-    description: Operations about batched_background_migrations
+    description: Operations related to batched_background_migrations
   - name: database_dictionary
-    description: Operations about database_dictionaries
+    description: Operations related to database_dictionaries
   - name: migrations
-    description: Operations about migrations
+    description: Operations related to migrations
   - name: broadcast_messages
-    description: Operations about broadcast_messages
+    description: Operations related to broadcast_messages
   - name: applications
-    description: Operations about applications
+    description: Operations related to applications
   - name: avatars
-    description: Operations about avatars
+    description: Operations related to avatars
   - name: bulk_imports
-    description: Operations about bulk_imports
+    description: Operations related to bulk_imports
   - name: agents
-    description: Operations about agents
+    description: Operations related to agents
   - name: ci_runners
-    description: Operations about ci_runners
+    description: Operations related to ci_runners
   - name: jobs
-    description: Operations about jobs
+    description: Operations related to jobs
   - name: events
-    description: Operations about events
+    description: Operations related to events
   - name: glql
-    description: Operations about glqls
+    description: Operations related to GLQL
   - name: ssh_keys
-    description: Operations about ssh_keys
+    description: Operations related to ssh_keys
   - name: markdown
-    description: Operations about markdowns
+    description: Operations related to Markdown
   - name: namespaces
-    description: Operations about namespaces
+    description: Operations related to namespaces
   - name: offline_exports
-    description: Operations about offline_exports
+    description: Operations related to offline_exports
   - name: organizations
-    description: Operations about organizations
+    description: Operations related to organizations
   - name: snippets
-    description: Operations about snippets
+    description: Operations related to snippets
   - name: hooks
-    description: Operations about hooks
+    description: Operations related to hooks
   - name: usage_data
-    description: Operations about usage_data
+    description: Operations related to usage_data
   - name: metrics
-    description: Operations about metrics
+    description: Operations related to metrics
   - name: users
-    description: Operations about users
-  - name: user
-    description: Operations about users
+    description: Operations related to users
   - name: appearance
-    description: Operations about appearances
+    description: Operations related to appearances
   - name: application_statistics
-    description: Operations about application_statistics
+    description: Operations related to application_statistics
   - name: imports
-    description: Operations about imports
+    description: Operations related to imports
   - name: issue_statistics
-    description: Operations about issue_statistics
+    description: Operations related to issue_statistics
   - name: project_topics
-    description: Operations about project_topics
+    description: Operations related to project_topics
   - name: web_commits
-    description: Operations about web_commits
+    description: Operations related to web_commits
   - name: access_requests
     description: Operations related to access requests
   - name: ci_lint
@@ -185,7 +181,7 @@ tags:
   - name: debian_packages
     description: Operations related to Debian Linux packages
   - name: dependency_proxy
-    description: Operations to manage dependency proxy for a groups
+    description: Operations to manage dependency proxy for groups
   - name: deploy_keys
     description: Operations related to deploy keys
   - name: deploy_tokens
@@ -213,7 +209,7 @@ tags:
   - name: geo
     description: Operations related to Geo
   - name: geo_nodes
-    description: Operations related Geo Nodes
+    description: Operations related to Geo nodes
   - name: go_proxy
     description: Operations related to Go Proxy
   - name: group_export
@@ -243,7 +239,7 @@ tags:
   - name: nuget_packages
     description: Operations related to Nuget packages
   - name: package_files
-    description: Operations about package files
+    description: Operations related to package files
   - name: plan_limits
     description: Operations related to plan limits
   - name: project_export
@@ -269,7 +265,7 @@ tags:
   - name: releases
     description: Operations related to releases
   - name: resource_milestone_events
-    description: Operations about resource milestone events
+    description: Operations related to resource milestone events
   - name: rpm_packages
     description: Operations related to RPM packages
   - name: rubygem_packages
@@ -1285,7 +1281,7 @@ paths:
             default: false
         - in: query
           name: with_projects
-          description: Omit project details
+          description: Include project details
           required: false
           schema:
             type: boolean
@@ -2608,7 +2604,7 @@ paths:
                 items:
                   $ref: "#/components/schemas/API_Entities_UserPublic"
       tags:
-        - group
+        - groups
       operationId: getApiV4GroupsIdSamlUsers
   "/api/v4/groups/{id}/provisioned_users":
     get:
@@ -48433,7 +48429,7 @@ paths:
         "403":
           description: Forbidden
       tags:
-        - user
+        - users
         - runners
       operationId: postApiV4UserRunners
   /api/v4/application/plan_limits:
@@ -49414,35 +49410,13 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  id:
-                    type: integer
-                    description: User ID
-                  username:
-                    type: string
-                    description: Username
-                  name:
-                    type: string
-                    nullable: true
-                    description: Display name
-                  email:
-                    type: string
-                    nullable: true
-                    description: Email address (may be empty based on privacy settings)
-                  bio:
-                    type: string
-                    nullable: true
-                    description: User bio
-                  public_email:
-                    type: string
-                    nullable: true
-                    description: Public email address
-                required:
-                  - id
-                  - username
+                $ref: "#/components/schemas/API_Entities_CurrentUser"
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/API_Entities_Error"
 servers:
   - url: //gitlab.com
 components:
@@ -56177,6 +56151,44 @@ components:
             - ubuntu18
             - docker runner
       description: API_Entities_Ci_Job model
+    API_Entities_CurrentUser:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: User ID
+        username:
+          type: string
+          description: Username
+        name:
+          type: string
+          nullable: true
+          description: Display name
+        email:
+          type: string
+          nullable: true
+          description: Email address (may be empty based on privacy settings)
+        bio:
+          type: string
+          nullable: true
+          description: User bio
+        public_email:
+          type: string
+          nullable: true
+          description: Public email address
+      required:
+        - id
+        - username
+      description: API_Entities_CurrentUser model
+    API_Entities_Error:
+      type: object
+      properties:
+        message:
+          type: string
+          description: Error message
+      required:
+        - message
+      description: API_Entities_Error model
     API_Entities_User:
       type: object
       properties:

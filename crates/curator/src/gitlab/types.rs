@@ -228,8 +228,8 @@ impl From<generated::ApiEntitiesNamespaceBasic> for GitLabNamespace {
     }
 }
 
-impl From<generated::GetApiV4UserResponse> for GitLabUser {
-    fn from(u: generated::GetApiV4UserResponse) -> Self {
+impl From<generated::ApiEntitiesCurrentUser> for GitLabUser {
+    fn from(u: generated::ApiEntitiesCurrentUser) -> Self {
         Self {
             id: u.id as u64,
             username: u.username,

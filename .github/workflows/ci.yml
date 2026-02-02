@@ -19,9 +19,8 @@ jobs:
     name: Nix Checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@v21
-      - uses: DeterminateSystems/magic-nix-cache-action@v13
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-nix
       - name: Run all checks (build, clippy, fmt, test, audit)
         run: nix flake check
 
@@ -31,9 +30,8 @@ jobs:
     needs: checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@v21
-      - uses: DeterminateSystems/magic-nix-cache-action@v13
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-nix
       - name: Build Nix package
         run: nix build
 
@@ -57,11 +55,10 @@ jobs:
           - "sqlite,github"
           - "postgres,github,gitlab,gitea"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: DeterminateSystems/nix-installer-action@v21
-      - uses: DeterminateSystems/magic-nix-cache-action@v13
+      - uses: ./.github/actions/setup-nix
       - name: Detect changed crates
         id: changes
         if: github.event_name == 'pull_request'
