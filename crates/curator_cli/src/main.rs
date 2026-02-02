@@ -99,6 +99,21 @@ enum Commands {
         #[command(subcommand)]
         action: commands::sync::SyncAction,
     },
+    /// Discover repositories by crawling a website URL
+    #[cfg(all(
+        feature = "discovery",
+        any(feature = "github", feature = "gitlab", feature = "gitea")
+    ))]
+    Discover {
+        /// URL to crawl for repository links
+        url: String,
+
+        #[command(flatten)]
+        discover_opts: DiscoverOptions,
+
+        #[command(flatten)]
+        sync_opts: CommonSyncOptions,
+    },
     /// Show rate limit status for a platform instance
     ///
     /// Displays current API rate limit information.
@@ -196,6 +211,38 @@ struct StarredSyncOptions {
     no_rate_limit: bool,
 }
 
+/// Options for discovery crawling.
+#[cfg(all(
+    feature = "discovery",
+    any(feature = "github", feature = "gitlab", feature = "gitea")
+))]
+#[derive(Debug, Clone, clap::Args)]
+struct DiscoverOptions {
+    /// Maximum crawl depth (default: 2)
+    #[arg(short = 'd', long, default_value_t = 2)]
+    max_depth: usize,
+
+    /// Maximum pages to fetch (default: 1000)
+    #[arg(short = 'p', long, default_value_t = 1000)]
+    max_pages: usize,
+
+    /// Maximum concurrent crawl requests (default: 10)
+    #[arg(short = 'C', long, default_value_t = 10)]
+    crawl_concurrency: usize,
+
+    /// Allow crawling external hosts (default: same host only)
+    #[arg(short = 'x', long)]
+    allow_external: bool,
+
+    /// Include subdomains when crawling (default: false)
+    #[arg(short = 's', long)]
+    include_subdomains: bool,
+
+    /// Disable sitemap discovery
+    #[arg(short = 'm', long)]
+    no_sitemaps: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -279,6 +326,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
         Commands::Sync { action } => {
             commands::sync::handle_sync(action, &config, &database_url).await?;
+        }
+        #[cfg(all(
+            feature = "discovery",
+            any(feature = "github", feature = "gitlab", feature = "gitea")
+        ))]
+        Commands::Discover {
+            url,
+            discover_opts,
+            sync_opts,
+        } => {
+            commands::discover::handle_discover(
+                url,
+                discover_opts,
+                sync_opts,
+                &config,
+                &database_url,
+            )
+            .await?;
         }
         #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
         Commands::Limits { instance, output } => {

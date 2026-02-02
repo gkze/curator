@@ -142,7 +142,7 @@ async fn sync_org(
     config: &Config,
     database_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db_conn = db::connect(database_url).await?;
+    let db_conn = db::connect_and_migrate(database_url).await?;
     let instance = get_instance(&db_conn, instance_name).await?;
     let token = get_token_for_instance(&instance, config).await?;
 
@@ -260,7 +260,7 @@ async fn sync_user(
     config: &Config,
     database_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db_conn = db::connect(database_url).await?;
+    let db_conn = db::connect_and_migrate(database_url).await?;
     let instance = get_instance(&db_conn, instance_name).await?;
     let token = get_token_for_instance(&instance, config).await?;
 
@@ -374,7 +374,7 @@ async fn sync_stars(
     config: &Config,
     database_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db_conn = db::connect(database_url).await?;
+    let db_conn = db::connect_and_migrate(database_url).await?;
     let instance = get_instance(&db_conn, instance_name).await?;
     let token = get_token_for_instance(&instance, config).await?;
 

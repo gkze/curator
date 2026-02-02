@@ -143,6 +143,17 @@ pub trait PlatformClient: Send + Sync {
     /// Get information about the authenticated user.
     async fn get_authenticated_user(&self) -> Result<UserInfo>;
 
+    /// Fetch a single repository by owner and name.
+    ///
+    /// Implementations may use the optional database connection for ETag caching
+    /// and cache-hit fallbacks.
+    async fn get_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        db: Option<&DatabaseConnection>,
+    ) -> Result<PlatformRepo>;
+
     /// List all repositories for an organization.
     ///
     /// This should handle pagination internally and return all repositories.

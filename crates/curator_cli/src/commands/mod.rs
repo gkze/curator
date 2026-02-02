@@ -7,5 +7,11 @@ pub(crate) mod migrate;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 pub(crate) mod sync;
 
+#[cfg(all(
+    feature = "discovery",
+    any(feature = "github", feature = "gitlab", feature = "gitea")
+))]
+pub(crate) mod discover;
+
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 pub(crate) mod shared;

@@ -173,6 +173,16 @@ impl<C: PlatformClient> PlatformClient for RateLimitedClient<C> {
         self.inner.get_authenticated_user().await
     }
 
+    async fn get_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        db: Option<&DatabaseConnection>,
+    ) -> Result<PlatformRepo> {
+        self.wait().await;
+        self.inner.get_repo(owner, name, db).await
+    }
+
     async fn list_org_repos(
         &self,
         org: &str,

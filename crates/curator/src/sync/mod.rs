@@ -69,8 +69,8 @@ pub use progress::{ProgressCallback, SyncProgress, emit};
 // Re-export engine functions for convenience
 pub use engine::{
     filter_by_activity, filter_for_incremental_sync, sync_namespace, sync_namespace_streaming,
-    sync_namespaces, sync_namespaces_streaming, sync_starred_streaming, sync_user,
-    sync_user_streaming, sync_users_streaming,
+    sync_namespaces, sync_namespaces_streaming, sync_repo_list_streaming, sync_starred_streaming,
+    sync_user, sync_user_streaming, sync_users_streaming,
 };
 
 // Re-export context types

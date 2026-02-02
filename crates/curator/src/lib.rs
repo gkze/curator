@@ -30,6 +30,9 @@ pub mod platform;
 pub mod repository;
 pub mod sync;
 
+#[cfg(feature = "discovery")]
+pub mod discovery;
+
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 pub mod oauth;
 

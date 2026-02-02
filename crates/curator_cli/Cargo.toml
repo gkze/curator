@@ -13,13 +13,14 @@ name = "curator"
 path = "src/main.rs"
 
 [features]
-default = ["all-databases", "github", "gitlab", "gitea"]
+default = ["all-databases", "github", "gitlab", "gitea", "discovery"]
 postgres = ["curator/postgres", "sea-orm/sqlx-postgres"]
 sqlite = ["curator/sqlite", "sea-orm/sqlx-sqlite"]
 all-databases = ["postgres", "sqlite"]
 github = ["curator/github"]
 gitlab = ["curator/gitlab"]
 gitea = ["curator/gitea"]
+discovery = ["curator/discovery"]
 
 [dependencies]
 curator = { path = "../curator", features = ["migrate"] }
@@ -45,6 +46,7 @@ open = "5.3"
 arboard = "3.4"
 toml_edit = "0.22"
 uuid = { version = "1", features = ["v4"] }
+url = "2.5"
 
 [lints]
 workspace = true

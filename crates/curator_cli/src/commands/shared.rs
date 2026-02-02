@@ -28,8 +28,8 @@ use curator::platform::{ApiRateLimiter, PlatformClient};
 use curator::repository;
 use curator::sync::{
     NamespaceSyncResultStreaming, ProgressCallback, SyncOptions, SyncResult,
-    sync_namespace_streaming, sync_namespaces_streaming, sync_starred_streaming,
-    sync_user_streaming, sync_users_streaming,
+    sync_namespace_streaming, sync_namespaces_streaming, sync_repo_list_streaming,
+    sync_starred_streaming, sync_user_streaming, sync_users_streaming,
 };
 use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
@@ -421,6 +421,33 @@ impl SyncRunner {
                     &self.options,
                     self.rate_limiter.as_ref(),
                     Some(&*self.db),
+                    tx,
+                    Some(&*self.progress),
+                )
+            })
+            .await?;
+
+        self.reporter.finish();
+
+        Ok(AggregatedSyncResult::from_single(result, persist_result))
+    }
+
+    /// Run a sync for an explicit repository list.
+    pub async fn run_repo_list<C: PlatformClient + Clone + 'static>(
+        &self,
+        client: &C,
+        label: &str,
+        repos: &[(String, String)],
+    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
+        let (result, persist_result) = self
+            .with_persist_task(|tx| {
+                sync_repo_list_streaming(
+                    client,
+                    label,
+                    repos,
+                    &self.options,
+                    self.rate_limiter.as_ref(),
+                    Some(Arc::clone(&self.db)),
                     tx,
                     Some(&*self.progress),
                 )

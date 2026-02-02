@@ -602,6 +602,21 @@ impl PlatformClient for GitLabClient {
         })
     }
 
+    async fn get_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        _db: Option<&sea_orm::DatabaseConnection>,
+    ) -> platform::Result<PlatformRepo> {
+        let full_path = format!("{}/{}", owner, name);
+        let project = self
+            .get_project_by_path(&full_path)
+            .await
+            .map_err(PlatformError::from)?;
+
+        Ok(to_platform_repo(&project))
+    }
+
     async fn list_org_repos(
         &self,
         org: &str,
@@ -744,6 +759,11 @@ impl PlatformClient for GitLabClient {
 
     async fn star_repo(&self, owner: &str, name: &str) -> platform::Result<bool> {
         let full_path = format!("{}/{}", owner, name);
+
+        if self.is_repo_starred(owner, name).await? {
+            return Ok(false);
+        }
+
         let project: GitLabProject = self
             .get_project_by_path(&full_path)
             .await
@@ -764,6 +784,13 @@ impl PlatformClient for GitLabClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<bool> {
         let full_path = format!("{}/{}", owner, name);
+
+        match self.is_repo_starred(owner, name).await {
+            Ok(true) => return Ok(false),
+            Ok(false) => {}
+            Err(PlatformError::RateLimited { .. }) => {}
+            Err(error) => return Err(error),
+        }
 
         let project: GitLabProject = self
             .get_project_by_path(&full_path)

@@ -599,6 +599,84 @@ impl PlatformClient for GitHubClient {
         })
     }
 
+    async fn get_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+    ) -> platform::Result<PlatformRepo> {
+        use crate::api_cache;
+        use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
+        use crate::repository;
+
+        let cache_key = ApiCacheModel::single_repo_key(owner, name);
+        let cached_etag = if let Some(db) = db {
+            api_cache::get_etag(db, self.instance_id, EndpointType::SingleRepo, &cache_key)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let route = format!("/repos/{}/{}", owner, name);
+        let fetch_result: FetchResult<octocrab::models::Repository> = self
+            .get_conditional(&route, cached_etag.as_deref())
+            .await
+            .map_err(PlatformError::from)?;
+
+        match fetch_result {
+            FetchResult::NotModified => {
+                if let Some(db) = db {
+                    let cached = repository::find_by_natural_key(db, self.instance_id, owner, name)
+                        .await
+                        .map_err(|e| PlatformError::internal(e.to_string()))?;
+                    if let Some(model) = cached {
+                        return Ok(PlatformRepo::from_model(&model));
+                    }
+                }
+
+                let refresh: FetchResult<octocrab::models::Repository> = self
+                    .get_conditional(&route, None)
+                    .await
+                    .map_err(PlatformError::from)?;
+
+                match refresh {
+                    FetchResult::Fetched { data, etag, .. } => {
+                        if let Some(db) = db {
+                            let _ = api_cache::upsert(
+                                db,
+                                self.instance_id,
+                                EndpointType::SingleRepo,
+                                &cache_key,
+                                etag,
+                            )
+                            .await;
+                        }
+                        Ok(to_platform_repo(&data))
+                    }
+                    FetchResult::NotModified => Err(PlatformError::internal(format!(
+                        "Cache hit for {}/{} but repository not found in database",
+                        owner, name
+                    ))),
+                }
+            }
+            FetchResult::Fetched { data, etag, .. } => {
+                if let Some(db) = db {
+                    let _ = api_cache::upsert(
+                        db,
+                        self.instance_id,
+                        EndpointType::SingleRepo,
+                        &cache_key,
+                        etag,
+                    )
+                    .await;
+                }
+                Ok(to_platform_repo(&data))
+            }
+        }
+    }
+
     async fn list_org_repos(
         &self,
         org: &str,

@@ -431,6 +431,20 @@ impl PlatformClient for GiteaClient {
         })
     }
 
+    async fn get_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        _db: Option<&sea_orm::DatabaseConnection>,
+    ) -> platform::Result<PlatformRepo> {
+        let repo = self
+            .get::<GiteaRepo>(&format!("/repos/{}/{}", owner, name))
+            .await
+            .map_err(PlatformError::from)?;
+
+        Ok(to_platform_repo(&repo))
+    }
+
     async fn list_org_repos(
         &self,
         org: &str,

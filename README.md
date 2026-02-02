@@ -118,12 +118,28 @@ The database URL defaults to `sqlite://~/.local/state/curator/curator.db` on Lin
 
 ### Database Setup
 
+Most CLI commands that access the database automatically apply pending migrations on startup.
+Use the `migrate` command if you want explicit control or are scripting deployments.
+
 ```bash
 # Run migrations
 curator migrate up
 
 # Check migration status
 curator migrate status
+```
+
+### Discovery
+
+```bash
+# Crawl a site and sync discovered repositories
+curator discover https://example.com
+
+# Limit the crawl depth and pages
+curator discover https://example.com --max-depth 1 --max-pages 200
+
+# Allow external hosts and include subdomains
+curator discover https://example.com --allow-external --include-subdomains
 ```
 
 ### GitHub

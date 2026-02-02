@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -632,6 +633,139 @@ pub async fn sync_user_streaming<C: PlatformClient + Clone + 'static>(
         on_progress,
     )
     .await
+}
+
+/// Sync an explicit list of repositories (owner/name pairs) with streaming persistence.
+///
+/// This is used for discovery-driven syncs where repository URLs are provided
+/// directly rather than through org/user listings.
+#[cfg_attr(
+    any(feature = "github", feature = "gitlab", feature = "gitea"),
+    tracing::instrument(skip(client, options, rate_limiter, db, model_tx, on_progress), fields(repo_count = repos.len()))
+)]
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
+    client: &C,
+    namespace: &str,
+    repos: &[(String, String)],
+    options: &SyncOptions,
+    rate_limiter: Option<&ApiRateLimiter>,
+    db: Option<Arc<DatabaseConnection>>,
+    model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<SyncResult, PlatformError> {
+    fetch::wait_for_rate_limit(rate_limiter).await;
+
+    emit(
+        on_progress,
+        SyncProgress::FetchingRepos {
+            namespace: namespace.to_string(),
+            total_repos: Some(repos.len()),
+            expected_pages: Some(repos.len().min(u32::MAX as usize) as u32),
+        },
+    );
+
+    let mut join_set: JoinSet<(String, String, Result<PlatformRepo, PlatformError>)> =
+        JoinSet::new();
+    let concurrency = std::cmp::max(1, std::cmp::min(options.concurrency, repos.len().max(1)));
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let limiter = rate_limiter.cloned();
+
+    for (owner, name) in repos {
+        let owner = owner.clone();
+        let name = name.clone();
+        let client = client.clone();
+        let semaphore = Arc::clone(&semaphore);
+        let limiter = limiter.clone();
+        let task_db = db.clone();
+
+        join_set.spawn(async move {
+            let _permit = match semaphore.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return (
+                        owner,
+                        name,
+                        Err(PlatformError::internal("Semaphore closed unexpectedly")),
+                    );
+                }
+            };
+
+            if let Some(ref limiter) = limiter {
+                limiter.wait().await;
+            }
+
+            let repo = client.get_repo(&owner, &name, task_db.as_deref()).await;
+            (owner, name, repo)
+        });
+    }
+
+    let mut fetched = Vec::new();
+    let mut errors = Vec::new();
+    let mut attempted = 0usize;
+
+    while let Some(result) = join_set.join_next().await {
+        attempted += 1;
+        emit(
+            on_progress,
+            SyncProgress::FetchedPage {
+                namespace: namespace.to_string(),
+                page: attempted as u32,
+                count: 1,
+                total_so_far: attempted,
+                expected_pages: Some(repos.len().min(u32::MAX as usize) as u32),
+            },
+        );
+
+        match result {
+            Ok((owner, name, Ok(repo))) => {
+                fetched.push(repo);
+                tracing::debug!(owner = %owner, name = %name, "Fetched repo");
+            }
+            Ok((owner, name, Err(error))) => {
+                let message = format!("{}/{}: {}", owner, name, error);
+                emit(
+                    on_progress,
+                    SyncProgress::Warning {
+                        message: message.clone(),
+                    },
+                );
+                errors.push(message);
+            }
+            Err(join_error) => {
+                let message = format!("Task join error: {}", join_error);
+                emit(
+                    on_progress,
+                    SyncProgress::Warning {
+                        message: message.clone(),
+                    },
+                );
+                errors.push(message);
+            }
+        }
+    }
+
+    emit(
+        on_progress,
+        SyncProgress::FetchComplete {
+            namespace: namespace.to_string(),
+            total: fetched.len(),
+        },
+    );
+
+    let mut result = sync_repos_streaming(
+        client,
+        namespace,
+        fetched,
+        options,
+        rate_limiter,
+        model_tx,
+        on_progress,
+    )
+    .await?;
+
+    result.errors.extend(errors);
+    Ok(result)
 }
 
 /// Sync multiple users' repositories concurrently with streaming persistence.
