@@ -127,10 +127,8 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "Install Nix"
-        uses: "DeterminateSystems/nix-installer-action@v21"
-      - name: "Setup Magic Nix Cache"
-        uses: "DeterminateSystems/magic-nix-cache-action@v13"
+      - name: "Setup Nix"
+        uses: "./.github/actions/setup-nix"
       - name: "Setup Nix build environment"
         run: |
           # Export environment variables from Nix devshell for cargo to use
