@@ -163,6 +163,36 @@ pub mod well_known {
             host: "gitlab.com",
         },
         WellKnownInstance {
+            name: "gnome-gitlab",
+            platform_type: PlatformType::GitLab,
+            host: "gitlab.gnome.org",
+        },
+        WellKnownInstance {
+            name: "freedesktop-gitlab",
+            platform_type: PlatformType::GitLab,
+            host: "gitlab.freedesktop.org",
+        },
+        WellKnownInstance {
+            name: "kde-gitlab",
+            platform_type: PlatformType::GitLab,
+            host: "invent.kde.org",
+        },
+        WellKnownInstance {
+            name: "kitware-gitlab",
+            platform_type: PlatformType::GitLab,
+            host: "gitlab.kitware.com",
+        },
+        WellKnownInstance {
+            name: "haskell-gitlab",
+            platform_type: PlatformType::GitLab,
+            host: "gitlab.haskell.org",
+        },
+        WellKnownInstance {
+            name: "archlinux-gitlab",
+            platform_type: PlatformType::GitLab,
+            host: "gitlab.archlinux.org",
+        },
+        WellKnownInstance {
             name: "codeberg",
             platform_type: PlatformType::Gitea,
             host: "codeberg.org",
@@ -350,8 +380,8 @@ mod tests {
 
     #[test]
     fn test_well_known_instances_constant() {
-        // Verify the INSTANCES constant has exactly 3 entries
-        assert_eq!(well_known::INSTANCES.len(), 3);
+        // Verify the INSTANCES constant has exactly 9 entries
+        assert_eq!(well_known::INSTANCES.len(), 9);
 
         // Verify each has unique name and host
         let names: Vec<_> = well_known::INSTANCES.iter().map(|i| i.name).collect();
@@ -359,10 +389,22 @@ mod tests {
 
         assert!(names.contains(&"github"));
         assert!(names.contains(&"gitlab"));
+        assert!(names.contains(&"gnome-gitlab"));
+        assert!(names.contains(&"freedesktop-gitlab"));
+        assert!(names.contains(&"kde-gitlab"));
+        assert!(names.contains(&"kitware-gitlab"));
+        assert!(names.contains(&"haskell-gitlab"));
+        assert!(names.contains(&"archlinux-gitlab"));
         assert!(names.contains(&"codeberg"));
 
         assert!(hosts.contains(&"github.com"));
         assert!(hosts.contains(&"gitlab.com"));
+        assert!(hosts.contains(&"gitlab.gnome.org"));
+        assert!(hosts.contains(&"gitlab.freedesktop.org"));
+        assert!(hosts.contains(&"invent.kde.org"));
+        assert!(hosts.contains(&"gitlab.kitware.com"));
+        assert!(hosts.contains(&"gitlab.haskell.org"));
+        assert!(hosts.contains(&"gitlab.archlinux.org"));
         assert!(hosts.contains(&"codeberg.org"));
     }
 }

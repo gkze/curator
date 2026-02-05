@@ -6,6 +6,7 @@ pub use sea_orm_migration::prelude::*;
 
 mod m20250114_000001_create_schema;
 mod m20250114_000002_seed_well_known_instances;
+mod m20250205_000001_seed_gitlab_instances;
 
 /// The migrator that runs all migrations.
 pub struct Migrator;
@@ -16,6 +17,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20250114_000001_create_schema::Migration),
             Box::new(m20250114_000002_seed_well_known_instances::Migration),
+            Box::new(m20250205_000001_seed_gitlab_instances::Migration),
         ]
     }
 
