@@ -17,15 +17,18 @@ A multi-platform repository tracker and manager that provides a unified interfac
 
 - **Unified sync**: Fetch and store repository metadata from organizations/groups/users into a local database
 - **Activity filtering**: Filter repositories by last activity date (configurable, default 60 days)
+- **Incremental sync**: Skip repositories that haven't changed since the last sync
 - **Batch starring**: Automatically star repositories across platforms
 - **Starred sync with pruning**: Sync your starred repos and optionally unstar inactive ones
 - **Database persistence**: SQLite and PostgreSQL support with bulk upserts
 - **Streaming operations**: Efficient sync with progress reporting and batch persistence
 - **Proactive rate limiting**: Client-side rate limiting to avoid API throttling
-- **ETag caching**: Cache API responses with ETags to reduce rate limit usage (GitHub)
+- **ETag caching**: Cache API responses with ETags to reduce rate limit usage (GitHub, GitLab)
 - **Graceful shutdown**: Ctrl+C handling with safe data flushing
 - **Dry-run mode**: Preview operations without making changes
 - **Configurable concurrency**: Control API request parallelism
+- **Instance management**: Add/list/remove platform instances in the local database
+- **OAuth login**: Device/PKCE flows for GitHub, GitLab, and Codeberg
 - **Shell completions**: Generate completions for bash, zsh, fish, etc.
 - **Man pages**: Generate man pages for offline documentation
 
@@ -66,7 +69,7 @@ nix profile add github:gkze/curator
 Curator uses a layered configuration system. Settings are resolved in this order (highest priority first):
 
 1. CLI flags
-1. Environment variables
+1. Environment variables (including `.env` in the current directory)
 1. Config file (`~/.config/curator/config.toml` or `./curator.toml`)
 1. Built-in defaults
 
@@ -74,21 +77,18 @@ Curator uses a layered configuration system. Settings are resolved in this order
 
 ```toml
 [database]
-url = "sqlite://~/.local/share/curator/curator.db"
+url = "sqlite://~/.local/state/curator/curator.db?mode=rwc"
 
 [github]
 token = "ghp_..."
 
 [gitlab]
-host = "gitlab.com"
 token = "glpat-..."
-include_subgroups = true
 
 [codeberg]
 token = "..."
 
 [gitea]
-host = "https://gitea.example.com"
 token = "..."
 
 [sync]
@@ -107,14 +107,38 @@ All environment variables use the `CURATOR_` prefix:
 | `CURATOR_DATABASE_URL` | Database connection string (default: see below) |
 | `CURATOR_GITHUB_TOKEN` | GitHub API token |
 | `CURATOR_GITLAB_TOKEN` | GitLab API token |
-| `CURATOR_GITLAB_HOST` | GitLab instance host (default: gitlab.com) |
 | `CURATOR_CODEBERG_TOKEN` | Codeberg API token |
-| `CURATOR_GITEA_HOST` | Gitea instance URL |
 | `CURATOR_GITEA_TOKEN` | Gitea API token |
 
-The database URL defaults to `sqlite://~/.local/state/curator/curator.db` on Linux (using the XDG state directory). On macOS, it defaults to `~/Library/Application Support/curator/curator.db`.
+The database URL defaults to `sqlite://~/.local/state/curator/curator.db?mode=rwc` on Linux (using the XDG state directory). On macOS, it defaults to `~/Library/Application Support/curator/curator.db?mode=rwc`.
 
 ## Usage
+
+### Instances & Auth
+
+Curator syncs against instances stored in the local database. Add an instance first, then authenticate.
+
+```bash
+# Add well-known instances
+curator instance add github
+curator instance add gitlab
+curator instance add codeberg
+
+# Add a self-hosted instance
+curator instance add work-gitlab -t gitlab -H gitlab.mycompany.com
+curator instance add my-gitea -t gitea -H gitea.example.com
+
+# List configured instances
+curator instance list
+
+# OAuth login (GitHub/GitLab/Codeberg)
+curator login github
+curator login gitlab
+curator login codeberg
+```
+
+OAuth login is supported for well-known instances (github.com, gitlab.com, codeberg.org).
+For GitHub Enterprise or self-hosted GitLab/Gitea, configure a PAT via `CURATOR_*_TOKEN`.
 
 ### Database Setup
 
@@ -140,76 +164,82 @@ curator discover https://example.com --max-depth 1 --max-pages 200
 
 # Allow external hosts and include subdomains
 curator discover https://example.com --allow-external --include-subdomains
+
+# Use sitemap discovery and tune crawl concurrency
+curator discover https://example.com --crawl-concurrency 20
 ```
+
+Discovery only syncs repositories for hosts that have configured instances.
+Add those instances first (e.g., `curator instance add github`).
 
 ### GitHub
 
 ```bash
 # Sync repositories from an organization
-curator github org rust-lang
+curator sync org github rust-lang
 
 # Sync multiple organizations
-curator github org org1 org2 org3
+curator sync org github org1 org2 org3
 
 # Sync repositories from a user
-curator github user octocat
+curator sync user github octocat
 
 # Preview without making changes
-curator github org rust-lang --dry-run
+curator sync org github rust-lang --dry-run
 
 # Filter by recent activity
-curator github org rust-lang --active-within-days 30
+curator sync org github rust-lang --active-within-days 30
 
 # Sync and prune starred repositories
-curator github stars
+curator sync stars github
 
 # Check rate limit status
-curator github limits
+curator limits github
 ```
 
 ### GitLab
 
 ```bash
 # Sync projects from a group
-curator gitlab group gitlab-org
+curator sync org gitlab gitlab-org
 
 # Sync from a self-hosted instance
-curator gitlab group my-group --host gitlab.example.com
+curator sync org work-gitlab my-group
 
 # Exclude subgroup projects
-curator gitlab group my-group --no-subgroups
+curator sync org gitlab my-group --no-subgroups
 
 # Sync projects from a user
-curator gitlab user username
+curator sync user gitlab username
 
 # Sync starred projects
-curator gitlab stars
+curator sync stars gitlab
 ```
 
 ### Codeberg
 
 ```bash
 # Sync repositories from an organization
-curator codeberg org my-org
+curator sync org codeberg my-org
 
 # Sync repositories from a user
-curator codeberg user username
+curator sync user codeberg username
 
 # Sync starred repositories
-curator codeberg stars
+curator sync stars codeberg
 ```
 
 ### Gitea
 
 ```bash
 # Sync repositories from an organization
-curator gitea org my-org --host https://gitea.example.com
+curator sync org my-gitea my-org
 
 # Sync repositories from a user
-curator gitea user username --host https://gitea.example.com
+curator sync user my-gitea username
 
 # Sync starred repositories
-curator gitea stars --host https://gitea.example.com
+curator sync stars my-gitea
 ```
 
 ### Common Options
@@ -221,9 +251,9 @@ curator gitea stars --host https://gitea.example.com
 | `-a` | `--active-within-days N` | Only sync repos active within N days |
 | `-c` | `--concurrency N` | Parallel API requests (default: 20) |
 | `-R` | `--no-rate-limit` | Disable proactive rate limiting |
-| `-H` | `--host` | Host URL (GitLab, Gitea) |
 | `-s` | `--no-subgroups` | Exclude subgroups (GitLab only) |
-| | `--no-prune` | Don't prune inactive starred repos (stars only) |
+| `-i` | `--incremental` | Incremental sync (org/user only) |
+| `-P` | `--no-prune` | Don't prune inactive starred repos (stars only) |
 
 ## Project Structure
 
@@ -233,20 +263,23 @@ crates/
 │   └── src/
 │       ├── lib.rs                # Library entry point
 │       ├── db.rs                 # Database connection utilities
+│       ├── instance.rs           # Instance helpers
 │       ├── platform.rs           # Platform trait definitions (PlatformClient)
-│       ├── repository.rs         # Repository CRUD operations
-│       ├── retry.rs              # Retry utilities with exponential backoff
+│       ├── platform/             # Platform helpers (rate limits, conversion)
+│       ├── repository.rs         # Repository API surface
+│       ├── repository/           # Repository CRUD and queries
+│       ├── sync/                 # Unified sync engine
+│       ├── discovery/            # Discovery crawler (feature)
+│       ├── oauth/                # OAuth helpers
 │       ├── api_cache.rs          # ETag-based API response caching
 │       ├── entity/               # SeaORM entities
+│       │   ├── instance.rs
 │       │   ├── code_repository.rs
-│       │   ├── code_platform.rs
 │       │   ├── code_visibility.rs
+│       │   ├── platform_type.rs
+│       │   ├── platform_metadata.rs
 │       │   └── api_cache.rs
 │       ├── migration/            # Database migrations
-│       ├── sync/                 # Unified sync engine
-│       │   ├── engine.rs         # Platform-agnostic sync logic
-│       │   ├── types.rs          # SyncOptions, SyncResult
-│       │   └── progress.rs       # Progress callback types
 │       ├── github/               # GitHub implementation
 │       ├── gitlab/               # GitLab implementation
 │       └── gitea/                # Gitea/Codeberg implementation
@@ -254,7 +287,9 @@ crates/
     └── src/
         ├── main.rs               # CLI entry point
         ├── config.rs             # Configuration loading
-        └── progress.rs           # Progress bar display
+        ├── commands/             # CLI subcommands
+        ├── progress.rs           # Progress bar display
+        └── shutdown.rs           # Ctrl+C handling
 ```
 
 ## Building
@@ -284,8 +319,9 @@ cargo test
 - `github` - GitHub platform support
 - `gitlab` - GitLab platform support
 - `gitea` - Gitea/Codeberg platform support
+- `discovery` - Website crawling and repo link discovery
 
-The CLI defaults to all features enabled (`all-databases`, `github`, `gitlab`, `gitea`).
+The CLI defaults to all features enabled (`all-databases`, `github`, `gitlab`, `gitea`, `discovery`).
 
 ## License
 
