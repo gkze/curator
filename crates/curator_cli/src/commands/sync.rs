@@ -133,6 +133,49 @@ fn get_default_rps(instance: &InstanceModel) -> u32 {
     }
 }
 
+fn merge_common_sync_options(
+    sync_opts: &CommonSyncOptions,
+    config: &Config,
+) -> (u64, usize, bool, bool, SyncStrategy) {
+    let active_within_days = sync_opts
+        .active_within_days
+        .unwrap_or(config.sync.active_within_days);
+    let concurrency = sync_opts.concurrency.unwrap_or(config.sync.concurrency);
+    let star = if sync_opts.no_star {
+        false
+    } else {
+        config.sync.star
+    };
+    let no_rate_limit = sync_opts.no_rate_limit || config.sync.no_rate_limit;
+    let strategy = if sync_opts.incremental {
+        SyncStrategy::Incremental
+    } else {
+        SyncStrategy::Full
+    };
+
+    (
+        active_within_days,
+        concurrency,
+        star,
+        no_rate_limit,
+        strategy,
+    )
+}
+
+fn merge_starred_sync_options(
+    sync_opts: &StarredSyncOptions,
+    config: &Config,
+) -> (u64, usize, bool, bool) {
+    let active_within_days = sync_opts
+        .active_within_days
+        .unwrap_or(config.sync.active_within_days);
+    let concurrency = sync_opts.concurrency.unwrap_or(config.sync.concurrency);
+    let prune = !sync_opts.no_prune;
+    let no_rate_limit = sync_opts.no_rate_limit || config.sync.no_rate_limit;
+
+    (active_within_days, concurrency, prune, no_rate_limit)
+}
+
 /// Sync organizations/groups.
 async fn sync_org(
     instance_name: &str,
@@ -146,25 +189,10 @@ async fn sync_org(
     let instance = get_instance(&db_conn, instance_name).await?;
     let token = get_token_for_instance(&instance, config).await?;
 
-    // Merge CLI args with config defaults
-    let active_within_days = sync_opts
-        .active_within_days
-        .unwrap_or(config.sync.active_within_days);
-    let concurrency = sync_opts.concurrency.unwrap_or(config.sync.concurrency);
-    let star = if sync_opts.no_star {
-        false
-    } else {
-        config.sync.star
-    };
-    let no_rate_limit = sync_opts.no_rate_limit || config.sync.no_rate_limit;
+    let (active_within_days, concurrency, star, no_rate_limit, strategy) =
+        merge_common_sync_options(&sync_opts, config);
 
     let db = Arc::new(db_conn);
-
-    let strategy = if sync_opts.incremental {
-        SyncStrategy::Incremental
-    } else {
-        SyncStrategy::Full
-    };
 
     let options = SyncOptions {
         active_within: chrono::Duration::days(active_within_days as i64),
@@ -264,25 +292,10 @@ async fn sync_user(
     let instance = get_instance(&db_conn, instance_name).await?;
     let token = get_token_for_instance(&instance, config).await?;
 
-    // Merge CLI args with config defaults
-    let active_within_days = sync_opts
-        .active_within_days
-        .unwrap_or(config.sync.active_within_days);
-    let concurrency = sync_opts.concurrency.unwrap_or(config.sync.concurrency);
-    let star = if sync_opts.no_star {
-        false
-    } else {
-        config.sync.star
-    };
-    let no_rate_limit = sync_opts.no_rate_limit || config.sync.no_rate_limit;
+    let (active_within_days, concurrency, star, no_rate_limit, strategy) =
+        merge_common_sync_options(&sync_opts, config);
 
     let db = Arc::new(db_conn);
-
-    let strategy = if sync_opts.incremental {
-        SyncStrategy::Incremental
-    } else {
-        SyncStrategy::Full
-    };
 
     let options = SyncOptions {
         active_within: chrono::Duration::days(active_within_days as i64),
@@ -378,13 +391,8 @@ async fn sync_stars(
     let instance = get_instance(&db_conn, instance_name).await?;
     let token = get_token_for_instance(&instance, config).await?;
 
-    // Merge CLI args with config defaults
-    let active_within_days = sync_opts
-        .active_within_days
-        .unwrap_or(config.sync.active_within_days);
-    let concurrency = sync_opts.concurrency.unwrap_or(config.sync.concurrency);
-    let prune = !sync_opts.no_prune;
-    let no_rate_limit = sync_opts.no_rate_limit || config.sync.no_rate_limit;
+    let (active_within_days, concurrency, prune, no_rate_limit) =
+        merge_starred_sync_options(&sync_opts, config);
 
     let db = Arc::new(db_conn);
 

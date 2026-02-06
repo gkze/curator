@@ -1,8 +1,10 @@
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use console::Term;
 
 /// Global shutdown flag for graceful termination.

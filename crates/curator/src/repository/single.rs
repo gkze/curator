@@ -2,6 +2,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Qu
 use uuid::Uuid;
 
 use crate::entity::code_repository::{ActiveModel, Column, Entity as CodeRepository, Model};
+use sea_orm::ActiveValue;
 
 use super::errors::{RepositoryError, Result};
 
@@ -67,9 +68,9 @@ pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Model
 /// Otherwise, a new repository will be inserted.
 pub async fn upsert(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
     // Extract natural key from the active model
-    let instance_id = model.instance_id.clone().unwrap();
-    let owner = model.owner.clone().unwrap();
-    let name = model.name.clone().unwrap();
+    let instance_id = required_active_value("instance_id", &model.instance_id)?;
+    let owner = required_active_value("owner", &model.owner)?;
+    let name = required_active_value("name", &model.name)?;
 
     // Check if exists
     let existing = find_by_natural_key(db, instance_id, &owner, &name).await?;
@@ -89,6 +90,18 @@ pub async fn upsert(db: &DatabaseConnection, model: ActiveModel) -> Result<Model
             }
             insert_model.insert(db).await.map_err(RepositoryError::from)
         }
+    }
+}
+
+fn required_active_value<T: Clone + Into<sea_orm::Value>>(
+    field: &str,
+    value: &ActiveValue<T>,
+) -> Result<T> {
+    match value {
+        ActiveValue::Set(value) | ActiveValue::Unchanged(value) => Ok(value.clone()),
+        ActiveValue::NotSet => Err(RepositoryError::InvalidInput {
+            message: format!("Missing required field: {}", field),
+        }),
     }
 }
 

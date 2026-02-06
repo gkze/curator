@@ -112,7 +112,7 @@ mod tests {
     fn test_pagination_default() {
         let p = Pagination::default();
         assert_eq!(p.page, 0);
-        assert_eq!(p.per_page, 0);
+        assert_eq!(p.per_page, 1);
     }
 
     #[test]

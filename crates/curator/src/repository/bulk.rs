@@ -1,5 +1,5 @@
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
+    ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, QueryFilter,
     sea_query::{Alias, Expr, OnConflict},
 };
 use uuid::Uuid;
@@ -54,7 +54,7 @@ pub const DEFAULT_BULK_UPSERT_BACKOFF_MS: u64 = 100;
 /// - Reduces database round-trips from 2n to 1
 /// - Only updates rows where `updated_at` has changed (content-based deduplication)
 ///
-/// The natural key for conflict detection is (platform, owner, name).
+/// The natural key for conflict detection is (instance_id, platform_id).
 /// The conditional update ensures we only modify rows when the platform's
 /// `updated_at` timestamp has changed, avoiding unnecessary writes.
 ///
@@ -190,8 +190,16 @@ pub async fn delete_by_owner_name(
 /// Check if a repository error is retryable (transient).
 fn is_retryable_error(err: &RepositoryError) -> bool {
     match err {
-        RepositoryError::Database(db_err) => {
-            let err_str = db_err.to_string().to_lowercase();
+        RepositoryError::Database(db_err) => is_retryable_db_error(db_err),
+        _ => false,
+    }
+}
+
+fn is_retryable_db_error(err: &DbErr) -> bool {
+    match err {
+        DbErr::ConnectionAcquire(_) | DbErr::Conn(_) => true,
+        DbErr::Exec(_) | DbErr::Query(_) => {
+            let err_str = err.to_string().to_lowercase();
             // SQLite: database is locked, busy
             // PostgreSQL: connection refused, too many connections
             // General: timeout, connection reset

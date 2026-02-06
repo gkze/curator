@@ -1,10 +1,15 @@
 use clap::ValueEnum;
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use uuid::Uuid;
 
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use curator::{Instance, InstanceColumn, PlatformType};
 
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::commands::shared::get_token_for_instance;
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::config::Config;
 
 /// Output format for rate limit display.

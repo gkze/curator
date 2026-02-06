@@ -39,7 +39,7 @@ use chrono::Utc;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use std::future::Future;
 
@@ -49,6 +49,12 @@ use super::progress::{ProgressCallback, SyncProgress, emit};
 use super::types::{NamespaceSyncResult, NamespaceSyncResultStreaming, SyncOptions, SyncResult};
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{ApiRateLimiter, PlatformClient, PlatformError, PlatformRepo};
+
+const REPO_STREAM_CHANNEL_BUFFER: usize = 500;
+const FILTER_PROGRESS_CHANNEL_BUFFER: usize = 256;
+const FILTER_PROGRESS_EMIT_MATCHED_STEP: usize = 25;
+const FILTER_PROGRESS_EMIT_PROCESSED_STEP: usize = 100;
+const PROCESSOR_LOG_EVERY: usize = 1000;
 
 /// Trait for concurrent sync result types.
 ///
@@ -898,12 +904,13 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     // Buffer of 500 provides headroom to reduce backpressure likelihood.
     // The time-based flushing in the persist task is the primary deadlock prevention,
     // but larger buffers reduce the frequency of backpressure situations.
-    let (repo_tx, mut repo_rx) = mpsc::channel::<PlatformRepo>(500);
+    let (repo_tx, mut repo_rx) = mpsc::channel::<PlatformRepo>(REPO_STREAM_CHANNEL_BUFFER);
 
     // Create channel for progress events from processor task
     // Sends (matched_count, processed_count) tuples
-    // Use unbounded to avoid blocking processor
-    let (progress_tx, progress_rx) = mpsc::unbounded_channel::<(usize, usize)>();
+    // Use a bounded channel and drop when full to avoid unbounded memory growth.
+    let (progress_tx, progress_rx) =
+        mpsc::channel::<(usize, usize)>(FILTER_PROGRESS_CHANNEL_BUFFER);
 
     // Spawn task to process repos as they stream in
     let processor_client = client.clone();
@@ -920,7 +927,7 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
         tracing::debug!("Processor task started");
         while let Some(repo) = repo_rx.recv().await {
             let new_processed = processor_processed.fetch_add(1, Ordering::Relaxed) + 1;
-            if new_processed.is_multiple_of(1000) {
+            if new_processed.is_multiple_of(PROCESSOR_LOG_EVERY) {
                 tracing::debug!(processed = new_processed, "Processor progress");
             }
 
@@ -932,7 +939,7 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
             };
 
             // Send progress update (ignore errors if receiver dropped)
-            let _ = progress_tx.send((new_matched, new_processed));
+            let _ = progress_tx.try_send((new_matched, new_processed));
 
             if is_active {
                 // Persist active starred repos
@@ -978,7 +985,7 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
 
     // Poll fetch, processor, and progress concurrently, emitting FilteredPage events in real-time
     // Wrap receiver in a stream for idiomatic async handling
-    let mut progress_stream = UnboundedReceiverStream::new(progress_rx).fuse();
+    let mut progress_stream = ReceiverStream::new(progress_rx).fuse();
     // Track when progress stream is exhausted to avoid spinning on fused stream
     // (fused streams return Ready(None) immediately, which would cause a spin loop)
     let mut progress_stream_done = false;
@@ -989,19 +996,13 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
 
             result = progress_stream.next(), if processor_result.is_none() && !progress_stream_done => {
                 if let Some((matched_count, processed_count)) = result {
-                    let should_emit = matched_count >= last_emitted_matched + 25
-                        || processed_count >= last_emitted_processed + 100
-                        || (matched_count > 0 && last_emitted_matched == 0)
-                        || (processed_count > 0 && last_emitted_processed == 0);
-
-                    if should_emit {
-                        emit(
-                            on_progress,
-                            SyncProgress::FilteredPage {
-                                matched_so_far: matched_count,
-                                processed_so_far: processed_count,
-                            },
-                        );
+                    if should_emit_filtered_progress(
+                        matched_count,
+                        processed_count,
+                        last_emitted_matched,
+                        last_emitted_processed,
+                    ) {
+                        emit_filtered_progress(on_progress, matched_count, processed_count);
                         last_emitted_matched = matched_count;
                         last_emitted_processed = processed_count;
                     }
@@ -1025,19 +1026,13 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
             // Drain any remaining buffered progress messages.
             // Since processor finished, the sender is dropped and stream won't block.
             while let Some((matched_count, processed_count)) = progress_stream.next().await {
-                let should_emit = matched_count >= last_emitted_matched + 25
-                    || processed_count >= last_emitted_processed + 100
-                    || (matched_count > 0 && last_emitted_matched == 0)
-                    || (processed_count > 0 && last_emitted_processed == 0);
-
-                if should_emit {
-                    emit(
-                        on_progress,
-                        SyncProgress::FilteredPage {
-                            matched_so_far: matched_count,
-                            processed_so_far: processed_count,
-                        },
-                    );
+                if should_emit_filtered_progress(
+                    matched_count,
+                    processed_count,
+                    last_emitted_matched,
+                    last_emitted_processed,
+                ) {
+                    emit_filtered_progress(on_progress, matched_count, processed_count);
                     last_emitted_matched = matched_count;
                     last_emitted_processed = processed_count;
                 }
@@ -1046,10 +1041,18 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
         }
     }
 
-    let fetch_result = fetch_result.expect("fetch should complete");
+    let fetch_result =
+        fetch_result.ok_or_else(|| PlatformError::internal("Fetch task did not complete"))?;
     drop(fetch_future);
 
-    let _ = processor_result.expect("processor should complete");
+    match processor_result {
+        Some(result) => {
+            result.map_err(|e| PlatformError::internal(format!("Processor task failed: {}", e)))?;
+        }
+        None => {
+            return Err(PlatformError::internal("Processor task did not complete"));
+        }
+    }
 
     // Emit final progress update
     let final_matched = matched.load(Ordering::Relaxed);
@@ -1128,6 +1131,32 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     }
 
     Ok(result)
+}
+
+fn should_emit_filtered_progress(
+    matched_count: usize,
+    processed_count: usize,
+    last_emitted_matched: usize,
+    last_emitted_processed: usize,
+) -> bool {
+    matched_count >= last_emitted_matched + FILTER_PROGRESS_EMIT_MATCHED_STEP
+        || processed_count >= last_emitted_processed + FILTER_PROGRESS_EMIT_PROCESSED_STEP
+        || (matched_count > 0 && last_emitted_matched == 0)
+        || (processed_count > 0 && last_emitted_processed == 0)
+}
+
+fn emit_filtered_progress(
+    on_progress: Option<&ProgressCallback>,
+    matched_count: usize,
+    processed_count: usize,
+) {
+    emit(
+        on_progress,
+        SyncProgress::FilteredPage {
+            matched_so_far: matched_count,
+            processed_so_far: processed_count,
+        },
+    );
 }
 
 #[cfg(test)]

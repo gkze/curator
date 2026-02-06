@@ -28,7 +28,7 @@ pub struct RepoSyncInfo {
 }
 
 /// Pagination parameters for list queries.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Pagination {
     /// Page number (0-indexed).
     pub page: u64,
@@ -39,7 +39,21 @@ pub struct Pagination {
 impl Pagination {
     /// Create a new pagination with the given page and per_page values.
     pub fn new(page: u64, per_page: u64) -> Self {
-        Self { page, per_page }
+        Self {
+            page,
+            per_page: per_page.max(MIN_PER_PAGE),
+        }
+    }
+}
+
+const MIN_PER_PAGE: u64 = 1;
+
+impl Default for Pagination {
+    fn default() -> Self {
+        Self {
+            page: 0,
+            per_page: MIN_PER_PAGE,
+        }
     }
 }
 

@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use console::Term;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::commands::limits::OutputFormat;
 
 #[derive(Parser)]

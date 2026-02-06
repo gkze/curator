@@ -36,7 +36,7 @@
 //! ```
 
 use std::path::PathBuf;
-#[cfg(feature = "github")]
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use std::{fs, io};
 
 use config::{Config as ConfigBuilder, Environment, File, FileFormat};
@@ -338,41 +338,9 @@ impl Config {
     /// preserving formatting, comments, and other settings.
     #[cfg(feature = "github")]
     pub fn save_github_token(token: &str) -> io::Result<PathBuf> {
-        use toml_edit::{DocumentMut, value};
-
-        let config_path = Self::default_config_path().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "Could not determine config directory",
-            )
-        })?;
-
-        // Ensure parent directory exists
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Read existing config or start fresh
-        let content = if config_path.exists() {
-            fs::read_to_string(&config_path)?
-        } else {
-            String::new()
-        };
-
-        // Parse as TOML document (preserves formatting and comments)
-        let mut doc: DocumentMut = content.parse().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid TOML: {}", e))
-        })?;
-
-        // Ensure [github] table exists and set the token
-        if !doc.contains_key("github") {
-            doc["github"] = toml_edit::table();
-        }
-        doc["github"]["token"] = value(token);
-
-        // Write back to file
-        fs::write(&config_path, doc.to_string())?;
-        Ok(config_path)
+        save_toml_section_tokens("github", |doc| {
+            doc["github"]["token"] = toml_edit::value(token);
+        })
     }
 
     /// Save GitLab OAuth tokens to the config file.
@@ -386,48 +354,16 @@ impl Config {
         refresh_token: Option<&str>,
         expires_at: Option<u64>,
     ) -> io::Result<PathBuf> {
-        use toml_edit::{DocumentMut, value};
+        save_toml_section_tokens("gitlab", |doc| {
+            doc["gitlab"]["token"] = toml_edit::value(access_token);
 
-        let config_path = Self::default_config_path().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "Could not determine config directory",
-            )
-        })?;
-
-        // Ensure parent directory exists
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Read existing config or start fresh
-        let content = if config_path.exists() {
-            fs::read_to_string(&config_path)?
-        } else {
-            String::new()
-        };
-
-        // Parse as TOML document (preserves formatting and comments)
-        let mut doc: DocumentMut = content.parse().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid TOML: {}", e))
-        })?;
-
-        // Ensure [gitlab] table exists and set the tokens
-        if !doc.contains_key("gitlab") {
-            doc["gitlab"] = toml_edit::table();
-        }
-        doc["gitlab"]["token"] = value(access_token);
-
-        if let Some(rt) = refresh_token {
-            doc["gitlab"]["refresh_token"] = value(rt);
-        }
-        if let Some(exp) = expires_at {
-            doc["gitlab"]["token_expires_at"] = value(exp as i64);
-        }
-
-        // Write back to file
-        fs::write(&config_path, doc.to_string())?;
-        Ok(config_path)
+            if let Some(rt) = refresh_token {
+                doc["gitlab"]["refresh_token"] = toml_edit::value(rt);
+            }
+            if let Some(exp) = expires_at {
+                doc["gitlab"]["token_expires_at"] = toml_edit::value(exp as i64);
+            }
+        })
     }
 
     /// Save Codeberg OAuth tokens to the config file.
@@ -441,49 +377,53 @@ impl Config {
         refresh_token: Option<&str>,
         expires_at: Option<u64>,
     ) -> io::Result<PathBuf> {
-        use toml_edit::{DocumentMut, value};
+        save_toml_section_tokens("codeberg", |doc| {
+            doc["codeberg"]["token"] = toml_edit::value(access_token);
 
-        let config_path = Self::default_config_path().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "Could not determine config directory",
-            )
-        })?;
-
-        // Ensure parent directory exists
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Read existing config or start fresh
-        let content = if config_path.exists() {
-            fs::read_to_string(&config_path)?
-        } else {
-            String::new()
-        };
-
-        // Parse as TOML document (preserves formatting and comments)
-        let mut doc: DocumentMut = content.parse().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid TOML: {}", e))
-        })?;
-
-        // Ensure [codeberg] table exists and set the tokens
-        if !doc.contains_key("codeberg") {
-            doc["codeberg"] = toml_edit::table();
-        }
-        doc["codeberg"]["token"] = value(access_token);
-
-        if let Some(rt) = refresh_token {
-            doc["codeberg"]["refresh_token"] = value(rt);
-        }
-        if let Some(exp) = expires_at {
-            doc["codeberg"]["token_expires_at"] = value(exp as i64);
-        }
-
-        // Write back to file
-        fs::write(&config_path, doc.to_string())?;
-        Ok(config_path)
+            if let Some(rt) = refresh_token {
+                doc["codeberg"]["refresh_token"] = toml_edit::value(rt);
+            }
+            if let Some(exp) = expires_at {
+                doc["codeberg"]["token_expires_at"] = toml_edit::value(exp as i64);
+            }
+        })
     }
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+fn save_toml_section_tokens(
+    section: &str,
+    update: impl FnOnce(&mut toml_edit::DocumentMut),
+) -> io::Result<PathBuf> {
+    let config_path = Config::default_config_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Could not determine config directory",
+        )
+    })?;
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let content = if config_path.exists() {
+        fs::read_to_string(&config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid TOML: {}", e)))?;
+
+    if !doc.contains_key(section) {
+        doc[section] = toml_edit::table();
+    }
+
+    update(&mut doc);
+
+    fs::write(&config_path, doc.to_string())?;
+    Ok(config_path)
 }
 
 #[cfg(test)]
@@ -508,6 +448,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gitlab")]
     fn test_gitlab_host_default() {
         let config = Config::default();
         assert_eq!(config.gitlab_host(), "gitlab.com");
@@ -740,6 +681,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "gitlab")]
     fn test_config_gitlab_host_with_custom() {
         let toml_content = r#"
             [gitlab]
