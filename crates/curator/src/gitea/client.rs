@@ -39,7 +39,6 @@ pub struct GiteaClient {
     /// The instance ID this client is configured for.
     instance_id: Uuid,
     /// Optional adaptive rate limiter for pacing API requests.
-    #[allow(dead_code)] // Infrastructure for response-header feedback loop
     rate_limiter: Option<AdaptiveRateLimiter>,
 }
 
@@ -100,11 +99,44 @@ impl GiteaClient {
     }
 
     /// Wait for rate limiter if one is configured.
-    #[allow(dead_code)] // Infrastructure for response-header feedback loop
     async fn wait_for_rate_limit(&self) {
         if let Some(ref limiter) = self.rate_limiter {
             limiter.wait().await;
         }
+    }
+
+    /// Update the rate limiter with rate limit info from response headers, if available.
+    fn update_rate_limit(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(ref limiter) = self.rate_limiter
+            && let Some(info) = Self::parse_rate_limit_headers(headers)
+        {
+            limiter.update(&info);
+        }
+    }
+
+    /// Extract rate limit info from Gitea response headers.
+    fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Option<RateLimitInfo> {
+        let limit = headers
+            .get("x-ratelimit-limit")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())?;
+        let remaining = headers
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())?;
+        let reset_epoch = headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())?;
+        let reset_at = chrono::DateTime::from_timestamp(reset_epoch, 0)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(chrono::Utc::now);
+        Some(RateLimitInfo {
+            limit,
+            remaining,
+            reset_at,
+            retry_after: None,
+        })
     }
 
     /// Get the host URL.
@@ -119,6 +151,7 @@ impl GiteaClient {
 
     /// Make an authenticated GET request.
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, GiteaError> {
+        self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1{}", self.host, path);
 
         let response = self
@@ -129,6 +162,9 @@ impl GiteaClient {
             .await?;
 
         let status = response.status();
+        let headers = response.headers().clone();
+        self.update_rate_limit(&headers);
+
         if !status.is_success() {
             let message = response.text().await.unwrap_or_default();
             return Err(GiteaError::Api {
@@ -143,6 +179,7 @@ impl GiteaClient {
 
     /// Make an authenticated PUT request (for starring).
     async fn put(&self, path: &str) -> Result<StatusCode, GiteaError> {
+        self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1{}", self.host, path);
 
         let response = self
@@ -153,6 +190,9 @@ impl GiteaClient {
             .await?;
 
         let status = response.status();
+        let headers = response.headers().clone();
+        self.update_rate_limit(&headers);
+
         if !status.is_success() && status != StatusCode::NO_CONTENT {
             let message = response.text().await.unwrap_or_default();
             return Err(GiteaError::Api {
@@ -166,6 +206,7 @@ impl GiteaClient {
 
     /// Make an authenticated DELETE request (for unstarring).
     async fn delete(&self, path: &str) -> Result<StatusCode, GiteaError> {
+        self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1{}", self.host, path);
 
         let response = self
@@ -176,6 +217,9 @@ impl GiteaClient {
             .await?;
 
         let status = response.status();
+        let headers = response.headers().clone();
+        self.update_rate_limit(&headers);
+
         if !status.is_success() && status != StatusCode::NO_CONTENT {
             let message = response.text().await.unwrap_or_default();
             return Err(GiteaError::Api {

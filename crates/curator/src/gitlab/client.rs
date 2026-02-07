@@ -48,7 +48,6 @@ pub struct GitLabClient {
     /// The instance ID this client is configured for.
     instance_id: Uuid,
     /// Optional adaptive rate limiter for pacing API requests.
-    #[allow(dead_code)] // Infrastructure for response-header feedback loop
     rate_limiter: Option<AdaptiveRateLimiter>,
 }
 
@@ -108,10 +107,18 @@ impl GitLabClient {
     }
 
     /// Wait for rate limiter if one is configured.
-    #[allow(dead_code)] // Infrastructure for response-header feedback loop
     async fn wait_for_rate_limit(&self) {
         if let Some(ref limiter) = self.rate_limiter {
             limiter.wait().await;
+        }
+    }
+
+    /// Update the rate limiter with rate limit info from response headers, if available.
+    fn update_rate_limit(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(ref limiter) = self.rate_limiter
+            && let Some(info) = Self::parse_rate_limit_headers(headers)
+        {
+            limiter.update(&info);
         }
     }
 
@@ -129,6 +136,8 @@ impl GitLabClient {
         url: &str,
         cached_etag: Option<&str>,
     ) -> Result<FetchResult<T>, GitLabError> {
+        self.wait_for_rate_limit().await;
+
         let mut request = self.api.client.get(url);
 
         if let Some(etag) = cached_etag {
@@ -142,6 +151,7 @@ impl GitLabClient {
 
         let status = response.status();
         let headers = response.headers().clone();
+        self.update_rate_limit(&headers);
 
         match status {
             reqwest::StatusCode::NOT_MODIFIED => Ok(FetchResult::NotModified),

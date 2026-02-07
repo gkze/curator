@@ -202,7 +202,6 @@ pub struct GitHubClient {
     /// The instance ID this client is configured for.
     instance_id: Uuid,
     /// Optional adaptive rate limiter for pacing API requests.
-    #[allow(dead_code)] // Infrastructure for response-header feedback loop
     rate_limiter: Option<AdaptiveRateLimiter>,
 }
 
@@ -236,11 +235,44 @@ impl GitHubClient {
     }
 
     /// Wait for rate limiter if one is configured.
-    #[allow(dead_code)] // Infrastructure for response-header feedback loop
     async fn wait_for_rate_limit(&self) {
         if let Some(ref limiter) = self.rate_limiter {
             limiter.wait().await;
         }
+    }
+
+    /// Update the rate limiter with rate limit info from response headers, if available.
+    fn update_rate_limit(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(ref limiter) = self.rate_limiter
+            && let Some(info) = Self::parse_rate_limit_headers(headers)
+        {
+            limiter.update(&info);
+        }
+    }
+
+    /// Extract rate limit info from GitHub response headers.
+    fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Option<RateLimitInfo> {
+        let limit = headers
+            .get("x-ratelimit-limit")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())?;
+        let remaining = headers
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())?;
+        let reset_epoch = headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())?;
+        let reset_at = chrono::DateTime::from_timestamp(reset_epoch, 0)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(chrono::Utc::now);
+        Some(RateLimitInfo {
+            limit,
+            remaining,
+            reset_at,
+            retry_after: None,
+        })
     }
 
     /// Get a reference to the inner Octocrab client.
@@ -258,6 +290,8 @@ impl GitHubClient {
         route: &str,
         cached_etag: Option<&str>,
     ) -> Result<FetchResult<T>, GitHubError> {
+        self.wait_for_rate_limit().await;
+
         // Build the request URL
         let url = format!("https://api.github.com{}", route);
 
@@ -280,6 +314,7 @@ impl GitHubClient {
 
         let status = response.status();
         let headers = response.headers().clone();
+        self.update_rate_limit(&headers);
 
         match status {
             StatusCode::NOT_MODIFIED => Ok(FetchResult::NotModified),
