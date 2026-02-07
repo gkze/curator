@@ -753,6 +753,55 @@ pub async fn get_token_for_instance(
         )
         .into()),
     }
+    .or_else(|e| {
+        // Fallback: try ~/.netrc for the instance host
+        if let Some(token) = read_netrc_token(&instance.host) {
+            Ok(token)
+        } else {
+            Err(e)
+        }
+    })
+}
+
+/// Read a token from ~/.netrc for the given host.
+///
+/// Parses the standard netrc format used by git, curl, and other tools:
+/// ```text
+/// machine github.com
+///   login user
+///   password ghp_xxx
+/// ```
+///
+/// Returns the `password` value for the matching `machine` entry, or `None`.
+fn read_netrc_token(host: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::Path::new(&home).join(".netrc");
+    let content = std::fs::read_to_string(path).ok()?;
+
+    let mut in_machine = false;
+    let mut tokens = content.split_whitespace().peekable();
+
+    while let Some(token) = tokens.next() {
+        match token {
+            "machine" => {
+                if let Some(&machine) = tokens.peek() {
+                    in_machine = machine == host;
+                    tokens.next();
+                }
+            }
+            "password" if in_machine => {
+                return tokens.next().map(|s| s.to_string());
+            }
+            // Also support "default" entry as a last resort
+            "default" if !in_machine => {
+                // Continue scanning for password in the default block
+                in_machine = true;
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 /// Get the Codeberg token, refreshing if expired or near expiry.
