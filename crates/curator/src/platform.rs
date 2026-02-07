@@ -29,6 +29,49 @@ pub use errors::{PlatformError, Result, short_error_message};
 pub use rate_limit::{AdaptiveRateLimiter, rate_limits};
 pub use types::{OrgInfo, PlatformClient, PlatformRepo, ProgressCallback, RateLimitInfo, UserInfo};
 
+use crate::entity::instance::Model as InstanceModel;
+use crate::entity::platform_type::PlatformType;
+
+/// Create a platform client for a given instance.
+///
+/// This is the single entry point for constructing platform-specific clients,
+/// eliminating repeated `match instance.platform_type` blocks across the CLI.
+///
+/// # Arguments
+/// * `instance` - The instance model with platform type and host info
+/// * `token` - Authentication token for the platform
+/// * `rate_limiter` - Optional adaptive rate limiter for request pacing
+pub async fn create_client(
+    instance: &InstanceModel,
+    token: &str,
+    rate_limiter: Option<AdaptiveRateLimiter>,
+) -> std::result::Result<Box<dyn PlatformClient>, PlatformError> {
+    match instance.platform_type {
+        PlatformType::GitHub => {
+            let client = crate::github::GitHubClient::new(token, instance.id, rate_limiter)
+                .map_err(|e| PlatformError::internal(e.to_string()))?;
+            Ok(Box::new(client))
+        }
+        PlatformType::GitLab => {
+            let client =
+                crate::gitlab::GitLabClient::new(&instance.host, token, instance.id, rate_limiter)
+                    .await
+                    .map_err(|e| PlatformError::internal(e.to_string()))?;
+            Ok(Box::new(client))
+        }
+        PlatformType::Gitea => {
+            let client = crate::gitea::GiteaClient::new(
+                &instance.base_url(),
+                token,
+                instance.id,
+                rate_limiter,
+            )
+            .map_err(|e| PlatformError::internal(e.to_string()))?;
+            Ok(Box::new(client))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration as StdDuration, Instant};
