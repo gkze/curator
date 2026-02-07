@@ -493,7 +493,10 @@ mod tests {
         let events_clone = Arc::clone(&events);
 
         let callback: ProgressCallback = Box::new(move |event| {
-            events_clone.lock().unwrap().push(format!("{:?}", event));
+            events_clone
+                .lock()
+                .expect("test events mutex poisoned")
+                .push(format!("{:?}", event));
         });
 
         emit(
@@ -522,7 +525,7 @@ mod tests {
             },
         );
 
-        let recorded = events.lock().unwrap();
+        let recorded = events.lock().expect("test events mutex poisoned");
         assert_eq!(recorded.len(), 3);
         assert!(recorded[0].contains("FetchingRepos"));
         assert!(recorded[1].contains("FetchedPage"));
