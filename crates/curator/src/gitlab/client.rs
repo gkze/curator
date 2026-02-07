@@ -930,10 +930,13 @@ impl PlatformClient for GitLabClient {
         &self,
         repo_tx: tokio::sync::mpsc::Sender<PlatformRepo>,
         db: Option<&sea_orm::DatabaseConnection>,
-        _concurrency: usize,
+        concurrency: usize,
         _skip_rate_checks: bool,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<usize> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Semaphore;
+
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -944,15 +947,245 @@ impl PlatformClient for GitLabClient {
         );
 
         let user = self.get_user_info().await?;
-        let (projects, stats) = self
-            .list_starred_projects(user.id, &user.username, db)
-            .await?;
+        let host = self.host.clone();
+        let username = user.username.clone();
+        let cache_key_prefix = format!("{}/starred", &username);
 
-        self.update_starred_cache(user.id, &projects).await;
+        // Try to load known total_pages from DB for cache-hit continuation
+        let mut known_total_pages: Option<u32> = None;
+        if let Some(db) = db
+            && let Ok(Some(stored)) = api_cache::get_total_pages(
+                db,
+                self.instance_id,
+                EndpointType::Starred,
+                &cache_key_prefix,
+            )
+            .await
+        {
+            known_total_pages = Some(stored as u32);
+        }
 
-        // Cache-hit fallback for streaming
-        if stats.all_cached()
-            && projects.is_empty()
+        // ── Page 1 (sequential) ─────────────────────────────────────
+        let url = format!(
+            "{}/api/v4/users/{}/starred_projects?per_page=100&page=1",
+            host, user.id,
+        );
+        let cache_key = ApiCacheModel::starred_key(&username, 1);
+        let cached_etag = if let Some(db) = db {
+            api_cache::get_etag(db, self.instance_id, EndpointType::Starred, &cache_key)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let first_result: FetchResult<Vec<GitLabProject>> =
+            self.get_conditional(&url, cached_etag.as_deref()).await?;
+
+        let total_sent = Arc::new(AtomicUsize::new(0));
+        let mut all_projects: Vec<GitLabProject> = Vec::new();
+        let mut all_cache_hits;
+
+        match first_result {
+            FetchResult::NotModified => {
+                all_cache_hits = true;
+                // If we don't know total_pages, we can't continue paginating
+                if known_total_pages.is_none() || known_total_pages == Some(1) {
+                    // All cached, fall back to DB
+                    if let Some(db) = db {
+                        let cached_repos = repository::find_all_by_instance(db, self.instance_id)
+                            .await
+                            .map_err(|e| PlatformError::internal(e.to_string()))?;
+
+                        if !cached_repos.is_empty() {
+                            emit(
+                                on_progress,
+                                SyncProgress::CacheHit {
+                                    namespace: "starred".to_string(),
+                                    cached_count: cached_repos.len(),
+                                },
+                            );
+
+                            for model in &cached_repos {
+                                let repo = PlatformRepo::from_model(model);
+                                if repo_tx.send(repo).await.is_ok() {
+                                    total_sent.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+
+                            let sent = total_sent.load(Ordering::Relaxed);
+                            emit(
+                                on_progress,
+                                SyncProgress::FetchComplete {
+                                    namespace: "starred".to_string(),
+                                    total: sent,
+                                },
+                            );
+                            return Ok(sent);
+                        }
+                    }
+                }
+            }
+            FetchResult::Fetched {
+                data: items,
+                etag,
+                pagination,
+            } => {
+                all_cache_hits = false;
+                if let Some(tp) = pagination.total_pages {
+                    known_total_pages = Some(tp);
+                }
+
+                // Store ETag + pagination for page 1
+                if let Some(db) = db {
+                    let _ = api_cache::upsert_with_pagination(
+                        db,
+                        self.instance_id,
+                        EndpointType::Starred,
+                        &cache_key,
+                        etag,
+                        known_total_pages.map(|t| t as i32),
+                    )
+                    .await;
+                }
+
+                let page_count = items.len();
+
+                // Stream page 1 repos immediately
+                for project in &items {
+                    let platform_repo = to_platform_repo(project);
+                    if repo_tx.send(platform_repo).await.is_ok() {
+                        total_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
+                        namespace: "starred".to_string(),
+                        page: 1,
+                        count: page_count,
+                        total_so_far: total_sent.load(Ordering::Relaxed),
+                        expected_pages: known_total_pages,
+                    },
+                );
+
+                all_projects.extend(items);
+            }
+        }
+
+        // ── Remaining pages (concurrent) ────────────────────────────
+        let total_pages = known_total_pages.unwrap_or(1);
+        if total_pages > 1 {
+            let semaphore = Arc::new(Semaphore::new(concurrency));
+            let mut handles = Vec::new();
+
+            let user_id = user.id;
+
+            for page in 2..=total_pages {
+                let client = self.clone();
+                let task_repo_tx = repo_tx.clone();
+                let task_total_sent = Arc::clone(&total_sent);
+                let task_semaphore = Arc::clone(&semaphore);
+                let task_host = host.clone();
+
+                // Pre-fetch ETag outside the spawn so we can borrow db
+                let task_cached_etag = if let Some(db) = db {
+                    let ck = ApiCacheModel::starred_key(&username, page);
+                    api_cache::get_etag(db, self.instance_id, EndpointType::Starred, &ck)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+
+                let handle = tokio::spawn(async move {
+                    let _permit = task_semaphore.acquire().await.ok()?;
+
+                    let url = format!(
+                        "{}/api/v4/users/{}/starred_projects?per_page=100&page={}",
+                        task_host, user_id, page,
+                    );
+
+                    let result: Result<FetchResult<Vec<GitLabProject>>, GitLabError> = client
+                        .get_conditional(&url, task_cached_etag.as_deref())
+                        .await;
+
+                    match result {
+                        Ok(FetchResult::NotModified) => {
+                            // Cache hit — no items to stream
+                            Some((page, Vec::<GitLabProject>::new(), true, None))
+                        }
+                        Ok(FetchResult::Fetched {
+                            data: items, etag, ..
+                        }) => {
+                            for project in &items {
+                                let platform_repo = to_platform_repo(project);
+                                if task_repo_tx.send(platform_repo).await.is_ok() {
+                                    task_total_sent.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Some((page, items, false, etag))
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to fetch starred repos page {}: {}",
+                                page,
+                                short_error_message(&e),
+                            );
+                            None
+                        }
+                    }
+                });
+
+                handles.push(handle);
+            }
+
+            // Collect results from all spawned tasks
+            for handle in handles {
+                if let Ok(Some((page_num, items, was_cache_hit, etag))) = handle.await {
+                    if !was_cache_hit {
+                        all_cache_hits = false;
+                    }
+
+                    // Store ETag for fetched pages
+                    if let Some(db) = db
+                        && !was_cache_hit
+                    {
+                        let ck = ApiCacheModel::starred_key(&username, page_num);
+                        let _ = api_cache::upsert_with_pagination(
+                            db,
+                            self.instance_id,
+                            EndpointType::Starred,
+                            &ck,
+                            etag,
+                            None, // total_pages already stored on page 1
+                        )
+                        .await;
+                    }
+
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchedPage {
+                            namespace: "starred".to_string(),
+                            page: page_num,
+                            count: items.len(),
+                            total_so_far: total_sent.load(Ordering::Relaxed),
+                            expected_pages: known_total_pages,
+                        },
+                    );
+
+                    all_projects.extend(items);
+                }
+            }
+        }
+
+        // ── Cache-hit fallback ──────────────────────────────────────
+        // If every page returned 304 and we got no projects, load from DB
+        if all_cache_hits
+            && all_projects.is_empty()
             && let Some(db) = db
         {
             let cached_repos = repository::find_all_by_instance(db, self.instance_id)
@@ -968,33 +1201,19 @@ impl PlatformClient for GitLabClient {
                     },
                 );
 
-                let mut sent = 0usize;
                 for model in &cached_repos {
                     let repo = PlatformRepo::from_model(model);
                     if repo_tx.send(repo).await.is_ok() {
-                        sent += 1;
+                        total_sent.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-
-                emit(
-                    on_progress,
-                    SyncProgress::FetchComplete {
-                        namespace: "starred".to_string(),
-                        total: sent,
-                    },
-                );
-                return Ok(sent);
             }
         }
 
-        let mut sent = 0usize;
-        for project in &projects {
-            let platform_repo = to_platform_repo(project);
-            if repo_tx.send(platform_repo).await.is_ok() {
-                sent += 1;
-            }
-        }
+        // Update starred cache with all projects we collected
+        self.update_starred_cache(user.id, &all_projects).await;
 
+        let sent = total_sent.load(Ordering::Relaxed);
         emit(
             on_progress,
             SyncProgress::FetchComplete {
