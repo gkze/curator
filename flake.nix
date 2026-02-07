@@ -199,6 +199,13 @@
               src = ./.;
               package = pkgs.prek;
               hooks = {
+                cargo-dist-generate-check = {
+                  enable = true;
+                  name = "cargo dist generate --check";
+                  entry = "cargo dist generate --mode ci --check";
+                  pass_filenames = false;
+                  stages = [ "pre-commit" ];
+                };
                 nix-fmt = {
                   enable = true;
                   name = "nix fmt";
@@ -231,6 +238,7 @@
               [
                 act
                 cargo-hack
+                cargo-dist
                 cargo-llvm-cov
                 cargo-nextest
                 cargo-release
