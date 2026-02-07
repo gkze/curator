@@ -124,15 +124,6 @@ async fn get_instance(
         })
 }
 
-/// Get the default RPS for an instance's platform type.
-fn get_default_rps(instance: &InstanceModel) -> u32 {
-    match instance.platform_type {
-        PlatformType::GitHub => rate_limits::GITHUB_DEFAULT_RPS,
-        PlatformType::GitLab => rate_limits::GITLAB_DEFAULT_RPS,
-        PlatformType::Gitea => rate_limits::GITEA_DEFAULT_RPS,
-    }
-}
-
 fn merge_common_sync_options(
     sync_opts: &CommonSyncOptions,
     config: &Config,
@@ -210,19 +201,27 @@ async fn sync_org(
         Arc::clone(&db),
         options.clone(),
         no_rate_limit,
-        get_default_rps(&instance),
         active_within_days,
     );
 
     // Display rate limit status (platform-dependent)
     let is_tty = Term::stdout().is_term();
 
+    // Create rate limiter for client construction
+    let rate_limiter = if no_rate_limit {
+        None
+    } else {
+        Some(curator::AdaptiveRateLimiter::new(
+            rate_limits::default_rps_for_platform(instance.platform_type),
+        ))
+    };
+
     match instance.platform_type {
         #[cfg(feature = "github")]
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
 
-            let client = GitHubClient::new(&token, instance.id)?;
+            let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
             display_rate_limit(&client, is_tty).await;
 
             if names.len() == 1 {
@@ -239,7 +238,8 @@ async fn sync_org(
         PlatformType::GitLab => {
             use curator::gitlab::GitLabClient;
 
-            let client = GitLabClient::new(&instance.host, &token, instance.id).await?;
+            let client =
+                GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
 
             if names.len() == 1 {
                 let result = runner.run_namespace(&client, &names[0]).await?;
@@ -255,7 +255,7 @@ async fn sync_org(
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
 
-            let client = GiteaClient::new(&instance.base_url(), &token, instance.id)?;
+            let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
 
             if names.len() == 1 {
                 let result = runner.run_namespace(&client, &names[0]).await?;
@@ -311,18 +311,26 @@ async fn sync_user(
         Arc::clone(&db),
         options.clone(),
         no_rate_limit,
-        get_default_rps(&instance),
         active_within_days,
     );
 
     let is_tty = Term::stdout().is_term();
+
+    // Create rate limiter for client construction
+    let rate_limiter = if no_rate_limit {
+        None
+    } else {
+        Some(curator::AdaptiveRateLimiter::new(
+            rate_limits::default_rps_for_platform(instance.platform_type),
+        ))
+    };
 
     match instance.platform_type {
         #[cfg(feature = "github")]
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
 
-            let client = GitHubClient::new(&token, instance.id)?;
+            let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
             display_rate_limit(&client, is_tty).await;
 
             if names.len() == 1 {
@@ -339,7 +347,8 @@ async fn sync_user(
         PlatformType::GitLab => {
             use curator::gitlab::GitLabClient;
 
-            let client = GitLabClient::new(&instance.host, &token, instance.id).await?;
+            let client =
+                GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
 
             if names.len() == 1 {
                 let result = runner.run_user(&client, &names[0]).await?;
@@ -355,7 +364,7 @@ async fn sync_user(
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
 
-            let client = GiteaClient::new(&instance.base_url(), &token, instance.id)?;
+            let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
 
             if names.len() == 1 {
                 let result = runner.run_user(&client, &names[0]).await?;
@@ -410,18 +419,26 @@ async fn sync_stars(
         Arc::clone(&db),
         options.clone(),
         no_rate_limit,
-        get_default_rps(&instance),
         active_within_days,
     );
 
     let is_tty = Term::stdout().is_term();
+
+    // Create rate limiter for client construction
+    let rate_limiter = if no_rate_limit {
+        None
+    } else {
+        Some(curator::AdaptiveRateLimiter::new(
+            rate_limits::default_rps_for_platform(instance.platform_type),
+        ))
+    };
 
     match instance.platform_type {
         #[cfg(feature = "github")]
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
 
-            let client = GitHubClient::new(&token, instance.id)?;
+            let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
             display_rate_limit(&client, is_tty).await;
 
             let result = runner.run_starred(&client).await?;
@@ -433,7 +450,8 @@ async fn sync_stars(
         PlatformType::GitLab => {
             use curator::gitlab::GitLabClient;
 
-            let client = GitLabClient::new(&instance.host, &token, instance.id).await?;
+            let client =
+                GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
 
             let result = runner.run_starred(&client).await?;
             runner.print_starred_result(&result, prune);
@@ -444,7 +462,7 @@ async fn sync_stars(
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
 
-            let client = GiteaClient::new(&instance.base_url(), &token, instance.id)?;
+            let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
 
             let result = runner.run_starred(&client).await?;
             runner.print_starred_result(&result, prune);

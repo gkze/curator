@@ -7,12 +7,10 @@
 //!
 //! ```ignore
 //! use curator::sync::{SyncContext, SyncOptions};
-//! use curator::platform::ApiRateLimiter;
 //!
 //! let ctx = SyncContext::builder()
 //!     .client(github_client)
 //!     .options(SyncOptions::default())
-//!     .rate_limiter(ApiRateLimiter::new(5))
 //!     .database(db)
 //!     .progress(callback)
 //!     .build()?;
@@ -29,7 +27,7 @@ use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
 
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
-use crate::platform::{ApiRateLimiter, PlatformClient, PlatformError};
+use crate::platform::{PlatformClient, PlatformError};
 
 use super::engine::{
     sync_namespace, sync_namespace_streaming, sync_namespaces_streaming, sync_starred_streaming,
@@ -62,7 +60,6 @@ pub type Result<T> = std::result::Result<T, SyncContextError>;
 pub struct SyncContextBuilder<C> {
     client: Option<C>,
     options: Option<SyncOptions>,
-    rate_limiter: Option<ApiRateLimiter>,
     database: Option<Arc<DatabaseConnection>>,
     progress: Option<Arc<ProgressCallback>>,
     shutdown_flag: Option<Arc<AtomicBool>>,
@@ -73,7 +70,6 @@ impl<C> Default for SyncContextBuilder<C> {
         Self {
             client: None,
             options: None,
-            rate_limiter: None,
             database: None,
             progress: None,
             shutdown_flag: None,
@@ -96,12 +92,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContextBuilder<C> {
     /// Set sync options.
     pub fn options(mut self, options: SyncOptions) -> Self {
         self.options = Some(options);
-        self
-    }
-
-    /// Set the rate limiter for proactive rate limiting.
-    pub fn rate_limiter(mut self, limiter: ApiRateLimiter) -> Self {
-        self.rate_limiter = Some(limiter);
         self
     }
 
@@ -137,7 +127,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContextBuilder<C> {
         Ok(SyncContext {
             client,
             options,
-            rate_limiter: self.rate_limiter,
             database: self.database,
             progress: self.progress,
             shutdown_flag: self.shutdown_flag,
@@ -152,7 +141,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContextBuilder<C> {
 pub struct SyncContext<C> {
     client: C,
     options: SyncOptions,
-    rate_limiter: Option<ApiRateLimiter>,
     database: Option<Arc<DatabaseConnection>>,
     progress: Option<Arc<ProgressCallback>>,
     shutdown_flag: Option<Arc<AtomicBool>>,
@@ -172,11 +160,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
     /// Get a reference to the options.
     pub fn options(&self) -> &SyncOptions {
         &self.options
-    }
-
-    /// Get a reference to the rate limiter.
-    pub fn rate_limiter(&self) -> Option<&ApiRateLimiter> {
-        self.rate_limiter.as_ref()
     }
 
     /// Get a reference to the database connection.
@@ -278,7 +261,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
             &self.client,
             namespace,
             &self.options,
-            self.rate_limiter.as_ref(),
             self.database.as_ref().map(|db| db.as_ref()),
             self.progress.as_ref().map(|p| p.as_ref()),
         )
@@ -299,7 +281,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
                     &self.client,
                     namespace,
                     &self.options,
-                    self.rate_limiter.as_ref(),
                     self.database.as_ref().map(|db| db.as_ref()),
                     tx,
                     self.progress.as_ref().map(|p| p.as_ref()),
@@ -320,7 +301,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
                 &self.client,
                 namespaces,
                 &self.options,
-                self.rate_limiter.as_ref(),
                 self.database.clone(),
                 tx,
                 self.progress.as_ref().map(|p| p.as_ref()),
@@ -340,7 +320,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
                     &self.client,
                     username,
                     &self.options,
-                    self.rate_limiter.as_ref(),
                     self.database.as_ref().map(|db| db.as_ref()),
                     tx,
                     self.progress.as_ref().map(|p| p.as_ref()),
@@ -361,7 +340,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
                 &self.client,
                 usernames,
                 &self.options,
-                self.rate_limiter.as_ref(),
                 self.database.clone(),
                 tx,
                 self.progress.as_ref().map(|p| p.as_ref()),
@@ -382,7 +360,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
                 sync_starred_streaming(
                     &self.client,
                     &self.options,
-                    self.rate_limiter.as_ref(),
                     self.database.as_ref().map(|db| db.as_ref()),
                     self.options.concurrency,
                     skip_rate_checks,
@@ -452,7 +429,6 @@ mod tests {
         let builder: SyncContextBuilder<String> = SyncContextBuilder::default();
         assert!(builder.client.is_none());
         assert!(builder.options.is_none());
-        assert!(builder.rate_limiter.is_none());
         assert!(builder.database.is_none());
         assert!(builder.progress.is_none());
         assert!(builder.shutdown_flag.is_none());

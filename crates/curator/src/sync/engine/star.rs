@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
-use crate::platform::{ApiRateLimiter, PlatformClient, PlatformError, PlatformRepo};
+use crate::platform::{PlatformClient, PlatformError, PlatformRepo};
 
 use super::super::progress::{ProgressCallback, SyncProgress, emit};
 use super::super::types::StarringStats;
@@ -104,7 +104,6 @@ pub(super) async fn star_repos_concurrent<C: PlatformClient + Clone + 'static>(
     repos: Vec<(String, String)>,
     concurrency: usize,
     dry_run: bool,
-    rate_limiter: Option<&ApiRateLimiter>,
     on_progress: Option<&ProgressCallback>,
 ) -> StarringStats {
     let mut stats = StarringStats::default();
@@ -115,7 +114,6 @@ pub(super) async fn star_repos_concurrent<C: PlatformClient + Clone + 'static>(
 
     let concurrency = std::cmp::min(concurrency, repos.len());
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let limiter = rate_limiter.cloned();
 
     emit(
         on_progress,
@@ -131,7 +129,6 @@ pub(super) async fn star_repos_concurrent<C: PlatformClient + Clone + 'static>(
     for (owner, name) in repos {
         let client = client.clone();
         let semaphore = Arc::clone(&semaphore);
-        let limiter = limiter.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = match semaphore.acquire().await {
@@ -144,10 +141,6 @@ pub(super) async fn star_repos_concurrent<C: PlatformClient + Clone + 'static>(
                     );
                 }
             };
-
-            if let Some(ref limiter) = limiter {
-                limiter.wait().await;
-            }
 
             let result = if dry_run {
                 match client.is_repo_starred(&owner, &name).await {
@@ -239,7 +232,6 @@ pub(super) async fn prune_repos<C: PlatformClient + Clone + 'static>(
     client: &C,
     repos: Vec<(String, String)>,
     dry_run: bool,
-    rate_limiter: Option<&ApiRateLimiter>,
     on_progress: Option<&ProgressCallback>,
 ) -> PruneResult {
     let mut result = PruneResult {
@@ -261,10 +253,6 @@ pub(super) async fn prune_repos<C: PlatformClient + Clone + 'static>(
     );
 
     for (owner, name) in repos {
-        if let Some(limiter) = rate_limiter {
-            limiter.wait().await;
-        }
-
         if dry_run {
             result.pruned += 1;
             result.pruned_repos.push((owner.clone(), name.clone()));

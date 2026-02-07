@@ -26,7 +26,7 @@ mod types;
 pub use conditional::{CacheStats, FetchResult, PaginationInfo};
 pub use convert::strip_null_values;
 pub use errors::{PlatformError, Result, short_error_message};
-pub use rate_limit::{ApiRateLimiter, RateLimitedClient, rate_limits};
+pub use rate_limit::{AdaptiveRateLimiter, rate_limits};
 pub use types::{OrgInfo, PlatformClient, PlatformRepo, ProgressCallback, RateLimitInfo, UserInfo};
 
 #[cfg(test)]
@@ -228,6 +228,7 @@ mod tests {
             limit: 5000,
             remaining: 4999,
             reset_at: Utc::now(),
+            retry_after: None,
         };
         assert_eq!(info.limit, 5000);
         assert_eq!(info.remaining, 4999);
@@ -282,74 +283,106 @@ mod tests {
     }
 
     #[test]
-    fn test_api_rate_limiter_new() {
-        let limiter = ApiRateLimiter::new(10);
-        // Just verify it can be created without panicking
+    fn test_adaptive_rate_limiter_new() {
+        let limiter = AdaptiveRateLimiter::new(10);
+        let rps = limiter.current_rps();
+        assert!((rps - 10.0).abs() < 0.01);
 
-        // Test with zero (should default to 1)
-        let limiter_zero = ApiRateLimiter::new(0);
+        // Zero defaults to 1
+        let limiter_zero = AdaptiveRateLimiter::new(0);
+        let rps = limiter_zero.current_rps();
+        assert!((rps - 1.0).abs() < 0.01);
+    }
 
-        // Verify Clone works
-        let _cloned = limiter.clone();
-        let _cloned_zero = limiter_zero.clone();
+    #[test]
+    fn test_adaptive_rate_limiter_update_adjusts_rps() {
+        let limiter = AdaptiveRateLimiter::new(10);
+
+        // Simulate: 1000 remaining, reset in 100 seconds => target 10 rps
+        let info = RateLimitInfo {
+            limit: 5000,
+            remaining: 1000,
+            reset_at: Utc::now() + chrono::Duration::seconds(100),
+            retry_after: None,
+        };
+        limiter.update(&info);
+        let rps = limiter.current_rps();
+        assert!((rps - 10.0).abs() < 0.5, "Expected ~10 rps, got {}", rps);
+
+        // Simulate: 100 remaining, reset in 100 seconds => target 1 rps
+        let info = RateLimitInfo {
+            limit: 5000,
+            remaining: 100,
+            reset_at: Utc::now() + chrono::Duration::seconds(100),
+            retry_after: None,
+        };
+        limiter.update(&info);
+        let rps = limiter.current_rps();
+        assert!((rps - 1.0).abs() < 0.2, "Expected ~1 rps, got {}", rps);
+    }
+
+    #[test]
+    fn test_adaptive_rate_limiter_clamps_to_min_rps() {
+        let limiter = AdaptiveRateLimiter::new(10);
+
+        // Simulate: 1 remaining, reset in 100 seconds => 0.01 rps, clamped to MIN_RPS
+        let info = RateLimitInfo {
+            limit: 5000,
+            remaining: 1,
+            reset_at: Utc::now() + chrono::Duration::seconds(100),
+            retry_after: None,
+        };
+        limiter.update(&info);
+        let rps = limiter.current_rps();
+        assert!(rps >= 0.5, "RPS should be clamped to min, got {}", rps);
+    }
+
+    #[test]
+    fn test_adaptive_rate_limiter_clamps_to_max_rps() {
+        let limiter = AdaptiveRateLimiter::new(10);
+
+        // Simulate: 5000 remaining, reset in 1 second => 5000 rps, clamped to MAX_RPS
+        let info = RateLimitInfo {
+            limit: 5000,
+            remaining: 5000,
+            reset_at: Utc::now() + chrono::Duration::seconds(1),
+            retry_after: None,
+        };
+        limiter.update(&info);
+        let rps = limiter.current_rps();
+        assert!(rps <= 50.0, "RPS should be clamped to max, got {}", rps);
     }
 
     #[tokio::test]
-    async fn test_api_rate_limiter_wait_allows_first_request() {
-        let limiter = ApiRateLimiter::new(100); // High RPS for fast test
+    async fn test_adaptive_rate_limiter_wait_allows_first_request() {
+        let limiter = AdaptiveRateLimiter::new(100);
         let start = Instant::now();
         limiter.wait().await;
-        // First request should be nearly instant
         assert!(start.elapsed() < StdDuration::from_millis(50));
     }
 
-    #[tokio::test]
-    async fn test_api_rate_limiter_respects_rate() {
-        // Use a slower rate (2 RPS = 500ms between requests) for reliable testing
-        let limiter = ApiRateLimiter::new(2);
-        let start = Instant::now();
-
-        // First request should be instant (burst allowed)
-        limiter.wait().await;
-        let after_first = start.elapsed();
-
-        // Second request
-        limiter.wait().await;
-        let after_second = start.elapsed();
-
-        // The limiter should throttle after the first request
-        // Allow generous tolerance for test timing variability
-        // At 2 RPS, second request should wait ~500ms, but burst may allow instant
-        // Just verify the limiter doesn't crash and completes in reasonable time
-        assert!(after_second >= after_first);
-        assert!(after_second < StdDuration::from_secs(5)); // Sanity check
-    }
-
     #[test]
-    fn test_rate_limited_client_new() {
-        // We can't easily create a mock PlatformClient, but we can verify
-        // the RateLimitedClient wrapper compiles and the inner() method works
-        fn _assert_wrapper_compiles<C: PlatformClient>(client: C) {
-            let wrapped = RateLimitedClient::new(client, 10);
-            let _inner = wrapped.inner();
-        }
+    fn test_adaptive_rate_limiter_clone_shares_state() {
+        let limiter = AdaptiveRateLimiter::new(10);
+        let cloned = limiter.clone();
 
-        // Verify the function compiles (we can't call it without a real client)
-        fn _verify_compiles() {
-            fn _test<C: PlatformClient>(c: C) {
-                _assert_wrapper_compiles(c);
-            }
-        }
-    }
+        // Update through one reference
+        let info = RateLimitInfo {
+            limit: 5000,
+            remaining: 250,
+            reset_at: Utc::now() + chrono::Duration::seconds(100),
+            retry_after: None,
+        };
+        limiter.update(&info);
 
-    #[test]
-    fn test_rate_limited_client_clone() {
-        // Verify RateLimitedClient is Clone when inner is Clone
-        fn _assert_clone<T: Clone>() {}
-
-        // This would fail to compile if RateLimitedClient<C> isn't Clone when C: Clone
-        fn _verify<C: PlatformClient + Clone>() {
-            _assert_clone::<RateLimitedClient<C>>();
-        }
+        // Both should see the same RPS
+        let rps1 = limiter.current_rps();
+        let rps2 = cloned.current_rps();
+        assert!(
+            (rps1 - rps2).abs() < 0.01,
+            "Cloned limiter should share state: {} vs {}",
+            rps1,
+            rps2
+        );
     }
 }

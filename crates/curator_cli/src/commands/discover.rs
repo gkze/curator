@@ -264,17 +264,25 @@ async fn sync_instance_repos(
         Arc::clone(&db_conn),
         options.clone(),
         no_rate_limit,
-        default_rps(instance),
         active_within_days,
     );
 
     let is_tty = Term::stdout().is_term();
 
+    // Create rate limiter for client construction
+    let rate_limiter = if no_rate_limit {
+        None
+    } else {
+        Some(curator::AdaptiveRateLimiter::new(
+            rate_limits::default_rps_for_platform(instance.platform_type),
+        ))
+    };
+
     match instance.platform_type {
         #[cfg(feature = "github")]
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
-            let client = GitHubClient::new(&token, instance.id)?;
+            let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
             let result = runner.run_repo_list(&client, &instance.name, repos).await?;
             runner.print_single_result(&instance.name, &result, SyncKind::Namespace);
             display_final_rate_limit(&client, is_tty, no_rate_limit).await;
@@ -282,7 +290,8 @@ async fn sync_instance_repos(
         #[cfg(feature = "gitlab")]
         PlatformType::GitLab => {
             use curator::gitlab::GitLabClient;
-            let client = GitLabClient::new(&instance.host, &token, instance.id).await?;
+            let client =
+                GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
             let result = runner.run_repo_list(&client, &instance.name, repos).await?;
             runner.print_single_result(&instance.name, &result, SyncKind::Namespace);
             display_final_rate_limit(&client, is_tty, no_rate_limit).await;
@@ -290,7 +299,7 @@ async fn sync_instance_repos(
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
-            let client = GiteaClient::new(&instance.base_url(), &token, instance.id)?;
+            let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
             let result = runner.run_repo_list(&client, &instance.name, repos).await?;
             runner.print_single_result(&instance.name, &result, SyncKind::Namespace);
             display_final_rate_limit(&client, is_tty, no_rate_limit).await;
@@ -306,14 +315,6 @@ async fn sync_instance_repos(
     }
 
     Ok(())
-}
-
-fn default_rps(instance: &InstanceModel) -> u32 {
-    match instance.platform_type {
-        PlatformType::GitHub => rate_limits::GITHUB_DEFAULT_RPS,
-        PlatformType::GitLab => rate_limits::GITLAB_DEFAULT_RPS,
-        PlatformType::Gitea => rate_limits::GITEA_DEFAULT_RPS,
-    }
 }
 
 fn normalize_host(host: &str) -> String {

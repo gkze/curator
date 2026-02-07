@@ -17,8 +17,8 @@ use super::error::{GitHubError, is_rate_limit_error_from_github, short_error_mes
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
-    self, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient, PlatformError,
-    PlatformRepo, RateLimitInfo, UserInfo,
+    self, AdaptiveRateLimiter, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient,
+    PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
 };
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
@@ -144,6 +144,7 @@ pub async fn get_rate_limit(client: &Octocrab) -> Result<RateLimitInfo, GitHubEr
         limit: core.limit,
         remaining: core.remaining,
         reset_at: DateTime::from_timestamp(core.reset as i64, 0).unwrap_or_else(Utc::now),
+        retry_after: None,
     })
 }
 
@@ -200,16 +201,24 @@ pub struct GitHubClient {
     token: Arc<String>,
     /// The instance ID this client is configured for.
     instance_id: Uuid,
+    /// Optional adaptive rate limiter for pacing API requests.
+    #[allow(dead_code)] // Infrastructure for response-header feedback loop
+    rate_limiter: Option<AdaptiveRateLimiter>,
 }
 
 impl GitHubClient {
     /// Create a new GitHub client from an authentication token.
-    pub fn new(token: &str, instance_id: Uuid) -> Result<Self, GitHubError> {
+    pub fn new(
+        token: &str,
+        instance_id: Uuid,
+        rate_limiter: Option<AdaptiveRateLimiter>,
+    ) -> Result<Self, GitHubError> {
         let client = create_client(token)?;
         Ok(Self {
             inner: Arc::new(client),
             token: Arc::new(token.to_string()),
             instance_id,
+            rate_limiter,
         })
     }
 
@@ -222,6 +231,15 @@ impl GitHubClient {
             inner: Arc::new(client),
             token: Arc::new(String::new()),
             instance_id,
+            rate_limiter: None,
+        }
+    }
+
+    /// Wait for rate limiter if one is configured.
+    #[allow(dead_code)] // Infrastructure for response-header feedback loop
+    async fn wait_for_rate_limit(&self) {
+        if let Some(ref limiter) = self.rate_limiter {
+            limiter.wait().await;
         }
     }
 

@@ -15,7 +15,8 @@ use super::types::{GiteaAuthUser, GiteaOrg, GiteaRepo};
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
-    self, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
+    self, AdaptiveRateLimiter, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo,
+    UserInfo,
 };
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
@@ -37,6 +38,9 @@ pub struct GiteaClient {
     token: String,
     /// The instance ID this client is configured for.
     instance_id: Uuid,
+    /// Optional adaptive rate limiter for pacing API requests.
+    #[allow(dead_code)] // Infrastructure for response-header feedback loop
+    rate_limiter: Option<AdaptiveRateLimiter>,
 }
 
 impl GiteaClient {
@@ -60,7 +64,12 @@ impl GiteaClient {
     /// // For self-hosted Gitea/Forgejo
     /// let client = GiteaClient::new("https://git.example.com", "token", instance_id)?;
     /// ```
-    pub fn new(host: &str, token: &str, instance_id: Uuid) -> Result<Self, GiteaError> {
+    pub fn new(
+        host: &str,
+        token: &str,
+        instance_id: Uuid,
+        rate_limiter: Option<AdaptiveRateLimiter>,
+    ) -> Result<Self, GiteaError> {
         // Normalize host URL
         let host = host.trim_end_matches('/').to_string();
 
@@ -86,7 +95,16 @@ impl GiteaClient {
             host,
             token: token.to_string(),
             instance_id,
+            rate_limiter,
         })
+    }
+
+    /// Wait for rate limiter if one is configured.
+    #[allow(dead_code)] // Infrastructure for response-header feedback loop
+    async fn wait_for_rate_limit(&self) {
+        if let Some(ref limiter) = self.rate_limiter {
+            limiter.wait().await;
+        }
     }
 
     /// Get the host URL.
@@ -181,6 +199,7 @@ impl GiteaClient {
             limit: 1000,
             remaining: 1000,
             reset_at: Utc::now() + chrono::Duration::minutes(1),
+            retry_after: None,
         }
     }
 
@@ -767,7 +786,7 @@ pub fn create_client(
     token: &str,
     instance_id: Uuid,
 ) -> Result<GiteaClient, GiteaError> {
-    GiteaClient::new(host, token, instance_id)
+    GiteaClient::new(host, token, instance_id, None)
 }
 
 #[cfg(test)]
@@ -780,6 +799,7 @@ mod tests {
             limit: 1000,
             remaining: 999,
             reset_at: Utc::now(),
+            retry_after: None,
         };
         assert_eq!(info.limit, 1000);
         assert_eq!(info.remaining, 999);

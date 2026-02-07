@@ -23,8 +23,8 @@ use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
-    self, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient, PlatformError,
-    PlatformRepo, RateLimitInfo, UserInfo,
+    self, AdaptiveRateLimiter, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient,
+    PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
 };
 use crate::repository;
 use crate::retry::with_retry;
@@ -47,6 +47,9 @@ pub struct GitLabClient {
     starred_projects_cache: Arc<Mutex<Option<StarredProjectsCache>>>,
     /// The instance ID this client is configured for.
     instance_id: Uuid,
+    /// Optional adaptive rate limiter for pacing API requests.
+    #[allow(dead_code)] // Infrastructure for response-header feedback loop
+    rate_limiter: Option<AdaptiveRateLimiter>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +63,12 @@ impl GitLabClient {
     ///
     /// Builds a [`reqwest::Client`] with the supplied token and passes it to
     /// the Progenitor-generated client via [`api::Client::new_with_client`].
-    pub async fn new(host: &str, token: &str, instance_id: Uuid) -> Result<Self, GitLabError> {
+    pub async fn new(
+        host: &str,
+        token: &str,
+        instance_id: Uuid,
+        rate_limiter: Option<AdaptiveRateLimiter>,
+    ) -> Result<Self, GitLabError> {
         let host_only = host
             .trim_start_matches("https://")
             .trim_start_matches("http://")
@@ -95,7 +103,16 @@ impl GitLabClient {
             host: normalized_host,
             starred_projects_cache: Arc::new(Mutex::new(None)),
             instance_id,
+            rate_limiter,
         })
+    }
+
+    /// Wait for rate limiter if one is configured.
+    #[allow(dead_code)] // Infrastructure for response-header feedback loop
+    async fn wait_for_rate_limit(&self) {
+        if let Some(ref limiter) = self.rate_limiter {
+            limiter.wait().await;
+        }
     }
 
     /// Get the host URL.
@@ -184,6 +201,7 @@ impl GitLabClient {
             limit,
             remaining,
             reset_at,
+            retry_after: None,
         })
     }
 
@@ -563,6 +581,7 @@ impl GitLabClient {
             limit: 2000,
             remaining: 2000,
             reset_at: Utc::now() + chrono::Duration::minutes(1),
+            retry_after: None,
         }
     }
 }
@@ -988,7 +1007,7 @@ pub async fn create_client(
     token: &str,
     instance_id: Uuid,
 ) -> Result<GitLabClient, GitLabError> {
-    GitLabClient::new(host, token, instance_id).await
+    GitLabClient::new(host, token, instance_id, None).await
 }
 
 #[cfg(test)]
@@ -1001,6 +1020,7 @@ mod tests {
             limit: 2000,
             remaining: 1999,
             reset_at: Utc::now(),
+            retry_after: None,
         };
         assert_eq!(info.limit, 2000);
         assert_eq!(info.remaining, 1999);

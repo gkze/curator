@@ -50,7 +50,7 @@ pub(crate) async fn handle_limits(
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
 
-            let client = GitHubClient::new(&token, Uuid::nil())?;
+            let client = GitHubClient::new(&token, Uuid::nil(), None)?;
             let rate_limits = curator::github::get_rate_limits(client.inner()).await?;
             let items = github_rate_limits_to_display(&rate_limits.resources);
             RateLimitDisplay::print_many(items, output);

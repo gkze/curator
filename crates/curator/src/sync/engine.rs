@@ -5,28 +5,24 @@
 //!
 //! # Rate Limiting
 //!
-//! All sync functions accept an optional `ApiRateLimiter` to enable proactive
-//! rate limiting. When provided, the limiter's `wait()` method is called before
-//! each API operation to prevent hitting platform rate limits.
+//! Rate limiting is handled inside platform clients. Each client has an
+//! `Option<AdaptiveRateLimiter>` field and calls `wait_for_rate_limit()` before
+//! API operations. The sync engine does not need to thread limiters through.
 //!
 //! # Example
 //!
 //! ```ignore
 //! use curator::sync::{SyncOptions, sync_namespace_streaming};
-//! use curator::platform::{ApiRateLimiter, rate_limits};
 //!
-//! let limiter = ApiRateLimiter::new(rate_limits::GITHUB_DEFAULT_RPS);
 //! let result = sync_namespace_streaming(
 //!     &client,
 //!     "rust-lang",
 //!     &options,
-//!     Some(&limiter),
 //!     model_tx,
 //!     Some(&progress),
 //! ).await?;
 //! ```
 
-mod fetch;
 mod filter;
 mod persist;
 mod star;
@@ -48,7 +44,7 @@ use sea_orm::DatabaseConnection;
 use super::progress::{ProgressCallback, SyncProgress, emit};
 use super::types::{NamespaceSyncResult, NamespaceSyncResultStreaming, SyncOptions, SyncResult};
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
-use crate::platform::{ApiRateLimiter, PlatformClient, PlatformError, PlatformRepo};
+use crate::platform::{PlatformClient, PlatformError, PlatformRepo};
 
 const REPO_STREAM_CHANNEL_BUFFER: usize = 500;
 const FILTER_PROGRESS_CHANNEL_BUFFER: usize = 256;
@@ -239,7 +235,6 @@ async fn sync_repos<C: PlatformClient + Clone + 'static>(
     namespace: &str,
     repos: Vec<PlatformRepo>,
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
     let mut result = SyncResult {
@@ -286,7 +281,6 @@ async fn sync_repos<C: PlatformClient + Clone + 'static>(
             repos_to_star,
             options.concurrency,
             options.dry_run,
-            rate_limiter,
             on_progress,
         )
         .await;
@@ -316,7 +310,6 @@ async fn sync_repos_streaming<C: PlatformClient + Clone + 'static>(
     namespace: &str,
     repos: Vec<PlatformRepo>,
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
@@ -337,7 +330,6 @@ async fn sync_repos_streaming<C: PlatformClient + Clone + 'static>(
             streaming_result.repos_to_star,
             options.concurrency,
             options.dry_run,
-            rate_limiter,
             on_progress,
         )
         .await;
@@ -363,25 +355,22 @@ async fn sync_repos_streaming<C: PlatformClient + Clone + 'static>(
 /// * `client` - Platform client implementing `PlatformClient`
 /// * `namespace` - Organization or group name to sync
 /// * `options` - Sync configuration options
-/// * `rate_limiter` - Optional rate limiter for proactive rate limiting
 /// * `db` - Optional database connection for ETag caching
 /// * `on_progress` - Optional progress callback
 #[cfg_attr(
     any(feature = "github", feature = "gitlab", feature = "gitea"),
-    tracing::instrument(skip(client, options, rate_limiter, db, on_progress), fields(namespace = %namespace))
+    tracing::instrument(skip(client, options, db, on_progress), fields(namespace = %namespace))
 )]
 pub async fn sync_namespace<C: PlatformClient + Clone + 'static>(
     client: &C,
     namespace: &str,
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     db: Option<&DatabaseConnection>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
-    fetch::wait_for_rate_limit(rate_limiter).await;
     let repos = client.list_org_repos(namespace, db, on_progress).await?;
 
-    sync_repos(client, namespace, repos, options, rate_limiter, on_progress).await
+    sync_repos(client, namespace, repos, options, on_progress).await
 }
 
 /// Sync a namespace with streaming persistence.
@@ -393,36 +382,24 @@ pub async fn sync_namespace<C: PlatformClient + Clone + 'static>(
 /// * `client` - Platform client implementing `PlatformClient`
 /// * `namespace` - Organization or group name to sync
 /// * `options` - Sync configuration options
-/// * `rate_limiter` - Optional rate limiter for proactive rate limiting
 /// * `db` - Optional database connection for ETag caching
 /// * `model_tx` - Channel sender for streaming model persistence
 /// * `on_progress` - Optional progress callback
 #[cfg_attr(
     any(feature = "github", feature = "gitlab", feature = "gitea"),
-    tracing::instrument(skip(client, options, rate_limiter, db, model_tx, on_progress), fields(namespace = %namespace))
+    tracing::instrument(skip(client, options, db, model_tx, on_progress), fields(namespace = %namespace))
 )]
 pub async fn sync_namespace_streaming<C: PlatformClient + Clone + 'static>(
     client: &C,
     namespace: &str,
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     db: Option<&DatabaseConnection>,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
-    fetch::wait_for_rate_limit(rate_limiter).await;
     let repos = client.list_org_repos(namespace, db, on_progress).await?;
 
-    sync_repos_streaming(
-        client,
-        namespace,
-        repos,
-        options,
-        rate_limiter,
-        model_tx,
-        on_progress,
-    )
-    .await
+    sync_repos_streaming(client, namespace, repos, options, model_tx, on_progress).await
 }
 
 /// Sync multiple namespaces concurrently.
@@ -432,7 +409,6 @@ pub async fn sync_namespace_streaming<C: PlatformClient + Clone + 'static>(
 /// * `client` - Platform client implementing `PlatformClient`
 /// * `namespaces` - List of organization or group names to sync
 /// * `options` - Sync configuration options
-/// * `rate_limiter` - Optional rate limiter for proactive rate limiting
 /// * `db` - Optional database connection for ETag caching (wrapped in Arc for concurrent access)
 /// * `on_progress` - Optional progress callback
 #[cfg_attr(
@@ -443,13 +419,11 @@ pub async fn sync_namespaces<C: PlatformClient + Clone + 'static>(
     client: &C,
     namespaces: &[String],
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     db: Option<Arc<DatabaseConnection>>,
     on_progress: Option<&ProgressCallback>,
 ) -> Vec<NamespaceSyncResult> {
     let client = client.clone();
     let options = options.clone();
-    let limiter = rate_limiter.cloned();
 
     spawn_concurrent_sync(
         namespaces,
@@ -457,7 +431,6 @@ pub async fn sync_namespaces<C: PlatformClient + Clone + 'static>(
         |namespace, semaphore| {
             let client = client.clone();
             let options = options.clone();
-            let limiter = limiter.clone();
             let task_db = db.clone();
 
             async move {
@@ -466,15 +439,7 @@ pub async fn sync_namespaces<C: PlatformClient + Clone + 'static>(
                     Err(_) => return NamespaceSyncResult::semaphore_error(namespace),
                 };
 
-                match sync_namespace(
-                    &client,
-                    &namespace,
-                    &options,
-                    limiter.as_ref(),
-                    task_db.as_deref(),
-                    None,
-                )
-                .await
+                match sync_namespace(&client, &namespace, &options, task_db.as_deref(), None).await
                 {
                     Ok((sync_result, models)) => NamespaceSyncResult {
                         namespace,
@@ -503,7 +468,6 @@ pub async fn sync_namespaces<C: PlatformClient + Clone + 'static>(
 /// * `client` - Platform client implementing `PlatformClient`
 /// * `namespaces` - List of organization or group names to sync
 /// * `options` - Sync configuration options
-/// * `rate_limiter` - Optional rate limiter for proactive rate limiting
 /// * `db` - Optional database connection for ETag caching (wrapped in Arc for concurrent access)
 /// * `model_tx` - Channel sender for streaming model persistence
 /// * `on_progress` - Optional progress callback
@@ -515,14 +479,12 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
     client: &C,
     namespaces: &[String],
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     db: Option<Arc<DatabaseConnection>>,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Vec<NamespaceSyncResultStreaming> {
     let client = client.clone();
     let options = options.clone();
-    let limiter = rate_limiter.cloned();
 
     spawn_concurrent_sync_streaming(
         namespaces,
@@ -531,7 +493,6 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
         move |namespace, semaphore, tx| {
             let client = client.clone();
             let options = options.clone();
-            let limiter = limiter.clone();
             let task_db = db.clone();
 
             async move {
@@ -544,7 +505,6 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
                     &client,
                     &namespace,
                     &options,
-                    limiter.as_ref(),
                     task_db.as_deref(),
                     tx,
                     None,
@@ -579,25 +539,22 @@ pub async fn sync_namespaces_streaming<C: PlatformClient + Clone + 'static>(
 /// * `client` - Platform client implementing `PlatformClient`
 /// * `username` - Username whose repositories to sync
 /// * `options` - Sync configuration options
-/// * `rate_limiter` - Optional rate limiter for proactive rate limiting
 /// * `db` - Optional database connection for ETag caching
 /// * `on_progress` - Optional progress callback
 #[cfg_attr(
     any(feature = "github", feature = "gitlab", feature = "gitea"),
-    tracing::instrument(skip(client, options, rate_limiter, db, on_progress), fields(username = %username))
+    tracing::instrument(skip(client, options, db, on_progress), fields(username = %username))
 )]
 pub async fn sync_user<C: PlatformClient + Clone + 'static>(
     client: &C,
     username: &str,
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     db: Option<&DatabaseConnection>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
-    fetch::wait_for_rate_limit(rate_limiter).await;
     let repos = client.list_user_repos(username, db, on_progress).await?;
 
-    sync_repos(client, username, repos, options, rate_limiter, on_progress).await
+    sync_repos(client, username, repos, options, on_progress).await
 }
 
 /// Sync a user's repositories with streaming persistence.
@@ -609,36 +566,24 @@ pub async fn sync_user<C: PlatformClient + Clone + 'static>(
 /// * `client` - Platform client implementing `PlatformClient`
 /// * `username` - Username whose repositories to sync
 /// * `options` - Sync configuration options
-/// * `rate_limiter` - Optional rate limiter for proactive rate limiting
 /// * `db` - Optional database connection for ETag caching
 /// * `model_tx` - Channel sender for streaming model persistence
 /// * `on_progress` - Optional progress callback
 #[cfg_attr(
     any(feature = "github", feature = "gitlab", feature = "gitea"),
-    tracing::instrument(skip(client, options, rate_limiter, db, model_tx, on_progress), fields(username = %username))
+    tracing::instrument(skip(client, options, db, model_tx, on_progress), fields(username = %username))
 )]
 pub async fn sync_user_streaming<C: PlatformClient + Clone + 'static>(
     client: &C,
     username: &str,
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     db: Option<&DatabaseConnection>,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
-    fetch::wait_for_rate_limit(rate_limiter).await;
     let repos = client.list_user_repos(username, db, on_progress).await?;
 
-    sync_repos_streaming(
-        client,
-        username,
-        repos,
-        options,
-        rate_limiter,
-        model_tx,
-        on_progress,
-    )
-    .await
+    sync_repos_streaming(client, username, repos, options, model_tx, on_progress).await
 }
 
 /// Sync an explicit list of repositories (owner/name pairs) with streaming persistence.
@@ -647,7 +592,7 @@ pub async fn sync_user_streaming<C: PlatformClient + Clone + 'static>(
 /// directly rather than through org/user listings.
 #[cfg_attr(
     any(feature = "github", feature = "gitlab", feature = "gitea"),
-    tracing::instrument(skip(client, options, rate_limiter, db, model_tx, on_progress), fields(repo_count = repos.len()))
+    tracing::instrument(skip(client, options, db, model_tx, on_progress), fields(repo_count = repos.len()))
 )]
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
@@ -655,13 +600,10 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
     namespace: &str,
     repos: &[(String, String)],
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     db: Option<Arc<DatabaseConnection>>,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
-    fetch::wait_for_rate_limit(rate_limiter).await;
-
     emit(
         on_progress,
         SyncProgress::FetchingRepos {
@@ -675,14 +617,12 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
         JoinSet::new();
     let concurrency = std::cmp::max(1, std::cmp::min(options.concurrency, repos.len().max(1)));
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let limiter = rate_limiter.cloned();
 
     for (owner, name) in repos {
         let owner = owner.clone();
         let name = name.clone();
         let client = client.clone();
         let semaphore = Arc::clone(&semaphore);
-        let limiter = limiter.clone();
         let task_db = db.clone();
 
         join_set.spawn(async move {
@@ -696,10 +636,6 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
                     );
                 }
             };
-
-            if let Some(ref limiter) = limiter {
-                limiter.wait().await;
-            }
 
             let repo = client.get_repo(&owner, &name, task_db.as_deref()).await;
             (owner, name, repo)
@@ -759,16 +695,8 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
         },
     );
 
-    let mut result = sync_repos_streaming(
-        client,
-        namespace,
-        fetched,
-        options,
-        rate_limiter,
-        model_tx,
-        on_progress,
-    )
-    .await?;
+    let mut result =
+        sync_repos_streaming(client, namespace, fetched, options, model_tx, on_progress).await?;
 
     result.errors.extend(errors);
     Ok(result)
@@ -781,7 +709,6 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
 /// * `client` - Platform client implementing `PlatformClient`
 /// * `usernames` - List of usernames to sync
 /// * `options` - Sync configuration options
-/// * `rate_limiter` - Optional rate limiter for proactive rate limiting
 /// * `db` - Optional database connection for ETag caching (wrapped in Arc for concurrent access)
 /// * `model_tx` - Channel sender for streaming model persistence
 /// * `on_progress` - Optional progress callback
@@ -793,14 +720,12 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
     client: &C,
     usernames: &[String],
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     db: Option<Arc<DatabaseConnection>>,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Vec<NamespaceSyncResultStreaming> {
     let client = client.clone();
     let options = options.clone();
-    let limiter = rate_limiter.cloned();
 
     spawn_concurrent_sync_streaming(
         usernames,
@@ -809,7 +734,6 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
         move |username, semaphore, tx| {
             let client = client.clone();
             let options = options.clone();
-            let limiter = limiter.clone();
             let task_db = db.clone();
 
             async move {
@@ -822,7 +746,6 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
                     &client,
                     &username,
                     &options,
-                    limiter.as_ref(),
                     task_db.as_deref(),
                     tx,
                     None,
@@ -859,7 +782,6 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
 ///
 /// * `client` - Platform client implementing `PlatformClient`
 /// * `options` - Sync configuration options (uses `active_within` and `prune` flags)
-/// * `rate_limiter` - Optional rate limiter for proactive rate limiting
 /// * `db` - Optional database connection for ETag caching
 /// * `concurrency` - Number of concurrent page fetches
 /// * `skip_rate_checks` - Whether to skip rate limit checks
@@ -873,7 +795,6 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
 pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     client: &C,
     options: &SyncOptions,
-    rate_limiter: Option<&ApiRateLimiter>,
     db: Option<&DatabaseConnection>,
     concurrency: usize,
     skip_rate_checks: bool,
@@ -884,9 +805,6 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let cutoff = Utc::now() - options.active_within;
-
-    // Apply rate limiting before fetching repos
-    fetch::wait_for_rate_limit(rate_limiter).await;
 
     // Note: FilteringByActivity is not emitted here because the client's
     // list_starred_repos_streaming emits FetchingRepos, and filtering happens
@@ -1116,14 +1034,8 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     };
 
     if options.prune && !repos_to_prune.is_empty() {
-        let prune_result = star::prune_repos(
-            client,
-            repos_to_prune,
-            options.dry_run,
-            rate_limiter,
-            on_progress,
-        )
-        .await;
+        let prune_result =
+            star::prune_repos(client, repos_to_prune, options.dry_run, on_progress).await;
 
         result.pruned = prune_result.pruned;
         result.pruned_repos = prune_result.pruned_repos;

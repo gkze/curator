@@ -20,6 +20,8 @@ pub struct RateLimitInfo {
     pub remaining: usize,
     /// When the rate limit resets.
     pub reset_at: DateTime<Utc>,
+    /// Server-requested wait time (from `Retry-After` header on 429 responses).
+    pub retry_after: Option<std::time::Duration>,
 }
 
 /// Information about an organization on a platform.

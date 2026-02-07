@@ -24,7 +24,7 @@ use console::Term;
 use curator::PlatformType;
 use curator::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use curator::entity::instance::Model as InstanceModel;
-use curator::platform::{ApiRateLimiter, PlatformClient};
+use curator::platform::PlatformClient;
 use curator::repository;
 use curator::sync::{
     NamespaceSyncResultStreaming, ProgressCallback, SyncOptions, SyncResult,
@@ -60,23 +60,6 @@ pub(crate) fn spawn_persist_task(
     let shutdown_flag: Arc<AtomicBool> = Arc::clone(&SHUTDOWN_FLAG);
 
     curator::sync::spawn_persist_task(db, rx, Some(shutdown_flag), on_progress)
-}
-
-/// Create a rate limiter if rate limiting is enabled.
-/// Returns None if no_rate_limit is true, Some(limiter) otherwise.
-pub(crate) fn maybe_rate_limiter(no_rate_limit: bool, rps: u32) -> Option<ApiRateLimiter> {
-    if no_rate_limit {
-        None
-    } else {
-        Some(ApiRateLimiter::new(rps))
-    }
-}
-
-/// Print a warning when rate limiting is disabled (TTY only).
-pub(crate) fn warn_no_rate_limit(is_tty: bool) {
-    if is_tty {
-        eprintln!("Warning: Rate limiting disabled - you may experience API throttling\n");
-    }
 }
 
 /// Display final rate limit status with a timeout to avoid hangs.
@@ -223,8 +206,6 @@ pub struct SyncRunner {
     db: Arc<DatabaseConnection>,
     /// Sync options.
     options: SyncOptions,
-    /// Rate limiter (if enabled).
-    rate_limiter: Option<ApiRateLimiter>,
     /// Progress reporter.
     reporter: Arc<ProgressReporter>,
     /// Progress callback for the library.
@@ -233,7 +214,7 @@ pub struct SyncRunner {
     is_tty: bool,
     /// Active within days (for display).
     active_within_days: u64,
-    /// Whether rate limiting is disabled.
+    /// Whether rate limiting is disabled (used for display and skip_rate_checks).
     no_rate_limit: bool,
 }
 
@@ -245,32 +226,28 @@ impl SyncRunner {
     /// * `db` - Database connection
     /// * `options` - Sync options
     /// * `no_rate_limit` - Whether rate limiting is disabled
-    /// * `default_rps` - Default requests per second for rate limiting
     /// * `active_within_days` - Number of days for activity filter (for display)
     pub fn new(
         db: Arc<DatabaseConnection>,
         options: SyncOptions,
         no_rate_limit: bool,
-        default_rps: u32,
         active_within_days: u64,
     ) -> Self {
         let is_tty = Term::stdout().is_term();
         let reporter = Arc::new(ProgressReporter::new());
         let progress = reporter.as_callback();
-        let rate_limiter = maybe_rate_limiter(no_rate_limit, default_rps);
 
         if options.dry_run && is_tty {
             println!("DRY RUN - no changes will be made\n");
         }
 
-        if no_rate_limit {
-            warn_no_rate_limit(is_tty);
+        if no_rate_limit && is_tty {
+            eprintln!("Warning: Rate limiting disabled - you may experience API throttling\n");
         }
 
         Self {
             db,
             options,
-            rate_limiter,
             reporter,
             progress,
             is_tty,
@@ -369,7 +346,6 @@ impl SyncRunner {
                     client,
                     namespace,
                     &self.options,
-                    self.rate_limiter.as_ref(),
                     Some(&*self.db),
                     tx,
                     Some(&*self.progress),
@@ -394,7 +370,6 @@ impl SyncRunner {
                     client,
                     namespaces,
                     &self.options,
-                    self.rate_limiter.as_ref(),
                     Some(Arc::clone(&self.db)),
                     tx,
                     Some(&*self.progress),
@@ -419,7 +394,6 @@ impl SyncRunner {
                     client,
                     user,
                     &self.options,
-                    self.rate_limiter.as_ref(),
                     Some(&*self.db),
                     tx,
                     Some(&*self.progress),
@@ -446,7 +420,6 @@ impl SyncRunner {
                     label,
                     repos,
                     &self.options,
-                    self.rate_limiter.as_ref(),
                     Some(Arc::clone(&self.db)),
                     tx,
                     Some(&*self.progress),
@@ -471,7 +444,6 @@ impl SyncRunner {
                     client,
                     users,
                     &self.options,
-                    self.rate_limiter.as_ref(),
                     Some(Arc::clone(&self.db)),
                     tx,
                     Some(&*self.progress),
@@ -494,7 +466,6 @@ impl SyncRunner {
                 sync_starred_streaming(
                     client,
                     &self.options,
-                    self.rate_limiter.as_ref(),
                     Some(&*self.db),
                     self.options.concurrency,
                     self.no_rate_limit,

@@ -15,12 +15,11 @@
 //!
 //! ```ignore
 //! use curator::sync::{SyncOptions, SyncProgress, emit, sync_namespace};
-//! use curator::platform::{PlatformClient, ApiRateLimiter, rate_limits};
+//! use curator::platform::PlatformClient;
 //!
 //! async fn sync<C: PlatformClient + Clone + 'static>(client: &C) {
 //!     let options = SyncOptions::default();
-//!     let limiter = ApiRateLimiter::new(rate_limits::GITHUB_DEFAULT_RPS);
-//!     let (result, models) = sync_namespace(client, "my-org", &options, Some(&limiter), None).await?;
+//!     let (result, models) = sync_namespace(client, "my-org", &options, None, None).await?;
 //!     println!("Synced {} repos", result.matched);
 //! }
 //! ```
@@ -29,13 +28,11 @@
 //!
 //! ```ignore
 //! use curator::sync::{SyncContext, SyncOptions};
-//! use curator::platform::ApiRateLimiter;
 //!
 //! async fn sync_with_context(client: GitHubClient, db: Arc<DatabaseConnection>) {
 //!     let ctx = SyncContext::builder()
 //!         .client(client)
 //!         .options(SyncOptions::default())
-//!         .rate_limiter(ApiRateLimiter::new(5))
 //!         .database(db)
 //!         .build()
 //!         .unwrap();
