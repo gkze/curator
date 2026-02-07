@@ -1,0 +1,13 @@
+---
+- name: Setup Nix
+  uses: ./.github/actions/setup-nix
+- name: Setup Nix build environment
+  run: |-
+    nix develop --command printenv > /tmp/nix-env
+
+    for var in PKG_CONFIG_PATH LIBRARY_PATH C_INCLUDE_PATH CPATH; do
+      value=$(grep "^${var}=" /tmp/nix-env | cut -d= -f2- || true)
+      if [ -n "$value" ]; then
+        echo "${var}=${value}" >> "$GITHUB_ENV"
+      fi
+    done
