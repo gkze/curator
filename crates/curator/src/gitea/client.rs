@@ -177,6 +177,62 @@ impl GiteaClient {
         serde_json::from_str(&body).map_err(GiteaError::Json)
     }
 
+    /// Make a conditional GET request with optional `If-None-Match` header.
+    ///
+    /// If `cached_etag` is provided the server may return 304 Not Modified,
+    /// avoiding the cost of transferring and deserializing the response body.
+    async fn get_conditional<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        cached_etag: Option<&str>,
+    ) -> Result<platform::FetchResult<T>, GiteaError> {
+        use crate::platform::PaginationInfo;
+
+        self.wait_for_rate_limit().await;
+        let url = format!("{}/api/v1{}", self.host, path);
+
+        let mut request = self
+            .client
+            .get(&url)
+            .header(header::AUTHORIZATION, format!("token {}", self.token));
+
+        if let Some(etag) = cached_etag {
+            request = request.header(header::IF_NONE_MATCH, etag);
+        }
+
+        let response = request.send().await?;
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        self.update_rate_limit(&headers);
+
+        match status {
+            StatusCode::NOT_MODIFIED => Ok(platform::FetchResult::NotModified),
+            s if s.is_success() => {
+                let etag = headers
+                    .get(header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+
+                let body = response.text().await?;
+                let data: T = serde_json::from_str(&body).map_err(GiteaError::Json)?;
+
+                Ok(platform::FetchResult::Fetched {
+                    data,
+                    etag,
+                    pagination: PaginationInfo::default(),
+                })
+            }
+            _ => {
+                let message = response.text().await.unwrap_or_default();
+                Err(GiteaError::Api {
+                    status: status.as_u16(),
+                    message,
+                })
+            }
+        }
+    }
+
     /// Make an authenticated PUT request (for starring).
     async fn put(&self, path: &str) -> Result<StatusCode, GiteaError> {
         self.wait_for_rate_limit().await;
@@ -622,7 +678,6 @@ impl PlatformClient for GiteaClient {
         _skip_rate_checks: bool,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
-        // TODO: Implement ETag caching for Gitea
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -654,12 +709,13 @@ impl PlatformClient for GiteaClient {
     async fn list_starred_repos_streaming(
         &self,
         repo_tx: tokio::sync::mpsc::Sender<PlatformRepo>,
-        _db: Option<&sea_orm::DatabaseConnection>,
+        db: Option<&sea_orm::DatabaseConnection>,
         concurrency: usize,
         _skip_rate_checks: bool,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<usize> {
-        // TODO: Implement ETag caching for Gitea
+        use crate::api_cache;
+        use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         emit(
@@ -673,43 +729,119 @@ impl PlatformClient for GiteaClient {
 
         let total_sent = Arc::new(AtomicUsize::new(0));
 
-        // Fetch first page
-        let first_page: Vec<GiteaRepo> = self
-            .get(&format!("/user/starred?page=1&limit={}", PAGE_SIZE))
+        // Fetch first page with conditional ETag request
+        let cached_etag = if let Some(db) = db {
+            let ck = ApiCacheModel::starred_key("starred", 1);
+            api_cache::get_etag(db, self.instance_id, EndpointType::Starred, &ck)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let first_result: platform::FetchResult<Vec<GiteaRepo>> = self
+            .get_conditional(
+                &format!("/user/starred?page=1&limit={}", PAGE_SIZE),
+                cached_etag.as_deref(),
+            )
             .await
             .map_err(PlatformError::from)?;
 
-        let first_page_count = first_page.len();
+        let mut all_cache_hits;
 
-        // Send first page repos immediately
-        for repo in &first_page {
-            let platform_repo = to_platform_repo(repo);
-            if repo_tx.send(platform_repo).await.is_ok() {
-                total_sent.fetch_add(1, Ordering::Relaxed);
+        match first_result {
+            platform::FetchResult::NotModified => {
+                all_cache_hits = true;
+
+                // Cache hit — load from DB if available
+                if let Some(db) = db {
+                    let cached_repos =
+                        crate::repository::find_all_by_instance(db, self.instance_id)
+                            .await
+                            .map_err(|e| PlatformError::internal(e.to_string()))?;
+
+                    if !cached_repos.is_empty() {
+                        emit(
+                            on_progress,
+                            SyncProgress::CacheHit {
+                                namespace: "starred".to_string(),
+                                cached_count: cached_repos.len(),
+                            },
+                        );
+
+                        for model in &cached_repos {
+                            let repo = PlatformRepo::from_model(model);
+                            if repo_tx.send(repo).await.is_ok() {
+                                total_sent.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+
+                        let sent = total_sent.load(Ordering::Relaxed);
+                        emit(
+                            on_progress,
+                            SyncProgress::FetchComplete {
+                                namespace: "starred".to_string(),
+                                total: sent,
+                            },
+                        );
+                        return Ok(sent);
+                    }
+                }
             }
-        }
+            platform::FetchResult::Fetched {
+                data: first_page,
+                etag,
+                ..
+            } => {
+                all_cache_hits = false;
+                let first_page_count = first_page.len();
 
-        emit(
-            on_progress,
-            SyncProgress::FetchedPage {
-                namespace: "starred".to_string(),
-                page: 1,
-                count: first_page_count,
-                total_so_far: total_sent.load(Ordering::Relaxed),
-                expected_pages: None,
-            },
-        );
+                // Store ETag for page 1
+                if let Some(db) = db {
+                    let ck = ApiCacheModel::starred_key("starred", 1);
+                    let _ = api_cache::upsert_with_pagination(
+                        db,
+                        self.instance_id,
+                        EndpointType::Starred,
+                        &ck,
+                        etag,
+                        None,
+                    )
+                    .await;
+                }
 
-        // If first page is not full, we're done
-        if first_page_count < PAGE_SIZE as usize {
-            emit(
-                on_progress,
-                SyncProgress::FetchComplete {
-                    namespace: "starred".to_string(),
-                    total: total_sent.load(Ordering::Relaxed),
-                },
-            );
-            return Ok(total_sent.load(Ordering::Relaxed));
+                // Send first page repos immediately
+                for repo in &first_page {
+                    let platform_repo = to_platform_repo(repo);
+                    if repo_tx.send(platform_repo).await.is_ok() {
+                        total_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
+                        namespace: "starred".to_string(),
+                        page: 1,
+                        count: first_page_count,
+                        total_so_far: total_sent.load(Ordering::Relaxed),
+                        expected_pages: None,
+                    },
+                );
+
+                // If first page is not full, we're done
+                if first_page_count < PAGE_SIZE as usize {
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchComplete {
+                            namespace: "starred".to_string(),
+                            total: total_sent.load(Ordering::Relaxed),
+                        },
+                    );
+                    return Ok(total_sent.load(Ordering::Relaxed));
+                }
+            }
         }
 
         // Fetch remaining pages concurrently using semaphore for rate control
@@ -725,18 +857,34 @@ impl PlatformClient for GiteaClient {
             let task_total_sent = Arc::clone(&total_sent);
             let current_page = page;
 
+            // Pre-fetch ETag outside the spawn so we can borrow db
+            let task_cached_etag = if let Some(db) = db {
+                let ck = ApiCacheModel::starred_key("starred", page);
+                api_cache::get_etag(db, self.instance_id, EndpointType::Starred, &ck)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
             let handle = tokio::spawn(async move {
                 let _permit = task_semaphore.acquire().await.ok()?;
 
-                let repos: Result<Vec<GiteaRepo>, GiteaError> = client
-                    .get(&format!(
-                        "/user/starred?page={}&limit={}",
-                        current_page, PAGE_SIZE
-                    ))
+                let result: Result<platform::FetchResult<Vec<GiteaRepo>>, GiteaError> = client
+                    .get_conditional(
+                        &format!("/user/starred?page={}&limit={}", current_page, PAGE_SIZE),
+                        task_cached_etag.as_deref(),
+                    )
                     .await;
 
-                match repos {
-                    Ok(repos) => {
+                match result {
+                    Ok(platform::FetchResult::NotModified) => {
+                        Some((current_page, 0usize, true, None))
+                    }
+                    Ok(platform::FetchResult::Fetched {
+                        data: repos, etag, ..
+                    }) => {
                         let count = repos.len();
                         for repo in &repos {
                             let platform_repo = to_platform_repo(repo);
@@ -744,7 +892,7 @@ impl PlatformClient for GiteaClient {
                                 task_total_sent.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        Some((current_page, count))
+                        Some((current_page, count, false, etag))
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -764,7 +912,25 @@ impl PlatformClient for GiteaClient {
             if handles.len() >= concurrency {
                 let mut got_partial = false;
                 for handle in handles.drain(..) {
-                    if let Ok(Some((page_num, count))) = handle.await {
+                    if let Ok(Some((page_num, count, was_cache_hit, etag))) = handle.await {
+                        if !was_cache_hit {
+                            all_cache_hits = false;
+
+                            // Store ETag for fetched pages
+                            if let Some(db) = db {
+                                let ck = ApiCacheModel::starred_key("starred", page_num);
+                                let _ = api_cache::upsert_with_pagination(
+                                    db,
+                                    self.instance_id,
+                                    EndpointType::Starred,
+                                    &ck,
+                                    etag,
+                                    None,
+                                )
+                                .await;
+                            }
+                        }
+
                         emit(
                             on_progress,
                             SyncProgress::FetchedPage {
@@ -775,7 +941,7 @@ impl PlatformClient for GiteaClient {
                                 expected_pages: None,
                             },
                         );
-                        if count < PAGE_SIZE as usize {
+                        if !was_cache_hit && count < PAGE_SIZE as usize {
                             got_partial = true;
                         }
                     }
@@ -788,7 +954,24 @@ impl PlatformClient for GiteaClient {
 
         // Collect any remaining results from handles
         for handle in handles {
-            if let Ok(Some((page_num, count))) = handle.await {
+            if let Ok(Some((page_num, count, was_cache_hit, etag))) = handle.await {
+                if !was_cache_hit {
+                    all_cache_hits = false;
+
+                    if let Some(db) = db {
+                        let ck = ApiCacheModel::starred_key("starred", page_num);
+                        let _ = api_cache::upsert_with_pagination(
+                            db,
+                            self.instance_id,
+                            EndpointType::Starred,
+                            &ck,
+                            etag,
+                            None,
+                        )
+                        .await;
+                    }
+                }
+
                 emit(
                     on_progress,
                     SyncProgress::FetchedPage {
@@ -802,15 +985,43 @@ impl PlatformClient for GiteaClient {
             }
         }
 
+        // Cache-hit fallback: if all pages were 304 and nothing was sent
+        if all_cache_hits
+            && total_sent.load(Ordering::Relaxed) == 0
+            && let Some(db) = db
+        {
+            let cached_repos = crate::repository::find_all_by_instance(db, self.instance_id)
+                .await
+                .map_err(|e| PlatformError::internal(e.to_string()))?;
+
+            if !cached_repos.is_empty() {
+                emit(
+                    on_progress,
+                    SyncProgress::CacheHit {
+                        namespace: "starred".to_string(),
+                        cached_count: cached_repos.len(),
+                    },
+                );
+
+                for model in &cached_repos {
+                    let repo = PlatformRepo::from_model(model);
+                    if repo_tx.send(repo).await.is_ok() {
+                        total_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        let sent = total_sent.load(Ordering::Relaxed);
         emit(
             on_progress,
             SyncProgress::FetchComplete {
                 namespace: "starred".to_string(),
-                total: total_sent.load(Ordering::Relaxed),
+                total: sent,
             },
         );
 
-        Ok(total_sent.load(Ordering::Relaxed))
+        Ok(sent)
     }
 
     fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
