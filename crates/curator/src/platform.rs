@@ -30,6 +30,7 @@ pub use rate_limit::{AdaptiveRateLimiter, rate_limits};
 pub use types::{OrgInfo, PlatformClient, PlatformRepo, ProgressCallback, RateLimitInfo, UserInfo};
 
 use crate::entity::instance::Model as InstanceModel;
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::entity::platform_type::PlatformType;
 
 /// Create a platform client for a given instance.
@@ -41,17 +42,20 @@ use crate::entity::platform_type::PlatformType;
 /// * `instance` - The instance model with platform type and host info
 /// * `token` - Authentication token for the platform
 /// * `rate_limiter` - Optional adaptive rate limiter for request pacing
+#[allow(unused_variables)]
 pub async fn create_client(
     instance: &InstanceModel,
     token: &str,
     rate_limiter: Option<AdaptiveRateLimiter>,
 ) -> std::result::Result<Box<dyn PlatformClient>, PlatformError> {
     match instance.platform_type {
+        #[cfg(feature = "github")]
         PlatformType::GitHub => {
             let client = crate::github::GitHubClient::new(token, instance.id, rate_limiter)
                 .map_err(|e| PlatformError::internal(e.to_string()))?;
             Ok(Box::new(client))
         }
+        #[cfg(feature = "gitlab")]
         PlatformType::GitLab => {
             let client =
                 crate::gitlab::GitLabClient::new(&instance.host, token, instance.id, rate_limiter)
@@ -59,6 +63,7 @@ pub async fn create_client(
                     .map_err(|e| PlatformError::internal(e.to_string()))?;
             Ok(Box::new(client))
         }
+        #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
             let client = crate::gitea::GiteaClient::new(
                 &instance.base_url(),
@@ -69,6 +74,11 @@ pub async fn create_client(
             .map_err(|e| PlatformError::internal(e.to_string()))?;
             Ok(Box::new(client))
         }
+        #[allow(unreachable_patterns)]
+        _ => Err(PlatformError::internal(format!(
+            "platform {} support is not compiled in (missing cargo feature)",
+            instance.platform_type,
+        ))),
     }
 }
 
