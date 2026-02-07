@@ -110,6 +110,9 @@ pub struct GiteaOrg {
     pub location: Option<String>,
     /// Visibility: "public" or "limited" or "private".
     pub visibility: Option<String>,
+    /// Number of repositories in the organization.
+    #[serde(default)]
+    pub repo_count: usize,
 }
 
 /// Gitea user (authenticated user endpoint response).

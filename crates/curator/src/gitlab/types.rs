@@ -117,9 +117,12 @@ pub struct GitLabUser {
     pub email: Option<String>,
     /// User bio.
     pub bio: Option<String>,
-    /// Number of public repos (only available on /user endpoint).
+    /// Public email address.
     #[serde(default)]
     pub public_email: Option<String>,
+    /// Number of followers.
+    #[serde(default)]
+    pub followers: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +240,9 @@ impl From<generated::ApiEntitiesCurrentUser> for GitLabUser {
             email: u.email,
             bio: u.bio,
             public_email: u.public_email,
+            // Generated type doesn't include followers; fetched separately
+            // via get_authenticated_user() raw request
+            followers: 0,
         }
     }
 }

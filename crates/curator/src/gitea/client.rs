@@ -259,7 +259,7 @@ impl GiteaClient {
 
         Ok(OrgInfo {
             name: org_data.full_name.unwrap_or(org_data.username),
-            public_repos: 0, // Unknown without additional API call
+            public_repos: org_data.repo_count,
             description: org_data.description,
         })
     }

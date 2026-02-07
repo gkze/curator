@@ -502,9 +502,14 @@ impl GitLabClient {
         match resp {
             Ok(rv) => {
                 let detail: GitLabGroup = rv.into_inner().into();
+
+                // Fetch project count via a lightweight per_page=1 request
+                let encoded_group = group.replace('/', "%2F");
+                let repo_count = self.get_group_project_count(&encoded_group).await;
+
                 Ok(OrgInfo {
                     name: detail.name,
-                    public_repos: 0,
+                    public_repos: repo_count,
                     description: detail.description,
                 })
             }
@@ -515,6 +520,58 @@ impl GitLabClient {
             }
             Err(e) => Err(GitLabError::from(e)),
         }
+    }
+
+    /// Get the total project count for a group via a lightweight API request.
+    ///
+    /// Makes a `per_page=1` request to the group projects endpoint and reads
+    /// the `x-total` header to avoid fetching all projects.
+    async fn get_group_project_count(&self, encoded_group: &str) -> usize {
+        self.wait_for_rate_limit().await;
+
+        let url = format!(
+            "{}/api/v4/groups/{}/projects?per_page=1&page=1&include_subgroups=false",
+            self.host, encoded_group,
+        );
+
+        let Ok(response) = self.api.client.get(&url).send().await else {
+            return 0;
+        };
+
+        if !response.status().is_success() {
+            return 0;
+        }
+
+        response
+            .headers()
+            .get("x-total")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Get the followers count for the authenticated user via a raw API request.
+    ///
+    /// The progenitor-generated `CurrentUser` type doesn't include the
+    /// `followers` field, so we parse it from the raw JSON response.
+    async fn get_user_followers_count(&self) -> usize {
+        self.wait_for_rate_limit().await;
+
+        let url = format!("{}/api/v4/user", self.host);
+
+        let Ok(response) = self.api.client.get(&url).send().await else {
+            return 0;
+        };
+
+        if !response.status().is_success() {
+            return 0;
+        }
+
+        let Ok(json) = response.json::<serde_json::Value>().await else {
+            return 0;
+        };
+
+        json.get("followers").and_then(|v| v.as_u64()).unwrap_or(0) as usize
     }
 
     /// Look up a project by its full path (owner/name).
@@ -621,13 +678,17 @@ impl PlatformClient for GitLabClient {
     async fn get_authenticated_user(&self) -> platform::Result<UserInfo> {
         let user = self.get_user_info().await?;
 
+        // Fetch followers count via raw request since the generated
+        // CurrentUser type doesn't include it
+        let followers = self.get_user_followers_count().await;
+
         Ok(UserInfo {
             username: user.username,
             name: user.name,
             email: user.email.or(user.public_email),
             bio: user.bio,
             public_repos: 0,
-            followers: 0,
+            followers,
         })
     }
 
