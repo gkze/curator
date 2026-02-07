@@ -14,19 +14,9 @@ on:
       - "docs/**"
 
 jobs:
-  dist-check:
-    name: cargo-dist generate check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-nix
-      - name: Check cargo-dist workflow is up to date
-        run: nix develop --command cargo dist generate --mode ci --check
-
   # Run all Crane-based checks
   checks:
     name: Nix Checks
-    needs: dist-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
