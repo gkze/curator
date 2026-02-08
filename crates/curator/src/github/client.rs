@@ -18,7 +18,8 @@ use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, AdaptiveRateLimiter, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient,
-    PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
+    PlatformError, PlatformRepo, RateLimitInfo, UserInfo, handle_cache_hit_fallback,
+    load_repos_by_instance, load_repos_by_instance_and_owner,
 };
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
@@ -199,6 +200,8 @@ pub struct GitHubClient {
     inner: Arc<Octocrab>,
     /// The authentication token, stored for making raw conditional requests.
     token: Arc<String>,
+    /// Shared HTTP client for conditional (ETag) requests.
+    http_client: reqwest::Client,
     /// The instance ID this client is configured for.
     instance_id: Uuid,
     /// Optional adaptive rate limiter for pacing API requests.
@@ -216,6 +219,7 @@ impl GitHubClient {
         Ok(Self {
             inner: Arc::new(client),
             token: Arc::new(token.to_string()),
+            http_client: reqwest::Client::new(),
             instance_id,
             rate_limiter,
         })
@@ -229,6 +233,7 @@ impl GitHubClient {
         Self {
             inner: Arc::new(client),
             token: Arc::new(String::new()),
+            http_client: reqwest::Client::new(),
             instance_id,
             rate_limiter: None,
         }
@@ -295,8 +300,9 @@ impl GitHubClient {
         // Build the request URL
         let url = format!("https://api.github.com{}", route);
 
-        // Build the request with authentication
-        let mut request = reqwest::Client::new()
+        // Build the request with authentication (reuses shared connection pool)
+        let mut request = self
+            .http_client
             .get(&url)
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "curator")
@@ -379,7 +385,6 @@ impl GitHubClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
         use super::pagination::PaginatedFetchConfig;
-        use crate::repository;
 
         // Get org info to know total repos upfront
         let org_info = self.get_org_info(org).await.ok();
@@ -397,34 +402,17 @@ impl GitHubClient {
         // If all pages were cache hits and we got no repos, load from database
         if result.all_cache_hits
             && repos.is_empty()
-            && result.stats.cache_hits > 0
-            && let Some(db) = db
+            && let Some(models) = handle_cache_hit_fallback(
+                db,
+                result.stats.cache_hits,
+                |db| load_repos_by_instance_and_owner(db, self.instance_id, org),
+                org,
+                on_progress,
+            )
+            .await?
         {
-            let cached_repos =
-                repository::find_all_by_instance_and_owner(db, self.instance_id, org)
-                    .await
-                    .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-            if !cached_repos.is_empty() {
-                emit(
-                    on_progress,
-                    SyncProgress::CacheHit {
-                        namespace: org.to_string(),
-                        cached_count: cached_repos.len(),
-                    },
-                );
-                emit(
-                    on_progress,
-                    SyncProgress::FetchComplete {
-                        namespace: org.to_string(),
-                        total: cached_repos.len(),
-                    },
-                );
-
-                let repos: Vec<PlatformRepo> =
-                    cached_repos.iter().map(PlatformRepo::from_model).collect();
-                return Ok((repos, result.stats));
-            }
+            let repos: Vec<PlatformRepo> = models.iter().map(PlatformRepo::from_model).collect();
+            return Ok((repos, result.stats));
         }
 
         Ok((repos, result.stats))
@@ -459,7 +447,6 @@ impl GitHubClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
         use super::pagination::PaginatedFetchConfig;
-        use crate::repository;
 
         let config =
             PaginatedFetchConfig::starred(username).with_skip_rate_checks(skip_rate_checks);
@@ -474,33 +461,17 @@ impl GitHubClient {
         // If all pages were cache hits and we got no repos, load from database
         if result.all_cache_hits
             && repos.is_empty()
-            && result.stats.cache_hits > 0
-            && let Some(db) = db
+            && let Some(models) = handle_cache_hit_fallback(
+                db,
+                result.stats.cache_hits,
+                |db| load_repos_by_instance(db, self.instance_id),
+                "starred",
+                on_progress,
+            )
+            .await?
         {
-            let cached_repos = repository::find_all_by_instance(db, self.instance_id)
-                .await
-                .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-            if !cached_repos.is_empty() {
-                emit(
-                    on_progress,
-                    SyncProgress::CacheHit {
-                        namespace: "starred".to_string(),
-                        cached_count: cached_repos.len(),
-                    },
-                );
-                emit(
-                    on_progress,
-                    SyncProgress::FetchComplete {
-                        namespace: "starred".to_string(),
-                        total: cached_repos.len(),
-                    },
-                );
-
-                let repos: Vec<PlatformRepo> =
-                    cached_repos.iter().map(PlatformRepo::from_model).collect();
-                return Ok((repos, result.stats));
-            }
+            let repos: Vec<PlatformRepo> = models.iter().map(PlatformRepo::from_model).collect();
+            return Ok((repos, result.stats));
         }
 
         Ok((repos, result.stats))
@@ -533,7 +504,6 @@ impl GitHubClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
         use super::pagination::PaginatedFetchConfig;
-        use crate::repository;
 
         // Get user info to know total repos upfront
         let user_info: Option<serde_json::Value> = self
@@ -559,34 +529,17 @@ impl GitHubClient {
         // If all pages were cache hits and we got no repos, load from database
         if result.all_cache_hits
             && repos.is_empty()
-            && result.stats.cache_hits > 0
-            && let Some(db) = db
+            && let Some(models) = handle_cache_hit_fallback(
+                db,
+                result.stats.cache_hits,
+                |db| load_repos_by_instance_and_owner(db, self.instance_id, username),
+                username,
+                on_progress,
+            )
+            .await?
         {
-            let cached_repos =
-                repository::find_all_by_instance_and_owner(db, self.instance_id, username)
-                    .await
-                    .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-            if !cached_repos.is_empty() {
-                emit(
-                    on_progress,
-                    SyncProgress::CacheHit {
-                        namespace: username.to_string(),
-                        cached_count: cached_repos.len(),
-                    },
-                );
-                emit(
-                    on_progress,
-                    SyncProgress::FetchComplete {
-                        namespace: username.to_string(),
-                        total: cached_repos.len(),
-                    },
-                );
-
-                let repos: Vec<PlatformRepo> =
-                    cached_repos.iter().map(PlatformRepo::from_model).collect();
-                return Ok((repos, result.stats));
-            }
+            let repos: Vec<PlatformRepo> = models.iter().map(PlatformRepo::from_model).collect();
+            return Ok((repos, result.stats));
         }
 
         Ok((repos, result.stats))
@@ -696,15 +649,17 @@ impl PlatformClient for GitHubClient {
 
                 match refresh {
                     FetchResult::Fetched { data, etag, .. } => {
-                        if let Some(db) = db {
-                            let _ = api_cache::upsert(
+                        if let Some(db) = db
+                            && let Err(e) = api_cache::upsert(
                                 db,
                                 self.instance_id,
                                 EndpointType::SingleRepo,
                                 &cache_key,
                                 etag,
                             )
-                            .await;
+                            .await
+                        {
+                            tracing::debug!("api cache upsert failed: {e}");
                         }
                         Ok(to_platform_repo(&data))
                     }
@@ -715,15 +670,17 @@ impl PlatformClient for GitHubClient {
                 }
             }
             FetchResult::Fetched { data, etag, .. } => {
-                if let Some(db) = db {
-                    let _ = api_cache::upsert(
+                if let Some(db) = db
+                    && let Err(e) = api_cache::upsert(
                         db,
                         self.instance_id,
                         EndpointType::SingleRepo,
                         &cache_key,
                         etag,
                     )
-                    .await;
+                    .await
+                {
+                    tracing::debug!("api cache upsert failed: {e}");
                 }
                 Ok(to_platform_repo(&data))
             }
@@ -1176,7 +1133,6 @@ impl PlatformClient for GitHubClient {
         if let Some(db) = db {
             use crate::api_cache;
             use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
-            use crate::repository;
 
             let username = self.get_authenticated_user().await?.username;
             let mut expected_pages =
@@ -1247,7 +1203,7 @@ impl PlatformClient for GitHubClient {
                     }
 
                     let total_pages_to_store = expected_pages.map(|t| t as i32);
-                    let _ = api_cache::upsert_with_pagination(
+                    if let Err(e) = api_cache::upsert_with_pagination(
                         db,
                         self.instance_id,
                         EndpointType::Starred,
@@ -1255,7 +1211,10 @@ impl PlatformClient for GitHubClient {
                         etag,
                         total_pages_to_store,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::debug!("api cache upsert failed: {e}");
+                    }
 
                     // Emit FetchingRepos with expected_pages from Link header
                     emit(
@@ -1300,9 +1259,7 @@ impl PlatformClient for GitHubClient {
 
             if expected_pages.is_none() {
                 if all_cache_hits && total_sent.load(Ordering::Relaxed) == 0 && cache_hits > 0 {
-                    let cached_repos = repository::find_all_by_instance(db, self.instance_id)
-                        .await
-                        .map_err(|e| PlatformError::internal(e.to_string()))?;
+                    let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
 
                     if !cached_repos.is_empty() {
                         let cached_count = cached_repos.len();
@@ -1430,21 +1387,22 @@ impl PlatformClient for GitHubClient {
 
                 // Batch update ETags for modified pages
                 for (cache_key, etag) in etag_updates {
-                    let _ = api_cache::upsert(
+                    if let Err(e) = api_cache::upsert(
                         db,
                         self.instance_id,
                         EndpointType::Starred,
                         &cache_key,
                         etag,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::debug!("api cache upsert failed: {e}");
+                    }
                 }
             }
 
             if all_cache_hits && total_sent.load(Ordering::Relaxed) == 0 && cache_hits > 0 {
-                let cached_repos = repository::find_all_by_instance(db, self.instance_id)
-                    .await
-                    .map_err(|e| PlatformError::internal(e.to_string()))?;
+                let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
 
                 if !cached_repos.is_empty() {
                     let cached_count = cached_repos.len();

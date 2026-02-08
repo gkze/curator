@@ -104,7 +104,7 @@ impl InteractiveReporter {
     }
 
     pub fn handle(&self, event: SyncProgress) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         match event {
             SyncProgress::FetchingRepos {
@@ -485,7 +485,7 @@ impl InteractiveReporter {
     }
 
     pub fn finish(&self) {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         for fetch_state in state.fetch_bars.values() {
             if !fetch_state.bar.is_finished() {
                 fetch_state.bar.finish();

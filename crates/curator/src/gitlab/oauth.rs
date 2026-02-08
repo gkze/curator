@@ -69,7 +69,7 @@ pub struct DeviceCodeResponse {
 }
 
 /// Successful access token response from GitLab.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AccessTokenResponse {
     /// The OAuth access token.
     pub access_token: String,
@@ -92,6 +92,22 @@ pub struct AccessTokenResponse {
     /// The refresh token for obtaining new access tokens.
     #[serde(default)]
     pub refresh_token: Option<String>,
+}
+
+impl std::fmt::Debug for AccessTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .field("created_at", &self.created_at)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 /// Error response during token polling.

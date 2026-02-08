@@ -117,7 +117,7 @@ impl AdaptiveRateLimiter {
     /// the theoretical arrival time, respecting burst tolerance.
     pub async fn wait(&self) {
         let sleep_duration = {
-            let mut state = self.state.lock().expect("rate limiter lock poisoned");
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
             let cell_size = state.cell_size;
             let burst_tolerance = state.burst_tolerance;
@@ -155,7 +155,7 @@ impl AdaptiveRateLimiter {
     /// If the response includes a `retry_after` duration (from a 429 response),
     /// the TAT is pushed forward to honor the server's requested wait time.
     pub fn update(&self, info: &RateLimitInfo) {
-        let mut state = self.state.lock().expect("rate limiter lock poisoned");
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // Handle Retry-After: push TAT forward
         if let Some(retry_after) = info.retry_after {
@@ -180,7 +180,7 @@ impl AdaptiveRateLimiter {
     ///
     /// Useful for diagnostics and logging.
     pub fn current_rps(&self) -> f64 {
-        let state = self.state.lock().expect("rate limiter lock poisoned");
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         1.0 / state.cell_size.as_secs_f64()
     }
 }

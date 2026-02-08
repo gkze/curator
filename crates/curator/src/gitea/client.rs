@@ -16,7 +16,7 @@ use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, AdaptiveRateLimiter, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo,
-    UserInfo,
+    UserInfo, load_repos_by_instance,
 };
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
@@ -775,10 +775,7 @@ impl PlatformClient for GiteaClient {
             platform::FetchResult::NotModified => {
                 // Cache hit — load from DB if available
                 if let Some(db) = db {
-                    let cached_repos =
-                        crate::repository::find_all_by_instance(db, self.instance_id)
-                            .await
-                            .map_err(|e| PlatformError::internal(e.to_string()))?;
+                    let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
 
                     if !cached_repos.is_empty() {
                         emit(
@@ -831,7 +828,7 @@ impl PlatformClient for GiteaClient {
                 // Store ETag for page 1
                 if let Some(db) = db {
                     let ck = ApiCacheModel::starred_key(&cache_username, 1);
-                    let _ = api_cache::upsert_with_pagination(
+                    if let Err(e) = api_cache::upsert_with_pagination(
                         db,
                         self.instance_id,
                         EndpointType::Starred,
@@ -839,7 +836,10 @@ impl PlatformClient for GiteaClient {
                         etag,
                         None,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::debug!("api cache upsert failed: {e}");
+                    }
                 }
 
                 // Send first page repos immediately
@@ -962,7 +962,7 @@ impl PlatformClient for GiteaClient {
                             // Store ETag for fetched pages
                             if let Some(db) = db {
                                 let ck = ApiCacheModel::starred_key(&cache_username, page_num);
-                                let _ = api_cache::upsert_with_pagination(
+                                if let Err(e) = api_cache::upsert_with_pagination(
                                     db,
                                     self.instance_id,
                                     EndpointType::Starred,
@@ -970,7 +970,10 @@ impl PlatformClient for GiteaClient {
                                     etag,
                                     None,
                                 )
-                                .await;
+                                .await
+                                {
+                                    tracing::debug!("api cache upsert failed: {e}");
+                                }
                             }
 
                             if count < PAGE_SIZE as usize {
@@ -1006,7 +1009,7 @@ impl PlatformClient for GiteaClient {
 
                     if let Some(db) = db {
                         let ck = ApiCacheModel::starred_key(&cache_username, page_num);
-                        let _ = api_cache::upsert_with_pagination(
+                        if let Err(e) = api_cache::upsert_with_pagination(
                             db,
                             self.instance_id,
                             EndpointType::Starred,
@@ -1014,7 +1017,10 @@ impl PlatformClient for GiteaClient {
                             etag,
                             None,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::debug!("api cache upsert failed: {e}");
+                        }
                     }
                 }
 
@@ -1036,9 +1042,7 @@ impl PlatformClient for GiteaClient {
             && total_sent.load(Ordering::Relaxed) == 0
             && let Some(db) = db
         {
-            let cached_repos = crate::repository::find_all_by_instance(db, self.instance_id)
-                .await
-                .map_err(|e| PlatformError::internal(e.to_string()))?;
+            let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
 
             if !cached_repos.is_empty() {
                 emit(

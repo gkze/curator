@@ -216,7 +216,7 @@ impl GitHubClient {
                             None
                         };
 
-                        let _ = api_cache::upsert_with_pagination(
+                        if let Err(e) = api_cache::upsert_with_pagination(
                             db,
                             self.instance_id(),
                             config.endpoint_type,
@@ -224,7 +224,10 @@ impl GitHubClient {
                             etag,
                             total_pages_to_store,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::debug!("api cache upsert failed: {e}");
+                        }
                     }
 
                     all_items.extend(items);
@@ -376,8 +379,8 @@ impl GitHubClient {
                 }
 
                 // Store ETag
-                if let Some(db) = db {
-                    let _ = api_cache::upsert_with_pagination(
+                if let Some(db) = db
+                    && let Err(e) = api_cache::upsert_with_pagination(
                         db,
                         self.instance_id(),
                         config.endpoint_type,
@@ -385,7 +388,9 @@ impl GitHubClient {
                         etag,
                         known_total_pages.map(|t| t as i32),
                     )
-                    .await;
+                    .await
+                {
+                    tracing::debug!("api cache upsert failed: {e}");
                 }
 
                 emit(
@@ -516,7 +521,7 @@ impl GitHubClient {
                         // Store new ETag
                         if let Some(db) = db {
                             let cache_key = (config.cache_key_fn)(page);
-                            let _ = api_cache::upsert_with_pagination(
+                            if let Err(e) = api_cache::upsert_with_pagination(
                                 db,
                                 self.instance_id(),
                                 config.endpoint_type,
@@ -524,7 +529,10 @@ impl GitHubClient {
                                 new_etag,
                                 None,
                             )
-                            .await;
+                            .await
+                            {
+                                tracing::debug!("api cache upsert failed: {e}");
+                            }
                         }
                     } else if count == 0 {
                         stats.cache_hits += 1;

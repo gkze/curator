@@ -174,7 +174,7 @@ impl GiteaOAuth for GiteaAuth {
 }
 
 /// Successful access token response from Gitea.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AccessTokenResponse {
     /// The OAuth access token.
     pub access_token: String,
@@ -193,6 +193,21 @@ pub struct AccessTokenResponse {
     /// The granted scope.
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+impl std::fmt::Debug for AccessTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 /// Error response from the token endpoint.
@@ -875,7 +890,8 @@ mod tests {
 
         let debug_str = format!("{:?}", token);
         assert!(debug_str.contains("AccessTokenResponse"));
-        assert!(debug_str.contains("secret")); // Debug shows the token (be careful in production logs!)
+        assert!(!debug_str.contains("secret")); // Token must be redacted in Debug output
+        assert!(debug_str.contains("[REDACTED]"));
     }
 
     // ========== GiteaAuth Tests ==========

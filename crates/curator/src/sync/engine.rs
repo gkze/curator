@@ -1030,7 +1030,7 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     // Prune inactive starred repos
     let repos_to_prune: Vec<(String, String)> = match Arc::try_unwrap(repos_to_prune) {
         Ok(mutex) => mutex.into_inner().unwrap_or_default(),
-        Err(arc) => arc.lock().expect("repos_to_prune mutex poisoned").clone(),
+        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     };
 
     if options.prune && !repos_to_prune.is_empty() {

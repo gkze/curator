@@ -65,7 +65,7 @@ pub struct DeviceCodeResponse {
 }
 
 /// Successful access token response from GitHub.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AccessTokenResponse {
     /// The OAuth access token.
     pub access_token: String,
@@ -75,6 +75,16 @@ pub struct AccessTokenResponse {
 
     /// The granted scopes (space-separated).
     pub scope: String,
+}
+
+impl std::fmt::Debug for AccessTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 /// Error response during token polling.

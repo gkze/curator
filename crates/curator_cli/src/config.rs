@@ -423,6 +423,14 @@ fn save_toml_section_tokens(
     update(&mut doc);
 
     fs::write(&config_path, doc.to_string())?;
+
+    // Restrict permissions to owner-only (0600) since file contains tokens
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+    }
+
     Ok(config_path)
 }
 

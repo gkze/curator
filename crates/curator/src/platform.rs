@@ -17,12 +17,16 @@
 //! }
 //! ```
 
+mod cache_fallback;
 mod conditional;
 mod convert;
 mod errors;
 mod rate_limit;
 mod types;
 
+pub use cache_fallback::{
+    handle_cache_hit_fallback, load_repos_by_instance, load_repos_by_instance_and_owner,
+};
 pub use conditional::{CacheStats, FetchResult, PaginationInfo};
 pub use convert::strip_null_values;
 pub use errors::{PlatformError, Result, short_error_message};

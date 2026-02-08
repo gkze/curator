@@ -24,9 +24,9 @@ use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, AdaptiveRateLimiter, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient,
-    PlatformError, PlatformRepo, RateLimitInfo, UserInfo,
+    PlatformError, PlatformRepo, RateLimitInfo, UserInfo, handle_cache_hit_fallback,
+    load_repos_by_instance, load_repos_by_instance_and_owner,
 };
-use crate::repository;
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
 
@@ -302,7 +302,7 @@ impl GitLabClient {
                         } else {
                             None
                         };
-                        let _ = api_cache::upsert_with_pagination(
+                        if let Err(e) = api_cache::upsert_with_pagination(
                             db,
                             self.instance_id,
                             endpoint_type,
@@ -310,7 +310,10 @@ impl GitLabClient {
                             etag,
                             tp_to_store,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::debug!("api cache upsert failed: {e}");
+                        }
                     }
 
                     all.extend(items);
@@ -733,30 +736,16 @@ impl PlatformClient for GitLabClient {
         // Cache-hit fallback: if every page was 304, load from the local DB.
         if stats.all_cached()
             && projects.is_empty()
-            && let Some(db) = db
+            && let Some(models) = handle_cache_hit_fallback(
+                db,
+                stats.cache_hits,
+                |db| load_repos_by_instance_and_owner(db, self.instance_id, org),
+                org,
+                on_progress,
+            )
+            .await?
         {
-            let cached_repos =
-                repository::find_all_by_instance_and_owner(db, self.instance_id, org)
-                    .await
-                    .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-            if !cached_repos.is_empty() {
-                emit(
-                    on_progress,
-                    SyncProgress::CacheHit {
-                        namespace: org.to_string(),
-                        cached_count: cached_repos.len(),
-                    },
-                );
-                emit(
-                    on_progress,
-                    SyncProgress::FetchComplete {
-                        namespace: org.to_string(),
-                        total: cached_repos.len(),
-                    },
-                );
-                return Ok(cached_repos.iter().map(PlatformRepo::from_model).collect());
-            }
+            return Ok(models.iter().map(PlatformRepo::from_model).collect());
         }
 
         emit(
@@ -791,30 +780,16 @@ impl PlatformClient for GitLabClient {
         // Cache-hit fallback
         if stats.all_cached()
             && projects.is_empty()
-            && let Some(db) = db
+            && let Some(models) = handle_cache_hit_fallback(
+                db,
+                stats.cache_hits,
+                |db| load_repos_by_instance_and_owner(db, self.instance_id, username),
+                username,
+                on_progress,
+            )
+            .await?
         {
-            let cached_repos =
-                repository::find_all_by_instance_and_owner(db, self.instance_id, username)
-                    .await
-                    .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-            if !cached_repos.is_empty() {
-                emit(
-                    on_progress,
-                    SyncProgress::CacheHit {
-                        namespace: username.to_string(),
-                        cached_count: cached_repos.len(),
-                    },
-                );
-                emit(
-                    on_progress,
-                    SyncProgress::FetchComplete {
-                        namespace: username.to_string(),
-                        total: cached_repos.len(),
-                    },
-                );
-                return Ok(cached_repos.iter().map(PlatformRepo::from_model).collect());
-            }
+            return Ok(models.iter().map(PlatformRepo::from_model).collect());
         }
 
         emit(
@@ -989,31 +964,18 @@ impl PlatformClient for GitLabClient {
                 all_cache_hits = true;
                 if known_total_pages.is_none() || known_total_pages == Some(1) {
                     // All cached, fall back to DB
-                    if let Some(db) = db {
-                        let cached_repos = repository::find_all_by_instance(db, self.instance_id)
-                            .await
-                            .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-                        if !cached_repos.is_empty() {
-                            emit(
-                                on_progress,
-                                SyncProgress::CacheHit {
-                                    namespace: "starred".to_string(),
-                                    cached_count: cached_repos.len(),
-                                },
-                            );
-                            emit(
-                                on_progress,
-                                SyncProgress::FetchComplete {
-                                    namespace: "starred".to_string(),
-                                    total: cached_repos.len(),
-                                },
-                            );
-
-                            let repos: Vec<PlatformRepo> =
-                                cached_repos.iter().map(PlatformRepo::from_model).collect();
-                            return Ok(repos);
-                        }
+                    if let Some(models) = handle_cache_hit_fallback(
+                        db,
+                        1,
+                        |db| load_repos_by_instance(db, self.instance_id),
+                        "starred",
+                        on_progress,
+                    )
+                    .await?
+                    {
+                        let repos: Vec<PlatformRepo> =
+                            models.iter().map(PlatformRepo::from_model).collect();
+                        return Ok(repos);
                     }
                 }
             }
@@ -1028,8 +990,8 @@ impl PlatformClient for GitLabClient {
                 }
 
                 // Store ETag + pagination for page 1
-                if let Some(db) = db {
-                    let _ = api_cache::upsert_with_pagination(
+                if let Some(db) = db
+                    && let Err(e) = api_cache::upsert_with_pagination(
                         db,
                         self.instance_id,
                         EndpointType::Starred,
@@ -1037,7 +999,9 @@ impl PlatformClient for GitLabClient {
                         etag,
                         known_total_pages.map(|t| t as i32),
                     )
-                    .await;
+                    .await
+                {
+                    tracing::debug!("api cache upsert failed: {e}");
                 }
 
                 emit(
@@ -1120,7 +1084,7 @@ impl PlatformClient for GitLabClient {
                         && !was_cache_hit
                     {
                         let ck = ApiCacheModel::starred_key(&username, page_num);
-                        let _ = api_cache::upsert_with_pagination(
+                        if let Err(e) = api_cache::upsert_with_pagination(
                             db,
                             self.instance_id,
                             EndpointType::Starred,
@@ -1128,7 +1092,10 @@ impl PlatformClient for GitLabClient {
                             etag,
                             None,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::debug!("api cache upsert failed: {e}");
+                        }
                     }
 
                     emit(
@@ -1150,32 +1117,17 @@ impl PlatformClient for GitLabClient {
         // ── Cache-hit fallback ──────────────────────────────────────
         if all_cache_hits
             && all_projects.is_empty()
-            && let Some(db) = db
+            && let Some(models) = handle_cache_hit_fallback(
+                db,
+                1,
+                |db| load_repos_by_instance(db, self.instance_id),
+                "starred",
+                on_progress,
+            )
+            .await?
         {
-            let cached_repos = repository::find_all_by_instance(db, self.instance_id)
-                .await
-                .map_err(|e| PlatformError::internal(e.to_string()))?;
-
-            if !cached_repos.is_empty() {
-                emit(
-                    on_progress,
-                    SyncProgress::CacheHit {
-                        namespace: "starred".to_string(),
-                        cached_count: cached_repos.len(),
-                    },
-                );
-                emit(
-                    on_progress,
-                    SyncProgress::FetchComplete {
-                        namespace: "starred".to_string(),
-                        total: cached_repos.len(),
-                    },
-                );
-
-                let repos: Vec<PlatformRepo> =
-                    cached_repos.iter().map(PlatformRepo::from_model).collect();
-                return Ok(repos);
-            }
+            let repos: Vec<PlatformRepo> = models.iter().map(PlatformRepo::from_model).collect();
+            return Ok(repos);
         }
 
         self.update_starred_cache(user.id, &all_projects).await;
@@ -1260,9 +1212,7 @@ impl PlatformClient for GitLabClient {
                 if known_total_pages.is_none() || known_total_pages == Some(1) {
                     // All cached, fall back to DB
                     if let Some(db) = db {
-                        let cached_repos = repository::find_all_by_instance(db, self.instance_id)
-                            .await
-                            .map_err(|e| PlatformError::internal(e.to_string()))?;
+                        let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
 
                         if !cached_repos.is_empty() {
                             emit(
@@ -1304,8 +1254,8 @@ impl PlatformClient for GitLabClient {
                 }
 
                 // Store ETag + pagination for page 1
-                if let Some(db) = db {
-                    let _ = api_cache::upsert_with_pagination(
+                if let Some(db) = db
+                    && let Err(e) = api_cache::upsert_with_pagination(
                         db,
                         self.instance_id,
                         EndpointType::Starred,
@@ -1313,7 +1263,9 @@ impl PlatformClient for GitLabClient {
                         etag,
                         known_total_pages.map(|t| t as i32),
                     )
-                    .await;
+                    .await
+                {
+                    tracing::debug!("api cache upsert failed: {e}");
                 }
 
                 let page_count = items.len();
@@ -1421,7 +1373,7 @@ impl PlatformClient for GitLabClient {
                         && !was_cache_hit
                     {
                         let ck = ApiCacheModel::starred_key(&username, page_num);
-                        let _ = api_cache::upsert_with_pagination(
+                        if let Err(e) = api_cache::upsert_with_pagination(
                             db,
                             self.instance_id,
                             EndpointType::Starred,
@@ -1429,7 +1381,10 @@ impl PlatformClient for GitLabClient {
                             etag,
                             None, // total_pages already stored on page 1
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::debug!("api cache upsert failed: {e}");
+                        }
                     }
 
                     emit(
@@ -1454,9 +1409,7 @@ impl PlatformClient for GitLabClient {
             && all_projects.is_empty()
             && let Some(db) = db
         {
-            let cached_repos = repository::find_all_by_instance(db, self.instance_id)
-                .await
-                .map_err(|e| PlatformError::internal(e.to_string()))?;
+            let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
 
             if !cached_repos.is_empty() {
                 emit(
