@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use clap::Subcommand;
-use console::{Term, style};
+use console::Term;
+#[cfg(feature = "github")]
+use console::style;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
 use curator::{

@@ -2,6 +2,7 @@
 //!
 //! Authenticates with a platform instance using the appropriate OAuth flow.
 
+#[cfg(feature = "gitea")]
 use std::time::Duration;
 
 use chrono::Utc;
@@ -343,6 +344,7 @@ async fn login_gitea(
 }
 
 /// Try to copy text to clipboard, returning true if successful.
+#[cfg(any(feature = "github", feature = "gitlab"))]
 fn copy_to_clipboard(text: &str) -> bool {
     match arboard::Clipboard::new() {
         Ok(mut clipboard) => clipboard.set_text(text).is_ok(),

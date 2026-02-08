@@ -26,10 +26,12 @@ use curator::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use curator::entity::instance::Model as InstanceModel;
 use curator::platform::PlatformClient;
 use curator::repository;
+#[cfg(feature = "discovery")]
+use curator::sync::sync_repo_list_streaming;
 use curator::sync::{
     NamespaceSyncResultStreaming, ProgressCallback, SyncOptions, SyncResult,
-    sync_namespace_streaming, sync_namespaces_streaming, sync_repo_list_streaming,
-    sync_starred_streaming, sync_user_streaming, sync_users_streaming,
+    sync_namespace_streaming, sync_namespaces_streaming, sync_starred_streaming,
+    sync_user_streaming, sync_users_streaming,
 };
 use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
@@ -40,6 +42,7 @@ use crate::shutdown::{SHUTDOWN_FLAG, is_shutdown_requested};
 
 /// Buffer time (in seconds) before token expiry to trigger refresh.
 /// We refresh 5 minutes early to avoid race conditions.
+#[cfg(feature = "gitea")]
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
 // Re-export types from the library for convenience
@@ -407,6 +410,7 @@ impl SyncRunner {
     }
 
     /// Run a sync for an explicit repository list.
+    #[cfg(feature = "discovery")]
     pub async fn run_repo_list<C: PlatformClient + Clone + 'static>(
         &self,
         client: &C,

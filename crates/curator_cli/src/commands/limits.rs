@@ -1,13 +1,13 @@
 use clap::ValueEnum;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+#[cfg(feature = "github")]
 use uuid::Uuid;
 
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use curator::{Instance, InstanceColumn, PlatformType};
 
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+#[cfg(feature = "github")]
 use crate::commands::shared::get_token_for_instance;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::config::Config;
@@ -42,14 +42,15 @@ pub(crate) async fn handle_limits(
             )
         })?;
 
-    // Get token for instance (with automatic refresh for OAuth tokens)
-    let token = get_token_for_instance(&instance, config).await?;
+    #[cfg(not(feature = "github"))]
+    let _ = config;
 
     match instance.platform_type {
         #[cfg(feature = "github")]
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
 
+            let token = get_token_for_instance(&instance, config).await?;
             let client = GitHubClient::new(&token, Uuid::nil(), None)?;
             let rate_limits = curator::github::get_rate_limits(client.inner()).await?;
             let items = github_rate_limits_to_display(&rate_limits.resources);
