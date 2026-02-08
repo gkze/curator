@@ -135,6 +135,8 @@ pub mod well_known {
         pub platform_type: PlatformType,
         /// Host URL without protocol
         pub host: &'static str,
+        /// OAuth Client ID registered on this instance (if any)
+        pub oauth_client_id: Option<&'static str>,
     }
 
     impl WellKnownInstance {
@@ -156,46 +158,59 @@ pub mod well_known {
             name: "github",
             platform_type: PlatformType::GitHub,
             host: "github.com",
+            oauth_client_id: Some("Ov23liN0721EfoUpRrLl"),
         },
         WellKnownInstance {
             name: "gitlab",
             platform_type: PlatformType::GitLab,
             host: "gitlab.com",
+            oauth_client_id: Some(
+                "eba8ea9cbb5e8ddd455a3b3db35871963d8aa6b0a344a4b8c8e34ae8d71f336f",
+            ),
         },
         WellKnownInstance {
             name: "gnome-gitlab",
             platform_type: PlatformType::GitLab,
             host: "gitlab.gnome.org",
+            oauth_client_id: None,
         },
         WellKnownInstance {
             name: "freedesktop-gitlab",
             platform_type: PlatformType::GitLab,
             host: "gitlab.freedesktop.org",
+            oauth_client_id: None,
         },
         WellKnownInstance {
             name: "kde-gitlab",
             platform_type: PlatformType::GitLab,
             host: "invent.kde.org",
+            oauth_client_id: None,
         },
         WellKnownInstance {
             name: "kitware-gitlab",
             platform_type: PlatformType::GitLab,
             host: "gitlab.kitware.com",
+            oauth_client_id: Some(
+                "2860b6473e16b639ccb37ce9ffdc6643cd5d09f6e55168621a72f6d687f3c637",
+            ),
         },
         WellKnownInstance {
             name: "haskell-gitlab",
             platform_type: PlatformType::GitLab,
             host: "gitlab.haskell.org",
+            oauth_client_id: None,
         },
         WellKnownInstance {
             name: "archlinux-gitlab",
             platform_type: PlatformType::GitLab,
             host: "gitlab.archlinux.org",
+            oauth_client_id: None,
         },
         WellKnownInstance {
             name: "codeberg",
             platform_type: PlatformType::Gitea,
             host: "codeberg.org",
+            oauth_client_id: Some("dfe120ce-2440-4f13-8bb0-9ba5620542a7"),
         },
     ];
 

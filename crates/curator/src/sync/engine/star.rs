@@ -2,103 +2,15 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
-use crate::platform::{PlatformClient, PlatformError, PlatformRepo};
+use crate::platform::{PlatformClient, PlatformError};
 
 use super::super::progress::{ProgressCallback, SyncProgress, emit};
 use super::super::types::StarringStats;
 
-/// Star repositories sequentially using the platform client.
-///
-/// This is the unified starring implementation for use with the generic sync engine.
-/// Currently unused as platform-specific sync functions use their own starring logic
-/// that operates on platform-specific types before conversion.
-#[allow(dead_code)]
-pub(super) async fn star_repos_sequential<C: PlatformClient>(
-    client: &C,
-    repos: &[&PlatformRepo],
-    dry_run: bool,
-    on_progress: Option<&ProgressCallback>,
-) -> StarringStats {
-    let mut stats = StarringStats::default();
-
-    if repos.is_empty() {
-        return stats;
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::StarringRepos {
-            count: repos.len(),
-            concurrency: 1,
-            dry_run,
-        },
-    );
-
-    for repo in repos {
-        let result = if dry_run {
-            Ok(true)
-        } else {
-            client
-                .star_repo_with_retry(&repo.owner, &repo.name, on_progress)
-                .await
-        };
-
-        match result {
-            Ok(true) => {
-                stats.starred += 1;
-                emit(
-                    on_progress,
-                    SyncProgress::StarredRepo {
-                        owner: repo.owner.clone(),
-                        name: repo.name.clone(),
-                        already_starred: false,
-                    },
-                );
-            }
-            Ok(false) => {
-                stats.skipped += 1;
-                emit(
-                    on_progress,
-                    SyncProgress::StarredRepo {
-                        owner: repo.owner.clone(),
-                        name: repo.name.clone(),
-                        already_starred: true,
-                    },
-                );
-            }
-            Err(e) => {
-                let err_msg = e.to_string();
-                stats
-                    .errors
-                    .push(format!("{}/{}: {}", repo.owner, repo.name, err_msg));
-                emit(
-                    on_progress,
-                    SyncProgress::StarError {
-                        owner: repo.owner.clone(),
-                        name: repo.name.clone(),
-                        error: err_msg,
-                    },
-                );
-            }
-        }
-    }
-
-    emit(
-        on_progress,
-        SyncProgress::StarringComplete {
-            starred: stats.starred,
-            already_starred: stats.skipped,
-            errors: stats.errors.len(),
-        },
-    );
-
-    stats
-}
-
 /// Star repositories concurrently using the platform client.
 ///
-/// Uses a semaphore to limit concurrency. When a rate limiter is provided,
-/// waits for rate limit clearance before each starring operation.
+/// Uses a semaphore to limit concurrency. Rate limiting is handled
+/// transparently by the platform client's adaptive rate limiter.
 pub(super) async fn star_repos_concurrent<C: PlatformClient + Clone + 'static>(
     client: &C,
     repos: Vec<(String, String)>,

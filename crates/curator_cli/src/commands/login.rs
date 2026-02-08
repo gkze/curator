@@ -191,8 +191,20 @@ async fn login_gitlab(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use curator::gitlab::oauth;
 
+    // Resolve the OAuth Client ID for this instance
+    let client_id = well_known::by_name(&instance.name)
+        .and_then(|wk| wk.oauth_client_id)
+        .ok_or_else(|| {
+            format!(
+                "No OAuth Client ID registered for GitLab instance '{}' ({}).\n\
+                 Register an OAuth application on https://{} and add its Client ID to \
+                 the well-known instances list.",
+                instance.name, instance.host, instance.host,
+            )
+        })?;
+
     // Request device code
-    let device_code = oauth::request_device_code_default(&instance.host)
+    let device_code = oauth::request_device_code_default(&instance.host, client_id)
         .await
         .map_err(|e| {
             Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error>
@@ -231,7 +243,7 @@ async fn login_gitlab(
     let _ = open::that(open_url);
 
     // Poll for token
-    let token_response = oauth::poll_for_token(&instance.host, &device_code)
+    let token_response = oauth::poll_for_token(&instance.host, client_id, &device_code)
         .await
         .map_err(|e| {
             Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error>

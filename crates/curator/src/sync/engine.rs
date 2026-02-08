@@ -5,9 +5,9 @@
 //!
 //! # Rate Limiting
 //!
-//! Rate limiting is handled inside platform clients. Each client has an
-//! `Option<AdaptiveRateLimiter>` field and calls `wait_for_rate_limit()` before
-//! API operations. The sync engine does not need to thread limiters through.
+//! Rate limiting is handled inside platform clients. Each client holds an
+//! optional `AdaptiveRateLimiter` and transparently paces requests before
+//! API operations. The sync engine does not manage rate limiters directly.
 //!
 //! # Example
 //!
@@ -221,7 +221,7 @@ where
     }
 
     let successful = results.iter().filter(|r| !r.is_error()).count();
-    let failed = results.iter().filter(|r| r.is_error()).count();
+    let failed = results.len() - successful;
     emit(
         on_progress,
         SyncProgress::SyncNamespacesComplete { successful, failed },

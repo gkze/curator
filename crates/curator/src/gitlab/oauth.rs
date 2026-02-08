@@ -16,17 +16,17 @@
 //! # Example
 //!
 //! ```ignore
-//! use curator::gitlab::oauth::{request_device_code, poll_for_token};
+//! use curator::gitlab::oauth::{request_device_code, poll_for_token, GITLAB_COM_CLIENT_ID};
 //!
-//! // Step 1: Request device code
-//! let device_code = request_device_code("https://gitlab.com", "read_api").await?;
+//! // Step 1: Request device code (pass the instance's client_id)
+//! let device_code = request_device_code("https://gitlab.com", GITLAB_COM_CLIENT_ID, "read_api").await?;
 //!
 //! // Step 2: Show user the code
 //! println!("Go to: {}", device_code.verification_uri);
 //! println!("Enter code: {}", device_code.user_code);
 //!
 //! // Step 3: Poll for token
-//! let token = poll_for_token("https://gitlab.com", &device_code).await?;
+//! let token = poll_for_token("https://gitlab.com", GITLAB_COM_CLIENT_ID, &device_code).await?;
 //! println!("Access token: {}", token.access_token);
 //! ```
 
@@ -35,11 +35,15 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// The Client ID for the Curator OAuth App on gitlab.com.
+/// The default Client ID for the Curator OAuth App on gitlab.com.
 ///
 /// This is a public identifier and is safe to embed in the source code.
 /// It identifies the Curator application to GitLab during OAuth flows.
-pub const CLIENT_ID: &str = "eba8ea9cbb5e8ddd455a3b3db35871963d8aa6b0a344a4b8c8e34ae8d71f336f";
+///
+/// For other GitLab instances, use the per-instance client ID from
+/// [`crate::entity::instance::well_known::WellKnownInstance::oauth_client_id`].
+pub const GITLAB_COM_CLIENT_ID: &str =
+    "eba8ea9cbb5e8ddd455a3b3db35871963d8aa6b0a344a4b8c8e34ae8d71f336f";
 
 /// Response from GitLab's device authorization endpoint.
 #[derive(Debug, Clone, Deserialize)]
@@ -123,6 +127,7 @@ fn base_url(host: &str) -> String {
 /// # Arguments
 ///
 /// * `host` - The GitLab host (e.g., "gitlab.com" or "https://gitlab.example.com").
+/// * `client_id` - The OAuth Client ID registered on the target GitLab instance.
 /// * `scope` - The OAuth scope(s) to request (e.g., "read_api").
 ///
 /// # Returns
@@ -130,6 +135,7 @@ fn base_url(host: &str) -> String {
 /// A [`DeviceCodeResponse`] containing the user code and verification URL.
 pub async fn request_device_code(
     host: &str,
+    client_id: &str,
     scope: &str,
 ) -> Result<DeviceCodeResponse, OAuthError> {
     let client = Client::new();
@@ -138,7 +144,7 @@ pub async fn request_device_code(
     let response = client
         .post(&url)
         .header("Accept", "application/json")
-        .form(&[("client_id", CLIENT_ID), ("scope", scope)])
+        .form(&[("client_id", client_id), ("scope", scope)])
         .send()
         .await?;
 
@@ -166,6 +172,7 @@ pub async fn request_device_code(
 /// # Arguments
 ///
 /// * `host` - The GitLab host (e.g., "gitlab.com").
+/// * `client_id` - The OAuth Client ID registered on the target GitLab instance.
 /// * `device_code` - The device code response from [`request_device_code`].
 ///
 /// # Returns
@@ -173,6 +180,7 @@ pub async fn request_device_code(
 /// An [`AccessTokenResponse`] containing the access token on success.
 pub async fn poll_for_token(
     host: &str,
+    client_id: &str,
     device_code: &DeviceCodeResponse,
 ) -> Result<AccessTokenResponse, OAuthError> {
     let client = Client::new();
@@ -193,7 +201,7 @@ pub async fn poll_for_token(
             .post(&url)
             .header("Accept", "application/json")
             .form(&[
-                ("client_id", CLIENT_ID),
+                ("client_id", client_id),
                 ("device_code", device_code.device_code.as_str()),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ])
@@ -260,6 +268,7 @@ pub async fn poll_for_token(
 /// # Arguments
 ///
 /// * `host` - The GitLab host (e.g., "gitlab.com").
+/// * `client_id` - The OAuth Client ID registered on the target GitLab instance.
 /// * `refresh_token` - The refresh token from a previous token response.
 ///
 /// # Returns
@@ -268,6 +277,7 @@ pub async fn poll_for_token(
 /// The old tokens are invalidated.
 pub async fn refresh_access_token(
     host: &str,
+    client_id: &str,
     refresh_token: &str,
 ) -> Result<AccessTokenResponse, OAuthError> {
     let client = Client::new();
@@ -277,7 +287,7 @@ pub async fn refresh_access_token(
         .post(&url)
         .header("Accept", "application/json")
         .form(&[
-            ("client_id", CLIENT_ID),
+            ("client_id", client_id),
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ])
@@ -334,9 +344,12 @@ pub fn token_is_expired(expires_at: Option<u64>, buffer_secs: u64) -> bool {
 
 /// Request a device code with the default scope for Curator (api).
 ///
-/// Uses the provided host. For gitlab.com, pass `"gitlab.com"`.
-pub async fn request_device_code_default(host: &str) -> Result<DeviceCodeResponse, OAuthError> {
-    request_device_code(host, "api").await
+/// Uses the provided host and client ID.
+pub async fn request_device_code_default(
+    host: &str,
+    client_id: &str,
+) -> Result<DeviceCodeResponse, OAuthError> {
+    request_device_code(host, client_id, "api").await
 }
 
 #[cfg(test)]
@@ -345,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_client_id_is_set() {
-        assert!(!CLIENT_ID.is_empty());
+        assert!(!GITLAB_COM_CLIENT_ID.is_empty());
     }
 
     #[test]

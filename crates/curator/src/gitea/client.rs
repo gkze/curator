@@ -80,7 +80,7 @@ impl GiteaClient {
         );
         headers.insert(
             header::USER_AGENT,
-            header::HeaderValue::from_static("curator/0.1.0"),
+            header::HeaderValue::from_static("curator"),
         );
 
         let client = Client::builder()
@@ -289,17 +289,27 @@ impl GiteaClient {
 
     /// Get rate limit information.
     ///
-    /// Gitea doesn't have a dedicated rate limit endpoint, so we return
-    /// approximate values. The actual rate limits depend on the instance
-    /// configuration.
+    /// Gitea doesn't have a dedicated rate limit endpoint. Returns the current
+    /// effective RPS from the adaptive rate limiter when available, otherwise
+    /// returns conservative defaults.
     pub fn get_rate_limit(&self) -> RateLimitInfo {
-        // Codeberg/Gitea defaults vary by instance
-        // Codeberg has relatively generous limits
-        RateLimitInfo {
-            limit: 1000,
-            remaining: 1000,
-            reset_at: Utc::now() + chrono::Duration::minutes(1),
-            retry_after: None,
+        if let Some(ref limiter) = self.rate_limiter {
+            let rps = limiter.current_rps();
+            // Approximate remaining from current pacing
+            let remaining = (rps * 60.0) as usize;
+            RateLimitInfo {
+                limit: remaining,
+                remaining,
+                reset_at: Utc::now() + chrono::Duration::minutes(1),
+                retry_after: None,
+            }
+        } else {
+            RateLimitInfo {
+                limit: 1000,
+                remaining: 1000,
+                reset_at: Utc::now() + chrono::Duration::minutes(1),
+                retry_after: None,
+            }
         }
     }
 
@@ -349,6 +359,7 @@ impl GiteaClient {
 
     /// Check if a repository is starred by the authenticated user.
     pub async fn is_repo_starred(&self, owner: &str, repo: &str) -> Result<bool, GiteaError> {
+        self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1/user/starred/{}/{}", self.host, owner, repo);
 
         let response = self
@@ -357,6 +368,9 @@ impl GiteaClient {
             .header(header::AUTHORIZATION, format!("token {}", self.token))
             .send()
             .await?;
+
+        let headers = response.headers().clone();
+        self.update_rate_limit(&headers);
 
         match response.status() {
             StatusCode::NO_CONTENT => Ok(true), // 204 = starred
@@ -570,7 +584,7 @@ impl PlatformClient for GiteaClient {
         _db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
-        // TODO: Implement ETag caching for Gitea
+        // NOTE: ETag caching not yet implemented for org/user repos (only starred).
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -602,7 +616,7 @@ impl PlatformClient for GiteaClient {
         _db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
-        // TODO: Implement ETag caching for Gitea
+        // NOTE: ETag caching not yet implemented for org/user repos (only starred).
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -727,11 +741,18 @@ impl PlatformClient for GiteaClient {
             },
         );
 
+        // Resolve the authenticated username for cache key scoping
+        let cache_username = self
+            .get_user_info()
+            .await
+            .map(|u| u.login)
+            .unwrap_or_else(|_| "starred".to_string());
+
         let total_sent = Arc::new(AtomicUsize::new(0));
 
         // Fetch first page with conditional ETag request
         let cached_etag = if let Some(db) = db {
-            let ck = ApiCacheModel::starred_key("starred", 1);
+            let ck = ApiCacheModel::starred_key(&cache_username, 1);
             api_cache::get_etag(db, self.instance_id, EndpointType::Starred, &ck)
                 .await
                 .ok()
@@ -752,8 +773,6 @@ impl PlatformClient for GiteaClient {
 
         match first_result {
             platform::FetchResult::NotModified => {
-                all_cache_hits = true;
-
                 // Cache hit — load from DB if available
                 if let Some(db) = db {
                     let cached_repos =
@@ -788,6 +807,18 @@ impl PlatformClient for GiteaClient {
                         return Ok(sent);
                     }
                 }
+
+                // First page was NotModified but no DB or empty DB -- nothing more to do
+                // (no pagination info available, can't determine total pages)
+                let sent = total_sent.load(Ordering::Relaxed);
+                emit(
+                    on_progress,
+                    SyncProgress::FetchComplete {
+                        namespace: "starred".to_string(),
+                        total: sent,
+                    },
+                );
+                return Ok(sent);
             }
             platform::FetchResult::Fetched {
                 data: first_page,
@@ -799,7 +830,7 @@ impl PlatformClient for GiteaClient {
 
                 // Store ETag for page 1
                 if let Some(db) = db {
-                    let ck = ApiCacheModel::starred_key("starred", 1);
+                    let ck = ApiCacheModel::starred_key(&cache_username, 1);
                     let _ = api_cache::upsert_with_pagination(
                         db,
                         self.instance_id,
@@ -844,13 +875,23 @@ impl PlatformClient for GiteaClient {
             }
         }
 
-        // Fetch remaining pages concurrently using semaphore for rate control
+        // Fetch remaining pages concurrently using semaphore for rate control.
+        // Safety cap: Gitea doesn't expose total pages, so we cap at a generous
+        // upper bound to prevent unbounded loops.
+        const MAX_PAGES: u32 = 500;
         let semaphore = Arc::new(Semaphore::new(concurrency));
         let mut page = 2u32;
         let mut handles = Vec::new();
 
-        // Spawn page fetches - semaphore limits concurrency, no artificial caps
         loop {
+            if page > MAX_PAGES {
+                tracing::warn!(
+                    "Reached maximum page limit ({}) for starred repos pagination",
+                    MAX_PAGES
+                );
+                break;
+            }
+
             let task_semaphore = Arc::clone(&semaphore);
             let client = self.clone();
             let task_repo_tx = repo_tx.clone();
@@ -859,7 +900,7 @@ impl PlatformClient for GiteaClient {
 
             // Pre-fetch ETag outside the spawn so we can borrow db
             let task_cached_etag = if let Some(db) = db {
-                let ck = ApiCacheModel::starred_key("starred", page);
+                let ck = ApiCacheModel::starred_key(&cache_username, page);
                 api_cache::get_etag(db, self.instance_id, EndpointType::Starred, &ck)
                     .await
                     .ok()
@@ -898,7 +939,7 @@ impl PlatformClient for GiteaClient {
                         tracing::warn!(
                             "Failed to fetch starred repos page {}: {}",
                             current_page,
-                            crate::gitea::error::short_error_message(&e)
+                            short_error_message(&e)
                         );
                         None
                     }
@@ -911,14 +952,16 @@ impl PlatformClient for GiteaClient {
             // Process in batches to detect early termination
             if handles.len() >= concurrency {
                 let mut got_partial = false;
+                let mut batch_all_cache_hits = true;
                 for handle in handles.drain(..) {
                     if let Ok(Some((page_num, count, was_cache_hit, etag))) = handle.await {
                         if !was_cache_hit {
                             all_cache_hits = false;
+                            batch_all_cache_hits = false;
 
                             // Store ETag for fetched pages
                             if let Some(db) = db {
-                                let ck = ApiCacheModel::starred_key("starred", page_num);
+                                let ck = ApiCacheModel::starred_key(&cache_username, page_num);
                                 let _ = api_cache::upsert_with_pagination(
                                     db,
                                     self.instance_id,
@@ -928,6 +971,10 @@ impl PlatformClient for GiteaClient {
                                     None,
                                 )
                                 .await;
+                            }
+
+                            if count < PAGE_SIZE as usize {
+                                got_partial = true;
                             }
                         }
 
@@ -941,12 +988,11 @@ impl PlatformClient for GiteaClient {
                                 expected_pages: None,
                             },
                         );
-                        if !was_cache_hit && count < PAGE_SIZE as usize {
-                            got_partial = true;
-                        }
                     }
                 }
-                if got_partial {
+                // Terminate if we got a partial page OR if every page in this
+                // batch was a cache hit (no new data to discover).
+                if got_partial || batch_all_cache_hits {
                     break;
                 }
             }
@@ -959,7 +1005,7 @@ impl PlatformClient for GiteaClient {
                     all_cache_hits = false;
 
                     if let Some(db) = db {
-                        let ck = ApiCacheModel::starred_key("starred", page_num);
+                        let ck = ApiCacheModel::starred_key(&cache_username, page_num);
                         let _ = api_cache::upsert_with_pagination(
                             db,
                             self.instance_id,

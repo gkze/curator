@@ -20,7 +20,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use sea_orm::DatabaseConnection;
@@ -123,6 +123,11 @@ impl<C: PlatformClient + Clone + 'static> SyncContextBuilder<C> {
             .client
             .ok_or(SyncContextError::MissingField { field: "client" })?;
         let options = self.options.unwrap_or_default();
+
+        // Validate: non-dry-run syncs require a database
+        if !options.dry_run && self.database.is_none() {
+            return Err(SyncContextError::MissingField { field: "database" });
+        }
 
         Ok(SyncContext {
             client,
@@ -370,14 +375,6 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
             .await?;
 
         Ok(SyncStreamingResult { sync, persist })
-    }
-
-    /// Get a real-time counter for saved repositories.
-    ///
-    /// This is useful for progress reporting - you can poll the counter
-    /// while the sync is running to show real-time progress.
-    pub fn create_persist_counter(&self) -> Arc<AtomicUsize> {
-        Arc::new(AtomicUsize::new(0))
     }
 
     /// Check if shutdown has been requested.

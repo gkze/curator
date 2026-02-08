@@ -134,8 +134,15 @@ async fn flush_batch(
     let batch_names: Vec<(String, String)> = batch
         .iter()
         .map(|model| {
-            // SAFETY: ActiveModel always has owner/name set by to_active_model()
-            (model.owner.clone().unwrap(), model.name.clone().unwrap())
+            let owner = match &model.owner {
+                sea_orm::ActiveValue::Set(v) | sea_orm::ActiveValue::Unchanged(v) => v.clone(),
+                sea_orm::ActiveValue::NotSet => "<unknown>".to_string(),
+            };
+            let name = match &model.name {
+                sea_orm::ActiveValue::Set(v) | sea_orm::ActiveValue::Unchanged(v) => v.clone(),
+                sea_orm::ActiveValue::NotSet => "<unknown>".to_string(),
+            };
+            (owner, name)
         })
         .collect();
 

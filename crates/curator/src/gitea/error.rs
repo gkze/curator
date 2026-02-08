@@ -99,7 +99,9 @@ pub fn short_error_message(err: &GiteaError) -> String {
         GiteaError::Json(_) => "JSON parse error".to_string(),
         GiteaError::Api { status, message } => {
             if message.len() > 50 {
-                format!("HTTP {}: {}...", status, &message[..47])
+                // Use char_indices to avoid panicking on multi-byte UTF-8
+                let truncated: String = message.chars().take(47).collect();
+                format!("HTTP {}: {}...", status, truncated)
             } else {
                 format!("HTTP {}: {}", status, message)
             }

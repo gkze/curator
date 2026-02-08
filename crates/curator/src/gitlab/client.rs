@@ -363,6 +363,7 @@ impl GitLabClient {
 
     /// Get information about the authenticated user.
     pub async fn get_user_info(&self) -> Result<GitLabUser, GitLabError> {
+        self.wait_for_rate_limit().await;
         let resp = self
             .api
             .get_api_v4_user()
@@ -401,6 +402,7 @@ impl GitLabClient {
     /// The trimmed OpenAPI spec doesn't include `/users?username=X`, so we
     /// fall back to the inner reqwest client for this one lookup.
     async fn resolve_user_id(&self, username: &str) -> Result<u64, GitLabError> {
+        self.wait_for_rate_limit().await;
         let url = format!("{}/api/v4/users", self.host);
         let resp = self
             .api
@@ -433,6 +435,7 @@ impl GitLabClient {
     ///
     /// Returns `Ok(true)` if the project was starred, `Ok(false)` if already starred.
     pub async fn star_project(&self, project_id: u64) -> Result<bool, GitLabError> {
+        self.wait_for_rate_limit().await;
         let id_str = project_id.to_string();
         match self.api.post_api_v4_projects_id_star(&id_str).await {
             Ok(_) => Ok(true),
@@ -449,6 +452,7 @@ impl GitLabClient {
     ///
     /// Returns `Ok(true)` if the project was unstarred, `Ok(false)` if wasn't starred.
     pub async fn unstar_project(&self, project_id: u64) -> Result<bool, GitLabError> {
+        self.wait_for_rate_limit().await;
         let id_str = project_id.to_string();
         match self.api.post_api_v4_projects_id_unstar(&id_str).await {
             Ok(_) => Ok(true),
@@ -491,6 +495,7 @@ impl GitLabClient {
 
     /// Get information about a group.
     pub async fn get_group_info(&self, group: &str) -> Result<OrgInfo, GitLabError> {
+        self.wait_for_rate_limit().await;
         let resp = self
             .api
             .get_api_v4_groups_id(
@@ -576,6 +581,7 @@ impl GitLabClient {
 
     /// Look up a project by its full path (owner/name).
     async fn get_project_by_path(&self, full_path: &str) -> Result<GitLabProject, GitLabError> {
+        self.wait_for_rate_limit().await;
         let resp = self
             .api
             .get_api_v4_projects_id(
