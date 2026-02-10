@@ -84,11 +84,16 @@ token = "ghp_..."
 
 [gitlab]
 token = "glpat-..."
+refresh_token = "..."      # optional; used for OAuth auto-refresh
+token_expires_at = 1735689600 # optional unix timestamp
 
 [codeberg]
 token = "..."
+refresh_token = "..."      # optional; used for OAuth auto-refresh
+token_expires_at = 1735689600 # optional unix timestamp
 
 [gitea]
+host = "gitea.example.com"
 token = "..."
 
 [sync]
@@ -106,11 +111,17 @@ All environment variables use the `CURATOR_` prefix:
 | ------------------------ | --------------------------------------------------- |
 | `CURATOR_DATABASE_URL` | Database connection string (default: see below) |
 | `CURATOR_GITHUB_TOKEN` | GitHub API token |
+| `CURATOR_GITLAB_HOST` | GitLab host (default: `gitlab.com`) |
 | `CURATOR_GITLAB_TOKEN` | GitLab API token |
+| `CURATOR_GITLAB_REFRESH_TOKEN` | GitLab OAuth refresh token |
+| `CURATOR_GITLAB_TOKEN_EXPIRES_AT` | GitLab OAuth token expiry (unix seconds) |
 | `CURATOR_CODEBERG_TOKEN` | Codeberg API token |
+| `CURATOR_CODEBERG_REFRESH_TOKEN` | Codeberg OAuth refresh token |
+| `CURATOR_CODEBERG_TOKEN_EXPIRES_AT` | Codeberg OAuth token expiry (unix seconds) |
+| `CURATOR_GITEA_HOST` | Gitea/Forgejo host |
 | `CURATOR_GITEA_TOKEN` | Gitea API token |
 
-The database URL defaults to `sqlite://~/.local/state/curator/curator.db?mode=rwc` on Linux (using the XDG state directory). On macOS, it defaults to `~/Library/Application Support/curator/curator.db?mode=rwc`.
+The database URL defaults to `sqlite://~/.local/state/curator/curator.db?mode=rwc` on Linux (using the XDG state directory). On macOS, it defaults to `sqlite://~/Library/Application Support/curator/curator.db?mode=rwc`.
 
 ## Usage
 
@@ -130,6 +141,9 @@ curator instance add my-gitea -t gitea -H gitea.example.com
 
 # List configured instances
 curator instance list
+
+# Update auth settings for an instance
+curator instance update work-gitlab -c my-oauth-client-id -f device
 
 # OAuth login (GitHub/GitLab/Codeberg)
 curator login github
@@ -151,6 +165,12 @@ curator migrate up
 
 # Check migration status
 curator migrate status
+
+# Roll back the last migration
+curator migrate down
+
+# Drop all tables and reapply migrations
+curator migrate fresh
 ```
 
 ### Discovery
@@ -167,6 +187,9 @@ curator discover https://example.com --allow-external --include-subdomains
 
 # Use sitemap discovery and tune crawl concurrency
 curator discover https://example.com --crawl-concurrency 20
+
+# Disable sitemap discovery
+curator discover https://example.com --no-sitemaps
 ```
 
 Discovery only syncs repositories for hosts that have configured instances.

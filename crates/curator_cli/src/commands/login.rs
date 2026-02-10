@@ -330,7 +330,7 @@ async fn login_gitlab(
                     println!();
                     println!("You can now use curator commands like:");
                     println!("  curator sync stars {}", instance.name);
-                    println!("  curator sync group {} <group-path>", instance.name);
+                    println!("  curator sync org {} <group-path>", instance.name);
                 } else {
                     tracing::info!(
                         config_path = %config_path.display(),

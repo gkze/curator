@@ -58,7 +58,7 @@ CONFIGURATION
       3. .env file in current directory
 
 ENVIRONMENT VARIABLES
-    CURATOR_DATABASE_URL      Database connection string (default: ~/.local/state/curator/curator.db)
+    CURATOR_DATABASE_URL      Database connection string (default: sqlite://~/.local/state/curator/curator.db?mode=rwc)
     CURATOR_GITHUB_TOKEN      GitHub personal access token
     CURATOR_GITLAB_TOKEN      GitLab personal access token
     CURATOR_GITEA_TOKEN       Gitea/Forgejo personal access token
