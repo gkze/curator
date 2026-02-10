@@ -16,7 +16,7 @@ use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, AdaptiveRateLimiter, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo,
-    UserInfo, load_repos_by_instance,
+    UserInfo, handle_streaming_cache_hit_fallback, load_repos_by_instance,
 };
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
@@ -774,39 +774,19 @@ impl PlatformClient for GiteaClient {
         match first_result {
             platform::FetchResult::NotModified => {
                 // Cache hit — load from DB if available
-                if let Some(db) = db {
-                    let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
+                let instance_id = self.instance_id;
+                handle_streaming_cache_hit_fallback(
+                    db,
+                    1, // one cache hit (this page)
+                    |db| load_repos_by_instance(db, instance_id),
+                    "starred",
+                    &repo_tx,
+                    &total_sent,
+                    on_progress,
+                )
+                .await?;
 
-                    if !cached_repos.is_empty() {
-                        emit(
-                            on_progress,
-                            SyncProgress::CacheHit {
-                                namespace: "starred".to_string(),
-                                cached_count: cached_repos.len(),
-                            },
-                        );
-
-                        for model in &cached_repos {
-                            let repo = PlatformRepo::from_model(model);
-                            if repo_tx.send(repo).await.is_ok() {
-                                total_sent.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-
-                        let sent = total_sent.load(Ordering::Relaxed);
-                        emit(
-                            on_progress,
-                            SyncProgress::FetchComplete {
-                                namespace: "starred".to_string(),
-                                total: sent,
-                            },
-                        );
-                        return Ok(sent);
-                    }
-                }
-
-                // First page was NotModified but no DB or empty DB -- nothing more to do
-                // (no pagination info available, can't determine total pages)
+                // First page was NotModified — no pagination info, can't determine total pages
                 let sent = total_sent.load(Ordering::Relaxed);
                 emit(
                     on_progress,
@@ -1038,28 +1018,18 @@ impl PlatformClient for GiteaClient {
         }
 
         // Cache-hit fallback: if all pages were 304 and nothing was sent
-        if all_cache_hits
-            && total_sent.load(Ordering::Relaxed) == 0
-            && let Some(db) = db
-        {
-            let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
-
-            if !cached_repos.is_empty() {
-                emit(
-                    on_progress,
-                    SyncProgress::CacheHit {
-                        namespace: "starred".to_string(),
-                        cached_count: cached_repos.len(),
-                    },
-                );
-
-                for model in &cached_repos {
-                    let repo = PlatformRepo::from_model(model);
-                    if repo_tx.send(repo).await.is_ok() {
-                        total_sent.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
+        if all_cache_hits && total_sent.load(Ordering::Relaxed) == 0 {
+            let instance_id = self.instance_id;
+            handle_streaming_cache_hit_fallback(
+                db,
+                1, // all pages were cache hits
+                |db| load_repos_by_instance(db, instance_id),
+                "starred",
+                &repo_tx,
+                &total_sent,
+                on_progress,
+            )
+            .await?;
         }
 
         let sent = total_sent.load(Ordering::Relaxed);

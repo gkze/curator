@@ -42,9 +42,13 @@ use std::future::Future;
 use sea_orm::DatabaseConnection;
 
 use super::progress::{ProgressCallback, SyncProgress, emit};
-use super::types::{NamespaceSyncResult, NamespaceSyncResultStreaming, SyncOptions, SyncResult};
+use super::types::{
+    NamespaceSyncResult, NamespaceSyncResultStreaming, SyncOptions, SyncResult, SyncStrategy,
+};
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{PlatformClient, PlatformError, PlatformRepo};
+use crate::repository;
+use crate::repository::RepoSyncInfo;
 
 const REPO_STREAM_CHANNEL_BUFFER: usize = 500;
 const FILTER_PROGRESS_CHANNEL_BUFFER: usize = 256;
@@ -230,6 +234,74 @@ where
     results
 }
 
+fn apply_incremental_filter(
+    repos: Vec<PlatformRepo>,
+    sync_info: &[RepoSyncInfo],
+) -> Vec<PlatformRepo> {
+    if sync_info.is_empty() {
+        return repos;
+    }
+
+    filter::filter_for_incremental_sync(&repos, sync_info)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+async fn maybe_filter_incremental_for_owner<C: PlatformClient>(
+    client: &C,
+    owner: &str,
+    options: &SyncOptions,
+    db: Option<&DatabaseConnection>,
+    repos: Vec<PlatformRepo>,
+) -> Result<Vec<PlatformRepo>, PlatformError> {
+    if options.strategy != SyncStrategy::Incremental {
+        return Ok(repos);
+    }
+
+    let Some(db) = db else {
+        return Ok(repos);
+    };
+
+    let sync_info =
+        repository::get_sync_info_by_instance_and_owner(db, client.instance_id(), owner)
+            .await
+            .map_err(|e| PlatformError::internal(e.to_string()))?;
+
+    Ok(apply_incremental_filter(repos, &sync_info))
+}
+
+async fn maybe_filter_incremental_for_owners<C: PlatformClient>(
+    client: &C,
+    owners: &[String],
+    options: &SyncOptions,
+    db: Option<&DatabaseConnection>,
+    repos: Vec<PlatformRepo>,
+) -> Result<Vec<PlatformRepo>, PlatformError> {
+    if options.strategy != SyncStrategy::Incremental {
+        return Ok(repos);
+    }
+
+    let Some(db) = db else {
+        return Ok(repos);
+    };
+
+    if owners.is_empty() {
+        return Ok(repos);
+    }
+
+    let mut sync_info: Vec<RepoSyncInfo> = Vec::new();
+    for owner in owners {
+        let mut owner_info =
+            repository::get_sync_info_by_instance_and_owner(db, client.instance_id(), owner)
+                .await
+                .map_err(|e| PlatformError::internal(e.to_string()))?;
+        sync_info.append(&mut owner_info);
+    }
+
+    Ok(apply_incremental_filter(repos, &sync_info))
+}
+
 async fn sync_repos<C: PlatformClient + Clone + 'static>(
     client: &C,
     namespace: &str,
@@ -369,6 +441,7 @@ pub async fn sync_namespace<C: PlatformClient + Clone + 'static>(
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
     let repos = client.list_org_repos(namespace, db, on_progress).await?;
+    let repos = maybe_filter_incremental_for_owner(client, namespace, options, db, repos).await?;
 
     sync_repos(client, namespace, repos, options, on_progress).await
 }
@@ -398,6 +471,7 @@ pub async fn sync_namespace_streaming<C: PlatformClient + Clone + 'static>(
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
     let repos = client.list_org_repos(namespace, db, on_progress).await?;
+    let repos = maybe_filter_incremental_for_owner(client, namespace, options, db, repos).await?;
 
     sync_repos_streaming(client, namespace, repos, options, model_tx, on_progress).await
 }
@@ -553,6 +627,7 @@ pub async fn sync_user<C: PlatformClient + Clone + 'static>(
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
     let repos = client.list_user_repos(username, db, on_progress).await?;
+    let repos = maybe_filter_incremental_for_owner(client, username, options, db, repos).await?;
 
     sync_repos(client, username, repos, options, on_progress).await
 }
@@ -582,6 +657,7 @@ pub async fn sync_user_streaming<C: PlatformClient + Clone + 'static>(
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
     let repos = client.list_user_repos(username, db, on_progress).await?;
+    let repos = maybe_filter_incremental_for_owner(client, username, options, db, repos).await?;
 
     sync_repos_streaming(client, username, repos, options, model_tx, on_progress).await
 }
@@ -694,6 +770,16 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
             total: fetched.len(),
         },
     );
+
+    let fetched = if options.strategy == SyncStrategy::Incremental {
+        let mut owners: Vec<String> = fetched.iter().map(|repo| repo.owner.clone()).collect();
+        owners.sort();
+        owners.dedup();
+        maybe_filter_incremental_for_owners(client, &owners, options, db.as_deref(), fetched)
+            .await?
+    } else {
+        fetched
+    };
 
     let mut result =
         sync_repos_streaming(client, namespace, fetched, options, model_tx, on_progress).await?;

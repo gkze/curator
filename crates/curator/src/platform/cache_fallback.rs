@@ -2,11 +2,14 @@
 
 use sea_orm::DatabaseConnection;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::entity::code_repository::Model;
-use crate::platform::ProgressCallback;
 use crate::platform::errors::PlatformError;
+use crate::platform::{PlatformRepo, ProgressCallback};
 use crate::repository::{find_all_by_instance, find_all_by_instance_and_owner};
 use crate::sync::{SyncProgress, emit};
 
@@ -51,6 +54,55 @@ where
         }
     }
     Ok(None)
+}
+
+/// Handle the cache-hit fallback pattern for streaming paginated listings.
+///
+/// When all pages returned 304 Not Modified and no items have been sent yet,
+/// load cached repositories from the database and stream them through the
+/// provided channel. Emits `CacheHit` progress if repos are found.
+///
+/// Returns the number of repos streamed (0 if no fallback was needed).
+pub async fn handle_streaming_cache_hit_fallback<'a, F, Fut>(
+    db: Option<&'a DatabaseConnection>,
+    cache_hits: u32,
+    repository_loader: F,
+    namespace: &'a str,
+    repo_tx: &mpsc::Sender<PlatformRepo>,
+    total_sent: &Arc<AtomicUsize>,
+    on_progress: Option<&'a ProgressCallback>,
+) -> Result<usize, PlatformError>
+where
+    F: FnOnce(&'a DatabaseConnection) -> Fut,
+    Fut: Future<Output = Result<Vec<Model>, PlatformError>>,
+{
+    if cache_hits > 0
+        && let Some(db) = db
+    {
+        let cached_repos = repository_loader(db).await?;
+
+        if !cached_repos.is_empty() {
+            let cached_count = cached_repos.len();
+
+            emit(
+                on_progress,
+                SyncProgress::CacheHit {
+                    namespace: namespace.to_string(),
+                    cached_count,
+                },
+            );
+
+            for model in &cached_repos {
+                let repo = PlatformRepo::from_model(model);
+                if repo_tx.send(repo).await.is_ok() {
+                    total_sent.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            return Ok(cached_count);
+        }
+    }
+    Ok(0)
 }
 
 /// Load repositories by instance ID (for starred listings).

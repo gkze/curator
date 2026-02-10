@@ -25,7 +25,8 @@ mod rate_limit;
 mod types;
 
 pub use cache_fallback::{
-    handle_cache_hit_fallback, load_repos_by_instance, load_repos_by_instance_and_owner,
+    handle_cache_hit_fallback, handle_streaming_cache_hit_fallback, load_repos_by_instance,
+    load_repos_by_instance_and_owner,
 };
 pub use conditional::{CacheStats, FetchResult, PaginationInfo};
 pub use convert::strip_null_values;

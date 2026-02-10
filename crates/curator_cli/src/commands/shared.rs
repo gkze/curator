@@ -499,24 +499,27 @@ impl SyncRunner {
     pub fn print_single_result(&self, name: &str, result: &AggregatedSyncResult, kind: SyncKind) {
         let was_interrupted = is_shutdown_requested();
         let saved = result.persist_result.saved_count;
+        let incremental = self.options.strategy == curator::sync::SyncStrategy::Incremental;
 
         if self.is_tty {
             if was_interrupted {
                 println!("\n(Interrupted by user - partial results below)");
             }
 
-            let entity = match kind {
-                SyncKind::Namespace => "repositories",
-                SyncKind::User => "repositories",
-                SyncKind::Starred => "starred",
+            let total_label = match kind {
+                SyncKind::Starred => "Total starred",
+                _ if incremental => "Updated since last sync",
+                _ => "Total repositories",
+            };
+            let active_label = if incremental {
+                format!("Active & updated (last {} days)", self.active_within_days)
+            } else {
+                format!("Active (last {} days)", self.active_within_days)
             };
 
             println!("\nSync results for '{}':", name);
-            println!("  Total {}:    {}", entity, result.total_processed);
-            println!(
-                "  Active (last {} days): {}",
-                self.active_within_days, result.total_matched
-            );
+            println!("  {}:    {}", total_label, result.total_processed);
+            println!("  {}: {}", active_label, result.total_matched);
 
             if self.options.star {
                 if self.options.dry_run {
@@ -568,6 +571,7 @@ impl SyncRunner {
     pub fn print_multi_result(&self, count: usize, result: &AggregatedSyncResult, kind: SyncKind) {
         let was_interrupted = is_shutdown_requested();
         let total_saved = result.persist_result.saved_count;
+        let incremental = self.options.strategy == curator::sync::SyncStrategy::Incremental;
 
         if self.is_tty {
             if was_interrupted {
@@ -579,13 +583,27 @@ impl SyncRunner {
                 SyncKind::User => "repositories",
                 SyncKind::Starred => "starred",
             };
+            let total_label = if incremental {
+                "Total updated since last sync"
+            } else {
+                "Total repositories processed"
+            };
+            let active_label = if incremental {
+                format!(
+                    "Total active & updated (last {} days)",
+                    self.active_within_days
+                )
+            } else {
+                format!("Total active (last {} days)", self.active_within_days)
+            };
 
             println!("\n=== SUMMARY ===");
-            println!("Total {} processed: {}", entity, result.total_processed);
-            println!(
-                "Total active (last {} days):  {}",
-                self.active_within_days, result.total_matched
-            );
+            if incremental {
+                println!("{}: {}", total_label, result.total_processed);
+            } else {
+                println!("Total {} processed: {}", entity, result.total_processed);
+            }
+            println!("{}:  {}", active_label, result.total_matched);
 
             if self.options.star {
                 if self.options.dry_run {

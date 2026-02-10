@@ -19,7 +19,7 @@ use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, AdaptiveRateLimiter, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient,
     PlatformError, PlatformRepo, RateLimitInfo, UserInfo, handle_cache_hit_fallback,
-    load_repos_by_instance, load_repos_by_instance_and_owner,
+    handle_streaming_cache_hit_fallback, load_repos_by_instance, load_repos_by_instance_and_owner,
 };
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
@@ -1258,27 +1258,18 @@ impl PlatformClient for GitHubClient {
             }
 
             if expected_pages.is_none() {
-                if all_cache_hits && total_sent.load(Ordering::Relaxed) == 0 && cache_hits > 0 {
-                    let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
-
-                    if !cached_repos.is_empty() {
-                        let cached_count = cached_repos.len();
-
-                        emit(
-                            on_progress,
-                            SyncProgress::CacheHit {
-                                namespace: "starred".to_string(),
-                                cached_count,
-                            },
-                        );
-
-                        for model in &cached_repos {
-                            let platform_repo = PlatformRepo::from_model(model);
-                            if repo_tx.send(platform_repo).await.is_ok() {
-                                total_sent.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
+                if all_cache_hits && total_sent.load(Ordering::Relaxed) == 0 {
+                    let instance_id = self.instance_id;
+                    handle_streaming_cache_hit_fallback(
+                        Some(db),
+                        cache_hits,
+                        |db| load_repos_by_instance(db, instance_id),
+                        "starred",
+                        &repo_tx,
+                        &total_sent,
+                        on_progress,
+                    )
+                    .await?;
                 }
 
                 emit(
@@ -1401,27 +1392,18 @@ impl PlatformClient for GitHubClient {
                 }
             }
 
-            if all_cache_hits && total_sent.load(Ordering::Relaxed) == 0 && cache_hits > 0 {
-                let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
-
-                if !cached_repos.is_empty() {
-                    let cached_count = cached_repos.len();
-
-                    emit(
-                        on_progress,
-                        SyncProgress::CacheHit {
-                            namespace: "starred".to_string(),
-                            cached_count,
-                        },
-                    );
-
-                    for model in &cached_repos {
-                        let platform_repo = PlatformRepo::from_model(model);
-                        if repo_tx.send(platform_repo).await.is_ok() {
-                            total_sent.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
+            if all_cache_hits && total_sent.load(Ordering::Relaxed) == 0 {
+                let instance_id = self.instance_id;
+                handle_streaming_cache_hit_fallback(
+                    Some(db),
+                    cache_hits,
+                    |db| load_repos_by_instance(db, instance_id),
+                    "starred",
+                    &repo_tx,
+                    &total_sent,
+                    on_progress,
+                )
+                .await?;
             }
 
             emit(

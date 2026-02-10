@@ -25,7 +25,7 @@ use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, AdaptiveRateLimiter, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient,
     PlatformError, PlatformRepo, RateLimitInfo, UserInfo, handle_cache_hit_fallback,
-    load_repos_by_instance, load_repos_by_instance_and_owner,
+    handle_streaming_cache_hit_fallback, load_repos_by_instance, load_repos_by_instance_and_owner,
 };
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
@@ -1210,36 +1210,28 @@ impl PlatformClient for GitLabClient {
                 all_cache_hits = true;
                 // If we don't know total_pages, we can't continue paginating
                 if known_total_pages.is_none() || known_total_pages == Some(1) {
-                    // All cached, fall back to DB
-                    if let Some(db) = db {
-                        let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
+                    let instance_id = self.instance_id;
+                    let sent = handle_streaming_cache_hit_fallback(
+                        db,
+                        1, // one cache hit (this page)
+                        |db| load_repos_by_instance(db, instance_id),
+                        "starred",
+                        &repo_tx,
+                        &total_sent,
+                        on_progress,
+                    )
+                    .await?;
 
-                        if !cached_repos.is_empty() {
-                            emit(
-                                on_progress,
-                                SyncProgress::CacheHit {
-                                    namespace: "starred".to_string(),
-                                    cached_count: cached_repos.len(),
-                                },
-                            );
-
-                            for model in &cached_repos {
-                                let repo = PlatformRepo::from_model(model);
-                                if repo_tx.send(repo).await.is_ok() {
-                                    total_sent.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-
-                            let sent = total_sent.load(Ordering::Relaxed);
-                            emit(
-                                on_progress,
-                                SyncProgress::FetchComplete {
-                                    namespace: "starred".to_string(),
-                                    total: sent,
-                                },
-                            );
-                            return Ok(sent);
-                        }
+                    if sent > 0 {
+                        let total = total_sent.load(Ordering::Relaxed);
+                        emit(
+                            on_progress,
+                            SyncProgress::FetchComplete {
+                                namespace: "starred".to_string(),
+                                total,
+                            },
+                        );
+                        return Ok(total);
                     }
                 }
             }
@@ -1405,28 +1397,18 @@ impl PlatformClient for GitLabClient {
 
         // ── Cache-hit fallback ──────────────────────────────────────
         // If every page returned 304 and we got no projects, load from DB
-        if all_cache_hits
-            && all_projects.is_empty()
-            && let Some(db) = db
-        {
-            let cached_repos = load_repos_by_instance(db, self.instance_id).await?;
-
-            if !cached_repos.is_empty() {
-                emit(
-                    on_progress,
-                    SyncProgress::CacheHit {
-                        namespace: "starred".to_string(),
-                        cached_count: cached_repos.len(),
-                    },
-                );
-
-                for model in &cached_repos {
-                    let repo = PlatformRepo::from_model(model);
-                    if repo_tx.send(repo).await.is_ok() {
-                        total_sent.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
+        if all_cache_hits && all_projects.is_empty() {
+            let instance_id = self.instance_id;
+            handle_streaming_cache_hit_fallback(
+                db,
+                1, // all pages were cache hits
+                |db| load_repos_by_instance(db, instance_id),
+                "starred",
+                &repo_tx,
+                &total_sent,
+                on_progress,
+            )
+            .await?;
         }
 
         // Update starred cache with all projects we collected

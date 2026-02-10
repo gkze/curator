@@ -178,7 +178,7 @@ struct CommonSyncOptions {
     #[arg(short = 'R', long)]
     no_rate_limit: bool,
 
-    /// Incremental sync - only fetch repos that changed since last sync
+    /// Incremental sync - only process repos that changed since last sync
     ///
     /// When enabled, compares the platform's updated_at/pushed_at timestamps
     /// with the stored synced_at to skip repositories that haven't changed.
