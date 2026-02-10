@@ -59,6 +59,8 @@ async fn create_test_instances(db: &DatabaseConnection) {
         name: Set("test-github".to_string()),
         platform_type: Set(PlatformType::GitHub),
         host: Set("test-github.example.com".to_string()),
+        oauth_client_id: Set(None),
+        oauth_flow: Set("auto".to_string()),
         created_at: Set(now.fixed_offset()),
     };
 
@@ -67,6 +69,8 @@ async fn create_test_instances(db: &DatabaseConnection) {
         name: Set("test-gitlab".to_string()),
         platform_type: Set(PlatformType::GitLab),
         host: Set("test-gitlab.example.com".to_string()),
+        oauth_client_id: Set(None),
+        oauth_flow: Set("auto".to_string()),
         created_at: Set(now.fixed_offset()),
     };
 

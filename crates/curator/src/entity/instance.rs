@@ -32,6 +32,17 @@ pub struct Model {
     /// Does not include the protocol (https://).
     pub host: String,
 
+    /// OAuth Client ID registered on this specific instance (if any).
+    ///
+    /// This enables OAuth for custom/self-hosted instances without hardcoding
+    /// client IDs in the well-known instance list.
+    pub oauth_client_id: Option<String>,
+
+    /// Preferred auth flow for this instance.
+    ///
+    /// Supported values: "auto", "device", "pkce", "token".
+    pub oauth_flow: String,
+
     /// When this instance was first configured.
     pub created_at: DateTimeWithTimeZone,
 }
@@ -147,6 +158,8 @@ pub mod well_known {
                 name: self.name.to_string(),
                 platform_type: self.platform_type,
                 host: self.host.to_string(),
+                oauth_client_id: self.oauth_client_id.map(ToString::to_string),
+                oauth_flow: "auto".to_string(),
                 created_at: Utc::now().fixed_offset(),
             }
         }
@@ -270,6 +283,8 @@ mod tests {
             name: "test".to_string(),
             platform_type,
             host: host.to_string(),
+            oauth_client_id: None,
+            oauth_flow: "auto".to_string(),
             created_at: Utc::now().fixed_offset(),
         }
     }
@@ -390,6 +405,11 @@ mod tests {
         assert_eq!(model.name, "github");
         assert_eq!(model.platform_type, PlatformType::GitHub);
         assert_eq!(model.host, "github.com");
+        assert_eq!(
+            model.oauth_client_id.as_deref(),
+            Some("Ov23liN0721EfoUpRrLl")
+        );
+        assert_eq!(model.oauth_flow, "auto");
         assert_eq!(model.id, Uuid::nil()); // Nil until inserted
     }
 

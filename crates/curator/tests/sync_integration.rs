@@ -58,6 +58,8 @@ async fn setup_test_db() -> sea_orm::DatabaseConnection {
         name: Set("test-github".to_string()),
         platform_type: Set(PlatformType::GitHub),
         host: Set("test-github.example.com".to_string()),
+        oauth_client_id: Set(None),
+        oauth_flow: Set("auto".to_string()),
         created_at: Set(now.fixed_offset()),
     };
 

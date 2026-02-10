@@ -9,14 +9,14 @@ use url::Url;
 
 use curator::discovery::{CrawlOptions, DiscoveryProgress, discover_repo_links};
 use curator::{
-    Instance, InstanceModel, PlatformType, db, rate_limits,
+    Instance, InstanceModel, PlatformType, db,
     sync::{PlatformOptions, SyncOptions, SyncStrategy},
 };
 
 use crate::CommonSyncOptions;
 use crate::DiscoverOptions;
 use crate::commands::shared::{
-    SyncKind, SyncRunner, display_final_rate_limit, get_token_for_instance,
+    SyncKind, SyncRunner, build_rate_limiter, display_final_rate_limit, get_token_for_instance,
 };
 use crate::config::Config;
 use crate::progress::ProgressReporter;
@@ -269,40 +269,30 @@ async fn sync_instance_repos(
 
     let is_tty = Term::stdout().is_term();
 
-    // Create rate limiter for client construction
-    let rate_limiter = if no_rate_limit {
-        None
-    } else {
-        Some(curator::AdaptiveRateLimiter::new(
-            rate_limits::default_rps_for_platform(instance.platform_type),
-        ))
-    };
+    let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
 
     match instance.platform_type {
         #[cfg(feature = "github")]
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
             let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
-            let result = runner.run_repo_list(&client, &instance.name, repos).await?;
-            runner.print_single_result(&instance.name, &result, SyncKind::Namespace);
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_discovery_sync_for_client(&runner, &client, instance, repos, is_tty, no_rate_limit)
+                .await?;
         }
         #[cfg(feature = "gitlab")]
         PlatformType::GitLab => {
             use curator::gitlab::GitLabClient;
             let client =
                 GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
-            let result = runner.run_repo_list(&client, &instance.name, repos).await?;
-            runner.print_single_result(&instance.name, &result, SyncKind::Namespace);
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_discovery_sync_for_client(&runner, &client, instance, repos, is_tty, no_rate_limit)
+                .await?;
         }
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
             let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
-            let result = runner.run_repo_list(&client, &instance.name, repos).await?;
-            runner.print_single_result(&instance.name, &result, SyncKind::Namespace);
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_discovery_sync_for_client(&runner, &client, instance, repos, is_tty, no_rate_limit)
+                .await?;
         }
         #[allow(unreachable_patterns)]
         _ => {
@@ -314,6 +304,20 @@ async fn sync_instance_repos(
         }
     }
 
+    Ok(())
+}
+
+async fn run_discovery_sync_for_client<C: curator::PlatformClient + Clone + 'static>(
+    runner: &SyncRunner,
+    client: &C,
+    instance: &InstanceModel,
+    repos: &[(String, String)],
+    is_tty: bool,
+    no_rate_limit: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = runner.run_repo_list(client, &instance.name, repos).await?;
+    runner.print_single_result(&instance.name, &result, SyncKind::Namespace);
+    display_final_rate_limit(client, is_tty, no_rate_limit).await;
     Ok(())
 }
 

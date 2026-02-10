@@ -30,6 +30,8 @@ mod star;
 pub use filter::{filter_by_activity, filter_for_incremental_sync};
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chrono::Utc;
 use tokio::sync::{Semaphore, mpsc};
@@ -856,6 +858,179 @@ pub async fn sync_users_streaming<C: PlatformClient + Clone + 'static>(
     .await
 }
 
+struct StarredProcessorState {
+    processed: Arc<AtomicUsize>,
+    matched: Arc<AtomicUsize>,
+    saved: Arc<AtomicUsize>,
+    channel_closed: Arc<AtomicBool>,
+    repos_to_prune: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl StarredProcessorState {
+    fn new() -> Self {
+        Self {
+            processed: Arc::new(AtomicUsize::new(0)),
+            matched: Arc::new(AtomicUsize::new(0)),
+            saved: Arc::new(AtomicUsize::new(0)),
+            channel_closed: Arc::new(AtomicBool::new(false)),
+            repos_to_prune: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_starred_processor_task<C: PlatformClient + Clone + 'static>(
+    client: &C,
+    cutoff: chrono::DateTime<Utc>,
+    repo_rx: mpsc::Receiver<PlatformRepo>,
+    model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
+    progress_tx: mpsc::Sender<(usize, usize)>,
+    dry_run: bool,
+    prune: bool,
+    state: &StarredProcessorState,
+) -> tokio::task::JoinHandle<()> {
+    let processor_client = client.clone();
+    let processor_processed = Arc::clone(&state.processed);
+    let processor_matched = Arc::clone(&state.matched);
+    let processor_saved = Arc::clone(&state.saved);
+    let processor_channel_closed = Arc::clone(&state.channel_closed);
+    let processor_repos_to_prune = Arc::clone(&state.repos_to_prune);
+
+    tokio::spawn(async move {
+        let mut repo_rx = repo_rx;
+        let processor_model_tx = model_tx;
+
+        tracing::debug!("Processor task started");
+        while let Some(repo) = repo_rx.recv().await {
+            let new_processed = processor_processed.fetch_add(1, Ordering::Relaxed) + 1;
+            if new_processed.is_multiple_of(PROCESSOR_LOG_EVERY) {
+                tracing::debug!(processed = new_processed, "Processor progress");
+            }
+
+            let is_active = filter::is_active_repo(&repo, cutoff);
+            let new_matched = if is_active {
+                processor_matched.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                processor_matched.load(Ordering::Relaxed)
+            };
+
+            let _ = progress_tx.try_send((new_matched, new_processed));
+
+            if is_active {
+                if !dry_run && !processor_channel_closed.load(Ordering::Relaxed) {
+                    let model = processor_client.to_active_model(&repo);
+                    if processor_model_tx.send(model).await.is_err() {
+                        processor_channel_closed.store(true, Ordering::Relaxed);
+                    } else {
+                        processor_saved.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            } else if prune && let Ok(mut prune_list) = processor_repos_to_prune.lock() {
+                prune_list.push((repo.owner.clone(), repo.name.clone()));
+            }
+        }
+
+        tracing::debug!(
+            processed = processor_processed.load(Ordering::Relaxed),
+            matched = processor_matched.load(Ordering::Relaxed),
+            saved = processor_saved.load(Ordering::Relaxed),
+            "Processor task finished"
+        );
+    })
+}
+
+async fn poll_starred_stream_tasks<F>(
+    fetch_future: F,
+    processor_handle: tokio::task::JoinHandle<()>,
+    progress_rx: mpsc::Receiver<(usize, usize)>,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<(usize, usize), PlatformError>
+where
+    F: Future<Output = Result<usize, PlatformError>>,
+{
+    let mut fetch_future = Box::pin(fetch_future);
+    let mut fetch_done = false;
+    let mut fetch_result: Option<Result<usize, PlatformError>> = None;
+    let mut processor_result: Option<Result<(), tokio::task::JoinError>> = None;
+    let mut last_emitted_matched = 0usize;
+    let mut last_emitted_processed = 0usize;
+    let mut processor_handle = processor_handle;
+
+    let mut progress_stream = ReceiverStream::new(progress_rx).fuse();
+    let mut progress_stream_done = false;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            result = progress_stream.next(), if processor_result.is_none() && !progress_stream_done => {
+                if let Some((matched_count, processed_count)) = result {
+                    if should_emit_filtered_progress(
+                        matched_count,
+                        processed_count,
+                        last_emitted_matched,
+                        last_emitted_processed,
+                    ) {
+                        emit_filtered_progress(on_progress, matched_count, processed_count);
+                        last_emitted_matched = matched_count;
+                        last_emitted_processed = processed_count;
+                    }
+                } else {
+                    progress_stream_done = true;
+                }
+            }
+
+            result = fetch_future.as_mut(), if !fetch_done => {
+                fetch_done = true;
+                fetch_result = Some(result);
+            }
+
+            result = &mut processor_handle, if processor_result.is_none() => {
+                processor_result = Some(result.map(|_| ()));
+            }
+        }
+
+        if fetch_done && processor_result.is_some() {
+            while let Some((matched_count, processed_count)) = progress_stream.next().await {
+                if should_emit_filtered_progress(
+                    matched_count,
+                    processed_count,
+                    last_emitted_matched,
+                    last_emitted_processed,
+                ) {
+                    emit_filtered_progress(on_progress, matched_count, processed_count);
+                    last_emitted_matched = matched_count;
+                    last_emitted_processed = processed_count;
+                }
+            }
+            break;
+        }
+    }
+
+    let fetch_result =
+        fetch_result.ok_or_else(|| PlatformError::internal("Fetch task did not complete"))?;
+    drop(fetch_future);
+
+    match processor_result {
+        Some(result) => {
+            result.map_err(|e| PlatformError::internal(format!("Processor task failed: {}", e)))?;
+        }
+        None => {
+            return Err(PlatformError::internal("Processor task did not complete"));
+        }
+    }
+
+    fetch_result?;
+    Ok((last_emitted_matched, last_emitted_processed))
+}
+
+fn take_prune_repos(repos_to_prune: Arc<Mutex<Vec<(String, String)>>>) -> Vec<(String, String)> {
+    match Arc::try_unwrap(repos_to_prune) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    }
+}
+
 /// Sync the authenticated user's starred repositories.
 ///
 /// This function:
@@ -887,9 +1062,6 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
     let cutoff = Utc::now() - options.active_within;
 
     // Note: FilteringByActivity is not emitted here because the client's
@@ -897,18 +1069,13 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     // during streaming (not as a separate phase). The FilteredPage events
     // provide incremental filtering progress.
 
-    // Shared state for the streaming processor
-    let processed = Arc::new(AtomicUsize::new(0));
-    let matched = Arc::new(AtomicUsize::new(0));
-    let saved = Arc::new(AtomicUsize::new(0));
-    let channel_closed = Arc::new(AtomicBool::new(false));
-    let repos_to_prune = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let state = StarredProcessorState::new();
 
     // Create channel for receiving repos from the streaming fetch.
     // Buffer of 500 provides headroom to reduce backpressure likelihood.
     // The time-based flushing in the persist task is the primary deadlock prevention,
     // but larger buffers reduce the frequency of backpressure situations.
-    let (repo_tx, mut repo_rx) = mpsc::channel::<PlatformRepo>(REPO_STREAM_CHANNEL_BUFFER);
+    let (repo_tx, repo_rx) = mpsc::channel::<PlatformRepo>(REPO_STREAM_CHANNEL_BUFFER);
 
     // Create channel for progress events from processor task
     // Sends (matched_count, processed_count) tuples
@@ -916,151 +1083,31 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     let (progress_tx, progress_rx) =
         mpsc::channel::<(usize, usize)>(FILTER_PROGRESS_CHANNEL_BUFFER);
 
-    // Spawn task to process repos as they stream in
-    let processor_client = client.clone();
-    let processor_model_tx = model_tx.clone();
-    let processor_processed = Arc::clone(&processed);
-    let processor_matched = Arc::clone(&matched);
-    let processor_saved = Arc::clone(&saved);
-    let processor_channel_closed = Arc::clone(&channel_closed);
-    let processor_repos_to_prune = Arc::clone(&repos_to_prune);
-    let processor_dry_run = options.dry_run;
-    let processor_prune = options.prune;
+    let processor_handle = spawn_starred_processor_task(
+        client,
+        cutoff,
+        repo_rx,
+        model_tx.clone(),
+        progress_tx,
+        options.dry_run,
+        options.prune,
+        &state,
+    );
 
-    let processor_handle = tokio::spawn(async move {
-        tracing::debug!("Processor task started");
-        while let Some(repo) = repo_rx.recv().await {
-            let new_processed = processor_processed.fetch_add(1, Ordering::Relaxed) + 1;
-            if new_processed.is_multiple_of(PROCESSOR_LOG_EVERY) {
-                tracing::debug!(processed = new_processed, "Processor progress");
-            }
-
-            let is_active = filter::is_active_repo(&repo, cutoff);
-            let new_matched = if is_active {
-                processor_matched.fetch_add(1, Ordering::Relaxed) + 1
-            } else {
-                processor_matched.load(Ordering::Relaxed)
-            };
-
-            // Send progress update (ignore errors if receiver dropped)
-            let _ = progress_tx.try_send((new_matched, new_processed));
-
-            if is_active {
-                // Persist active starred repos
-                if !processor_dry_run && !processor_channel_closed.load(Ordering::Relaxed) {
-                    let model = processor_client.to_active_model(&repo);
-                    if processor_model_tx.send(model).await.is_err() {
-                        processor_channel_closed.store(true, Ordering::Relaxed);
-                    } else {
-                        processor_saved.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            } else if processor_prune {
-                // Mark inactive repos for pruning
-                if let Ok(mut prune_list) = processor_repos_to_prune.lock() {
-                    prune_list.push((repo.owner.clone(), repo.name.clone()));
-                }
-            }
-        }
-        tracing::debug!(
-            processed = processor_processed.load(Ordering::Relaxed),
-            matched = processor_matched.load(Ordering::Relaxed),
-            saved = processor_saved.load(Ordering::Relaxed),
-            "Processor task finished"
-        );
-    });
-
-    // Stream starred repos with concurrent progress emission
-    // Use pin to allow polling the future while also checking progress
-    let mut fetch_future = Box::pin(client.list_starred_repos_streaming(
+    let fetch_future = client.list_starred_repos_streaming(
         repo_tx,
         db,
         concurrency,
         skip_rate_checks,
         on_progress,
-    ));
+    );
 
-    let mut fetch_done = false;
-    let mut fetch_result: Option<Result<usize, PlatformError>> = None;
-    let mut processor_result: Option<Result<(), tokio::task::JoinError>> = None;
-    let mut last_emitted_matched = 0usize;
-    let mut last_emitted_processed = 0usize;
-    let mut processor_handle = processor_handle;
-
-    // Poll fetch, processor, and progress concurrently, emitting FilteredPage events in real-time
-    // Wrap receiver in a stream for idiomatic async handling
-    let mut progress_stream = ReceiverStream::new(progress_rx).fuse();
-    // Track when progress stream is exhausted to avoid spinning on fused stream
-    // (fused streams return Ready(None) immediately, which would cause a spin loop)
-    let mut progress_stream_done = false;
-
-    loop {
-        tokio::select! {
-            biased;
-
-            result = progress_stream.next(), if processor_result.is_none() && !progress_stream_done => {
-                if let Some((matched_count, processed_count)) = result {
-                    if should_emit_filtered_progress(
-                        matched_count,
-                        processed_count,
-                        last_emitted_matched,
-                        last_emitted_processed,
-                    ) {
-                        emit_filtered_progress(on_progress, matched_count, processed_count);
-                        last_emitted_matched = matched_count;
-                        last_emitted_processed = processed_count;
-                    }
-                } else {
-                    // Stream exhausted (sender dropped), disable this branch to avoid spinning
-                    progress_stream_done = true;
-                }
-            }
-
-            result = fetch_future.as_mut(), if !fetch_done => {
-                fetch_done = true;
-                fetch_result = Some(result);
-            }
-
-            result = &mut processor_handle, if processor_result.is_none() => {
-                processor_result = Some(result.map(|_| ()));
-            }
-        }
-
-        if fetch_done && processor_result.is_some() {
-            // Drain any remaining buffered progress messages.
-            // Since processor finished, the sender is dropped and stream won't block.
-            while let Some((matched_count, processed_count)) = progress_stream.next().await {
-                if should_emit_filtered_progress(
-                    matched_count,
-                    processed_count,
-                    last_emitted_matched,
-                    last_emitted_processed,
-                ) {
-                    emit_filtered_progress(on_progress, matched_count, processed_count);
-                    last_emitted_matched = matched_count;
-                    last_emitted_processed = processed_count;
-                }
-            }
-            break;
-        }
-    }
-
-    let fetch_result =
-        fetch_result.ok_or_else(|| PlatformError::internal("Fetch task did not complete"))?;
-    drop(fetch_future);
-
-    match processor_result {
-        Some(result) => {
-            result.map_err(|e| PlatformError::internal(format!("Processor task failed: {}", e)))?;
-        }
-        None => {
-            return Err(PlatformError::internal("Processor task did not complete"));
-        }
-    }
+    let (last_emitted_matched, last_emitted_processed) =
+        poll_starred_stream_tasks(fetch_future, processor_handle, progress_rx, on_progress).await?;
 
     // Emit final progress update
-    let final_matched = matched.load(Ordering::Relaxed);
-    let final_processed = processed.load(Ordering::Relaxed);
+    let final_matched = state.matched.load(Ordering::Relaxed);
+    let final_processed = state.processed.load(Ordering::Relaxed);
     if final_matched > last_emitted_matched || final_processed > last_emitted_processed {
         emit(
             on_progress,
@@ -1070,9 +1117,6 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
             },
         );
     }
-
-    // Check fetch result before emitting completion events
-    fetch_result?;
 
     // Emit FilterComplete and ModelsReady BEFORE dropping the channel
     // This ensures the progress reporter knows the final count before any
@@ -1109,15 +1153,12 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     let mut result = SyncResult {
         processed: final_processed,
         matched: final_matched,
-        saved: saved.load(Ordering::Relaxed),
+        saved: state.saved.load(Ordering::Relaxed),
         ..Default::default()
     };
 
     // Prune inactive starred repos
-    let repos_to_prune: Vec<(String, String)> = match Arc::try_unwrap(repos_to_prune) {
-        Ok(mutex) => mutex.into_inner().unwrap_or_default(),
-        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-    };
+    let repos_to_prune = take_prune_repos(state.repos_to_prune);
 
     if options.prune && !repos_to_prune.is_empty() {
         let prune_result =

@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 use config::{Config as ConfigBuilder, Environment, File, FileFormat};
+use console::Term;
 use directories::ProjectDirs;
 use serde::Deserialize;
 
@@ -209,11 +210,17 @@ impl Config {
             Ok(settings) => match settings.try_deserialize::<Config>() {
                 Ok(config) => config,
                 Err(e) => {
+                    if Term::stderr().is_term() {
+                        eprintln!("Warning: Failed to parse curator config; using defaults: {e}");
+                    }
                     tracing::warn!("Failed to deserialize config: {}", e);
                     Config::default()
                 }
             },
             Err(e) => {
+                if Term::stderr().is_term() {
+                    eprintln!("Warning: Failed to load curator config; using defaults: {e}");
+                }
                 tracing::warn!("Failed to build config: {}", e);
                 Config::default()
             }
@@ -386,6 +393,18 @@ impl Config {
             if let Some(exp) = expires_at {
                 doc["codeberg"]["token_expires_at"] = toml_edit::value(exp as i64);
             }
+        })
+    }
+
+    /// Save a Gitea/Forgejo personal access token to the config file.
+    ///
+    /// Creates the config file and parent directories if they don't exist.
+    /// Updates only the `[gitea]` section while preserving other config content.
+    #[cfg(feature = "gitea")]
+    pub fn save_gitea_token(host: &str, token: &str) -> io::Result<PathBuf> {
+        save_toml_section_tokens("gitea", |doc| {
+            doc["gitea"]["host"] = toml_edit::value(host);
+            doc["gitea"]["token"] = toml_edit::value(token);
         })
     }
 }

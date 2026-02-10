@@ -6,8 +6,8 @@ use chrono::Utc;
 use clap::Subcommand;
 use console::style;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
+    PaginatorTrait, QueryFilter, Set,
 };
 use tabled::{Table, Tabled, settings::Style};
 use uuid::Uuid;
@@ -18,6 +18,25 @@ use curator::{
 };
 
 use super::limits::OutputFormat;
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum OauthFlowArg {
+    Auto,
+    Device,
+    Pkce,
+    Token,
+}
+
+impl OauthFlowArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Device => "device",
+            Self::Pkce => "pkce",
+            Self::Token => "token",
+        }
+    }
+}
 
 /// Instance management subcommands.
 #[derive(Subcommand)]
@@ -39,6 +58,35 @@ pub enum InstanceAction {
         /// Required for custom instances, inferred for well-known names
         #[arg(short = 'H', long)]
         host: Option<String>,
+
+        /// OAuth Client ID for this instance.
+        ///
+        /// Required for OAuth login on custom/self-hosted instances.
+        #[arg(short = 'c', long)]
+        oauth_client_id: Option<String>,
+
+        /// Preferred auth flow for this instance.
+        ///
+        /// `auto` tries device flow, then PKCE, then token login.
+        #[arg(short = 'f', long, value_enum, default_value_t = OauthFlowArg::Auto)]
+        oauth_flow: OauthFlowArg,
+    },
+    /// Update auth settings for an existing instance
+    Update {
+        /// Instance name
+        name: String,
+
+        /// OAuth Client ID for this instance.
+        #[arg(short = 'c', long)]
+        oauth_client_id: Option<String>,
+
+        /// Clear the stored OAuth Client ID.
+        #[arg(long)]
+        clear_oauth_client_id: bool,
+
+        /// Preferred auth flow for this instance.
+        #[arg(short = 'f', long, value_enum)]
+        oauth_flow: Option<OauthFlowArg>,
     },
     /// List all configured instances
     List {
@@ -105,8 +153,33 @@ pub async fn handle_instance(
             name,
             platform_type,
             host,
+            oauth_client_id,
+            oauth_flow,
         } => {
-            add_instance(db, &name, platform_type.as_deref(), host.as_deref()).await?;
+            add_instance(
+                db,
+                &name,
+                platform_type.as_deref(),
+                host.as_deref(),
+                oauth_client_id,
+                oauth_flow,
+            )
+            .await?;
+        }
+        InstanceAction::Update {
+            name,
+            oauth_client_id,
+            clear_oauth_client_id,
+            oauth_flow,
+        } => {
+            update_instance(
+                db,
+                &name,
+                oauth_client_id,
+                clear_oauth_client_id,
+                oauth_flow,
+            )
+            .await?;
         }
         InstanceAction::List { output } => {
             list_instances(db, output).await?;
@@ -121,12 +194,79 @@ pub async fn handle_instance(
     Ok(())
 }
 
+/// Update auth settings for an existing instance.
+async fn update_instance(
+    db: &DatabaseConnection,
+    name: &str,
+    oauth_client_id: Option<String>,
+    clear_oauth_client_id: bool,
+    oauth_flow: Option<OauthFlowArg>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if oauth_client_id.is_some() && clear_oauth_client_id {
+        return Err("Use either --oauth-client-id or --clear-oauth-client-id, not both".into());
+    }
+
+    let mut instance = Instance::find()
+        .filter(InstanceColumn::Name.eq(name))
+        .one(db)
+        .await?
+        .ok_or_else(|| format!("Instance '{}' not found", name))?
+        .into_active_model();
+
+    let mut changed = false;
+
+    if let Some(client_id) = oauth_client_id {
+        instance.oauth_client_id = Set(Some(client_id));
+        changed = true;
+    } else if clear_oauth_client_id {
+        instance.oauth_client_id = Set(None);
+        changed = true;
+    }
+
+    if let Some(flow) = oauth_flow {
+        instance.oauth_flow = Set(flow.as_str().to_string());
+        changed = true;
+    }
+
+    if !changed {
+        return Err(
+            "No updates requested. Set --oauth-client-id, --clear-oauth-client-id, or --oauth-flow"
+                .into(),
+        );
+    }
+
+    let updated = instance.update(db).await?;
+
+    println!(
+        "{} Updated instance '{}' auth settings",
+        style("✓").green().bold(),
+        style(&updated.name).cyan()
+    );
+    println!(
+        "  OAuth Client ID: {}",
+        style(
+            updated
+                .oauth_client_id
+                .as_deref()
+                .unwrap_or("(not set)")
+                .to_string()
+        )
+        .dim()
+        .cyan()
+    );
+    println!("  OAuth flow: {}", style(updated.oauth_flow).dim().cyan());
+
+    Ok(())
+}
+
 /// Add a new instance to the database.
 async fn add_instance(
     db: &DatabaseConnection,
     name: &str,
     platform_type: Option<&str>,
     host: Option<&str>,
+    oauth_client_id: Option<String>,
+    oauth_flow: OauthFlowArg,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Check if instance already exists
     let existing = Instance::find()
@@ -139,8 +279,12 @@ async fn add_instance(
     }
 
     // Determine the instance configuration - check well-known first
-    let (pt, h) = if let Some(wk) = well_known::by_name(name) {
-        (wk.platform_type, wk.host.to_string())
+    let (pt, h, oauth_client_id) = if let Some(wk) = well_known::by_name(name) {
+        (
+            wk.platform_type,
+            wk.host.to_string(),
+            oauth_client_id.or_else(|| wk.oauth_client_id.map(ToString::to_string)),
+        )
     } else {
         // Custom instance - require platform_type and host
         let pt = platform_type
@@ -162,7 +306,7 @@ async fn add_instance(
             })?
             .to_string();
 
-        (pt, h)
+        (pt, h, oauth_client_id)
     };
 
     // Create the instance
@@ -171,6 +315,8 @@ async fn add_instance(
         name: Set(name.to_string()),
         platform_type: Set(pt),
         host: Set(h.clone()),
+        oauth_client_id: Set(oauth_client_id.clone()),
+        oauth_flow: Set(oauth_flow.as_str().to_string()),
         created_at: Set(Utc::now().fixed_offset()),
     };
 
@@ -183,6 +329,14 @@ async fn add_instance(
         result.platform_type,
         result.host
     );
+
+    if let Some(client_id) = oauth_client_id {
+        println!(
+            "  OAuth Client ID configured: {}",
+            style(client_id).dim().cyan()
+        );
+    }
+    println!("  OAuth flow: {}", style(oauth_flow.as_str()).dim().cyan());
 
     Ok(())
 }
@@ -332,6 +486,17 @@ async fn show_instance(
         InstanceDetail {
             property: "Host".to_string(),
             value: instance.host.clone(),
+        },
+        InstanceDetail {
+            property: "OAuth Client ID".to_string(),
+            value: instance
+                .oauth_client_id
+                .clone()
+                .unwrap_or_else(|| "(not set)".to_string()),
+        },
+        InstanceDetail {
+            property: "OAuth Flow".to_string(),
+            value: instance.oauth_flow.clone(),
         },
         InstanceDetail {
             property: "Base URL".to_string(),

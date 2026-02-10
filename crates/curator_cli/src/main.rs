@@ -286,7 +286,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url = config
         .database_url()
-        .expect("Failed to determine database URL - this should not happen");
+        .ok_or_else(|| {
+            std::io::Error::other(
+                "Failed to determine database URL. Set CURATOR_DATABASE_URL or configure [database].url.",
+            )
+        })?;
 
     // Ensure the database directory exists for SQLite
     if database_url.starts_with("sqlite://") {

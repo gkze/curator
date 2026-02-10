@@ -12,16 +12,67 @@ use console::style;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
 use curator::{
-    Instance, InstanceColumn, InstanceModel, PlatformType, db, rate_limits,
+    Instance, InstanceColumn, InstanceModel, PlatformType, db,
     sync::{PlatformOptions, SyncOptions, SyncStrategy},
 };
 
 use crate::CommonSyncOptions;
 use crate::StarredSyncOptions;
 use crate::commands::shared::{
-    SyncKind, SyncRunner, display_final_rate_limit, get_token_for_instance,
+    SyncKind, SyncRunner, build_rate_limiter, display_final_rate_limit, get_token_for_instance,
 };
 use crate::config::Config;
+
+async fn run_namespace_sync_for_client<C: curator::PlatformClient + Clone + 'static>(
+    runner: &SyncRunner,
+    client: &C,
+    names: &[String],
+    is_tty: bool,
+    no_rate_limit: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if names.len() == 1 {
+        let result = runner.run_namespace(client, &names[0]).await?;
+        runner.print_single_result(&names[0], &result, SyncKind::Namespace);
+    } else {
+        let result = runner.run_namespaces(client, names).await;
+        runner.print_multi_result(names.len(), &result, SyncKind::Namespace);
+    }
+
+    display_final_rate_limit(client, is_tty, no_rate_limit).await;
+    Ok(())
+}
+
+async fn run_user_sync_for_client<C: curator::PlatformClient + Clone + 'static>(
+    runner: &SyncRunner,
+    client: &C,
+    names: &[String],
+    is_tty: bool,
+    no_rate_limit: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if names.len() == 1 {
+        let result = runner.run_user(client, &names[0]).await?;
+        runner.print_single_result(&names[0], &result, SyncKind::User);
+    } else {
+        let result = runner.run_users(client, names).await;
+        runner.print_multi_result(names.len(), &result, SyncKind::User);
+    }
+
+    display_final_rate_limit(client, is_tty, no_rate_limit).await;
+    Ok(())
+}
+
+async fn run_starred_sync_for_client<C: curator::PlatformClient + Clone + 'static>(
+    runner: &SyncRunner,
+    client: &C,
+    prune: bool,
+    is_tty: bool,
+    no_rate_limit: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = runner.run_starred(client).await?;
+    runner.print_starred_result(&result, prune);
+    display_final_rate_limit(client, is_tty, no_rate_limit).await;
+    Ok(())
+}
 
 /// Sync subcommands.
 #[derive(Subcommand)]
@@ -209,14 +260,7 @@ async fn sync_org(
     // Display rate limit status (platform-dependent)
     let is_tty = Term::stdout().is_term();
 
-    // Create rate limiter for client construction
-    let rate_limiter = if no_rate_limit {
-        None
-    } else {
-        Some(curator::AdaptiveRateLimiter::new(
-            rate_limits::default_rps_for_platform(instance.platform_type),
-        ))
-    };
+    let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
 
     match instance.platform_type {
         #[cfg(feature = "github")]
@@ -225,16 +269,7 @@ async fn sync_org(
 
             let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
             display_rate_limit(&client, is_tty).await;
-
-            if names.len() == 1 {
-                let result = runner.run_namespace(&client, &names[0]).await?;
-                runner.print_single_result(&names[0], &result, SyncKind::Namespace);
-            } else {
-                let result = runner.run_namespaces(&client, names).await;
-                runner.print_multi_result(names.len(), &result, SyncKind::Namespace);
-            }
-
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_namespace_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
         }
         #[cfg(feature = "gitlab")]
         PlatformType::GitLab => {
@@ -242,32 +277,14 @@ async fn sync_org(
 
             let client =
                 GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
-
-            if names.len() == 1 {
-                let result = runner.run_namespace(&client, &names[0]).await?;
-                runner.print_single_result(&names[0], &result, SyncKind::Namespace);
-            } else {
-                let result = runner.run_namespaces(&client, names).await;
-                runner.print_multi_result(names.len(), &result, SyncKind::Namespace);
-            }
-
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_namespace_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
         }
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
 
             let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
-
-            if names.len() == 1 {
-                let result = runner.run_namespace(&client, &names[0]).await?;
-                runner.print_single_result(&names[0], &result, SyncKind::Namespace);
-            } else {
-                let result = runner.run_namespaces(&client, names).await;
-                runner.print_multi_result(names.len(), &result, SyncKind::Namespace);
-            }
-
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_namespace_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
         }
         #[allow(unreachable_patterns)]
         _ => {
@@ -318,14 +335,7 @@ async fn sync_user(
 
     let is_tty = Term::stdout().is_term();
 
-    // Create rate limiter for client construction
-    let rate_limiter = if no_rate_limit {
-        None
-    } else {
-        Some(curator::AdaptiveRateLimiter::new(
-            rate_limits::default_rps_for_platform(instance.platform_type),
-        ))
-    };
+    let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
 
     match instance.platform_type {
         #[cfg(feature = "github")]
@@ -334,16 +344,7 @@ async fn sync_user(
 
             let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
             display_rate_limit(&client, is_tty).await;
-
-            if names.len() == 1 {
-                let result = runner.run_user(&client, &names[0]).await?;
-                runner.print_single_result(&names[0], &result, SyncKind::User);
-            } else {
-                let result = runner.run_users(&client, names).await;
-                runner.print_multi_result(names.len(), &result, SyncKind::User);
-            }
-
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_user_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
         }
         #[cfg(feature = "gitlab")]
         PlatformType::GitLab => {
@@ -351,32 +352,14 @@ async fn sync_user(
 
             let client =
                 GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
-
-            if names.len() == 1 {
-                let result = runner.run_user(&client, &names[0]).await?;
-                runner.print_single_result(&names[0], &result, SyncKind::User);
-            } else {
-                let result = runner.run_users(&client, names).await;
-                runner.print_multi_result(names.len(), &result, SyncKind::User);
-            }
-
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_user_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
         }
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
 
             let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
-
-            if names.len() == 1 {
-                let result = runner.run_user(&client, &names[0]).await?;
-                runner.print_single_result(&names[0], &result, SyncKind::User);
-            } else {
-                let result = runner.run_users(&client, names).await;
-                runner.print_multi_result(names.len(), &result, SyncKind::User);
-            }
-
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_user_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
         }
         #[allow(unreachable_patterns)]
         _ => {
@@ -426,14 +409,7 @@ async fn sync_stars(
 
     let is_tty = Term::stdout().is_term();
 
-    // Create rate limiter for client construction
-    let rate_limiter = if no_rate_limit {
-        None
-    } else {
-        Some(curator::AdaptiveRateLimiter::new(
-            rate_limits::default_rps_for_platform(instance.platform_type),
-        ))
-    };
+    let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
 
     match instance.platform_type {
         #[cfg(feature = "github")]
@@ -442,11 +418,7 @@ async fn sync_stars(
 
             let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
             display_rate_limit(&client, is_tty).await;
-
-            let result = runner.run_starred(&client).await?;
-            runner.print_starred_result(&result, prune);
-
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_starred_sync_for_client(&runner, &client, prune, is_tty, no_rate_limit).await?;
         }
         #[cfg(feature = "gitlab")]
         PlatformType::GitLab => {
@@ -454,22 +426,14 @@ async fn sync_stars(
 
             let client =
                 GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
-
-            let result = runner.run_starred(&client).await?;
-            runner.print_starred_result(&result, prune);
-
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_starred_sync_for_client(&runner, &client, prune, is_tty, no_rate_limit).await?;
         }
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
 
             let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
-
-            let result = runner.run_starred(&client).await?;
-            runner.print_starred_result(&result, prune);
-
-            display_final_rate_limit(&client, is_tty, no_rate_limit).await;
+            run_starred_sync_for_client(&runner, &client, prune, is_tty, no_rate_limit).await?;
         }
         #[allow(unreachable_patterns)]
         _ => {

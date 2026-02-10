@@ -47,6 +47,7 @@ arboard = "3.4"
 toml_edit = "0.22"
 uuid = { version = "1", features = ["v4"] }
 url = "2.5"
+rpassword = "7"
 
 [lints]
 workspace = true

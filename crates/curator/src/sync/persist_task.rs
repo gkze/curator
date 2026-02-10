@@ -343,14 +343,14 @@ pub fn spawn_persist_task(
 ///
 /// If the task panicked, returns a PersistTaskResult with panic_info set.
 pub async fn await_persist_task(
-    handle: tokio::task::JoinHandle<PersistTaskResult>,
+    mut handle: tokio::task::JoinHandle<PersistTaskResult>,
 ) -> PersistTaskResult {
     tracing::debug!("Awaiting persist task completion");
     let start = std::time::Instant::now();
 
     // Use tokio::select! to allow aborting the task on timeout
     tokio::select! {
-        result = handle => {
+        result = &mut handle => {
             let elapsed = start.elapsed();
             match result {
                 Ok(persist_result) => {
@@ -392,9 +392,17 @@ pub async fn await_persist_task(
         }
         _ = tokio::time::sleep(PERSIST_TASK_TIMEOUT) => {
             // Task timed out - this indicates a bug (likely a sender leak)
+            handle.abort();
+
+            // Best-effort wait for cancellation so the task does not continue detached.
+            let cancelled = tokio::time::timeout(std::time::Duration::from_secs(1), &mut handle)
+                .await
+                .is_ok();
+
             tracing::error!(
                 timeout_secs = PERSIST_TASK_TIMEOUT.as_secs(),
                 elapsed_ms = start.elapsed().as_millis(),
+                cancelled,
                 "Persist task timed out - possible sender leak or channel not closing. \
                  This is a bug. Please report it at https://github.com/gkze/curator/issues"
             );

@@ -29,6 +29,8 @@ use tokio::sync::mpsc;
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::platform::{PlatformClient, PlatformError};
 
+#[cfg(feature = "discovery")]
+use super::engine::sync_repo_list_streaming;
 use super::engine::{
     sync_namespace, sync_namespace_streaming, sync_namespaces_streaming, sync_starred_streaming,
     sync_user_streaming, sync_users_streaming,
@@ -351,6 +353,30 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
             )
         })
         .await
+    }
+
+    /// Sync an explicit repository list with streaming persistence.
+    #[cfg(feature = "discovery")]
+    pub async fn sync_repo_list_streaming(
+        &self,
+        label: &str,
+        repos: &[(String, String)],
+    ) -> std::result::Result<SyncStreamingResult, PlatformError> {
+        let (sync, persist) = self
+            .with_persist_task(|tx| {
+                sync_repo_list_streaming(
+                    &self.client,
+                    label,
+                    repos,
+                    &self.options,
+                    self.database.clone(),
+                    tx,
+                    self.progress.as_ref().map(|p| p.as_ref()),
+                )
+            })
+            .await?;
+
+        Ok(SyncStreamingResult { sync, persist })
     }
 
     /// Sync starred repositories with streaming persistence.

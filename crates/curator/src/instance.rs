@@ -75,6 +75,8 @@ pub async fn get_or_create(
         name: Set(name),
         platform_type: Set(platform_type),
         host: Set(host.to_string()),
+        oauth_client_id: Set(None),
+        oauth_flow: Set("auto".to_string()),
         created_at: Set(chrono::Utc::now().fixed_offset()),
     };
 
@@ -106,6 +108,8 @@ pub async fn get_or_create_well_known(
             name: Set(wk.name.to_string()),
             platform_type: Set(platform_type),
             host: Set(host.to_string()),
+            oauth_client_id: Set(wk.oauth_client_id.map(ToString::to_string)),
+            oauth_flow: Set("auto".to_string()),
             created_at: Set(chrono::Utc::now().fixed_offset()),
         };
 

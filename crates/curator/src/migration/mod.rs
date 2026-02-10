@@ -7,6 +7,7 @@ pub use sea_orm_migration::prelude::*;
 mod m20250114_000001_create_schema;
 mod m20250114_000002_seed_well_known_instances;
 mod m20250205_000001_seed_gitlab_instances;
+mod m20260210_000001_add_instance_oauth_client_id;
 
 /// The migrator that runs all migrations.
 pub struct Migrator;
@@ -18,6 +19,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20250114_000001_create_schema::Migration),
             Box::new(m20250114_000002_seed_well_known_instances::Migration),
             Box::new(m20250205_000001_seed_gitlab_instances::Migration),
+            Box::new(m20260210_000001_add_instance_oauth_client_id::Migration),
         ]
     }
 
