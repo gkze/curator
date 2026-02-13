@@ -35,6 +35,49 @@ jobs:
       - name: Build Nix package
         run: nix build
 
+  coverage:
+    name: Coverage (curator + github)
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-nix
+      - name: Generate coverage summary
+        run: |-
+          mkdir -p coverage
+          # Prevent tests from accidentally making real network calls.
+          # Requests to non-local hosts should fail fast.
+          PROXY_URL="http://127.0.0.1:9"
+          NO_PROXY_LIST="127.0.0.1,localhost,::1"
+
+          nix develop --command env \
+            HTTP_PROXY="$PROXY_URL" \
+            HTTPS_PROXY="$PROXY_URL" \
+            ALL_PROXY="$PROXY_URL" \
+            NO_PROXY="$NO_PROXY_LIST" \
+            no_proxy="$NO_PROXY_LIST" \
+            cargo llvm-cov -p curator --no-default-features \
+            --features github --summary-only --ignore-run-fail --fail-under-lines 25 \
+            | tee coverage/summary.txt
+      - name: Generate lcov report
+        run: |-
+          PROXY_URL="http://127.0.0.1:9"
+          NO_PROXY_LIST="127.0.0.1,localhost,::1"
+
+          nix develop --command env \
+            HTTP_PROXY="$PROXY_URL" \
+            HTTPS_PROXY="$PROXY_URL" \
+            ALL_PROXY="$PROXY_URL" \
+            NO_PROXY="$NO_PROXY_LIST" \
+            no_proxy="$NO_PROXY_LIST" \
+            cargo llvm-cov -p curator --no-default-features \
+            --features github --lcov --output-path coverage/lcov.info --ignore-run-fail
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-curator-github
+          path: coverage/
+
   # Test feature combinations (uses devShell for flexibility)
   # Uses cargo-nextest for faster parallel test execution
   # On PRs, only runs tests for changed crates and their dependents
@@ -75,17 +118,33 @@ jobs:
           FEATURES="${{ matrix.features }}"
           CHANGED="${{ steps.changes.outputs.crates }}"
 
+          # Prevent tests from accidentally making real network calls.
+          PROXY_URL="http://127.0.0.1:9"
+          NO_PROXY_LIST="127.0.0.1,localhost,::1"
+
           # Build nextest filter for affected crates
           if [ -n "$CHANGED" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
             # Convert comma-separated crates to nextest filter expression
             # e.g., "curator,curator_cli" -> "rdeps(curator) | rdeps(curator_cli)"
             FILTER=$(echo "$CHANGED" | tr ',' '\n' | sed 's/.*/rdeps(&)/' | tr '\n' '|' | sed 's/|$//')
             echo "Running affected tests with filter: $FILTER"
-            nix develop --command cargo nextest run -p curator --no-default-features \
-              --features "$FEATURES" -E "$FILTER"
+            nix develop --command env \
+              HTTP_PROXY="$PROXY_URL" \
+              HTTPS_PROXY="$PROXY_URL" \
+              ALL_PROXY="$PROXY_URL" \
+              NO_PROXY="$NO_PROXY_LIST" \
+              no_proxy="$NO_PROXY_LIST" \
+              cargo nextest run -p curator --no-default-features \
+                --features "$FEATURES" -E "$FILTER"
           else
             # On push to main or no crate changes, run full test suite
             echo "Running full test suite"
-            nix develop --command cargo nextest run -p curator --no-default-features \
-              --features "$FEATURES"
+            nix develop --command env \
+              HTTP_PROXY="$PROXY_URL" \
+              HTTPS_PROXY="$PROXY_URL" \
+              ALL_PROXY="$PROXY_URL" \
+              NO_PROXY="$NO_PROXY_LIST" \
+              no_proxy="$NO_PROXY_LIST" \
+              cargo nextest run -p curator --no-default-features \
+                --features "$FEATURES"
           fi

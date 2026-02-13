@@ -444,7 +444,133 @@ impl SyncStreamingResult {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use uuid::Uuid;
+
+    use crate::entity::platform_type::PlatformType;
+    use crate::platform::{OrgInfo, PlatformRepo, RateLimitInfo, UserInfo};
+
     use super::*;
+
+    #[derive(Clone)]
+    struct TestPlatformClient;
+
+    #[async_trait]
+    impl PlatformClient for TestPlatformClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> std::result::Result<RateLimitInfo, PlatformError> {
+            Ok(RateLimitInfo {
+                limit: 5000,
+                remaining: 5000,
+                reset_at: Utc::now(),
+                retry_after: None,
+            })
+        }
+
+        async fn get_org_info(&self, _org: &str) -> std::result::Result<OrgInfo, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn get_authenticated_user(&self) -> std::result::Result<UserInfo, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn get_repo(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> std::result::Result<PlatformRepo, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn list_org_repos(
+            &self,
+            _org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<Vec<PlatformRepo>, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn list_user_repos(
+            &self,
+            _username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<Vec<PlatformRepo>, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn is_repo_starred(
+            &self,
+            _owner: &str,
+            _name: &str,
+        ) -> std::result::Result<bool, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn star_repo(
+            &self,
+            _owner: &str,
+            _name: &str,
+        ) -> std::result::Result<bool, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<bool, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn unstar_repo(
+            &self,
+            _owner: &str,
+            _name: &str,
+        ) -> std::result::Result<bool, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<Vec<PlatformRepo>, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            _repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<usize, PlatformError> {
+            Err(PlatformError::internal("unused in tests"))
+        }
+
+        fn to_active_model(&self, _repo: &PlatformRepo) -> CodeRepositoryActiveModel {
+            CodeRepositoryActiveModel::default()
+        }
+    }
 
     #[test]
     fn test_builder_default() {
@@ -502,5 +628,397 @@ mod tests {
         assert!(options.prune);
         assert!(!options.dry_run);
         assert!(options.star); // Default is true
+    }
+
+    #[test]
+    fn test_builder_build_requires_client() {
+        let err = SyncContextBuilder::<TestPlatformClient>::new()
+            .options(SyncOptions::default())
+            .build()
+            .err()
+            .expect("builder should require client");
+
+        match err {
+            SyncContextError::MissingField { field } => assert_eq!(field, "client"),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_build_requires_database_for_non_dry_run() {
+        let err = SyncContextBuilder::new()
+            .client(TestPlatformClient)
+            .options(SyncOptions {
+                dry_run: false,
+                ..SyncOptions::default()
+            })
+            .build()
+            .err()
+            .expect("builder should require database for non-dry-run");
+
+        match err {
+            SyncContextError::MissingField { field } => assert_eq!(field, "database"),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_build_allows_missing_database_for_dry_run() {
+        let ctx = SyncContextBuilder::new()
+            .client(TestPlatformClient)
+            .options(SyncOptions {
+                dry_run: true,
+                ..SyncOptions::default()
+            })
+            .build()
+            .expect("dry-run builder should not require database");
+
+        assert!(ctx.database().is_none());
+        assert!(ctx.is_dry_run());
+    }
+
+    #[test]
+    fn test_builder_build_preserves_custom_options() {
+        let ctx = SyncContextBuilder::new()
+            .client(TestPlatformClient)
+            .options(SyncOptions {
+                dry_run: true,
+                star: false,
+                ..SyncOptions::default()
+            })
+            .build()
+            .expect("builder should succeed");
+
+        assert!(ctx.options().dry_run);
+        assert!(!ctx.options().star);
+    }
+
+    #[test]
+    fn test_builder_build_uses_default_options_when_omitted() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let ctx = SyncContextBuilder::new()
+            .client(TestPlatformClient)
+            .database(Arc::new(db))
+            .build()
+            .expect("builder should apply default options when omitted");
+
+        assert_eq!(ctx.options().dry_run, SyncOptions::default().dry_run);
+        assert_eq!(ctx.options().strategy, SyncOptions::default().strategy);
+    }
+
+    #[test]
+    fn test_is_shutdown_requested_reflects_flag_state() {
+        let unset = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions::default(),
+            database: None,
+            progress: None,
+            shutdown_flag: None,
+        };
+        assert!(!unset.is_shutdown_requested());
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions::default(),
+            database: None,
+            progress: None,
+            shutdown_flag: Some(Arc::clone(&flag)),
+        };
+
+        assert!(!ctx.is_shutdown_requested());
+        flag.store(true, Ordering::Relaxed);
+        assert!(ctx.is_shutdown_requested());
+    }
+
+    #[test]
+    fn test_builder_applies_optional_progress_and_shutdown_fields() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let progress = Arc::new(Box::new(|_event| {}) as ProgressCallback);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+        let ctx = SyncContextBuilder::new()
+            .client(TestPlatformClient)
+            .database(Arc::new(db))
+            .progress(Arc::clone(&progress))
+            .shutdown_flag(Arc::clone(&shutdown_flag))
+            .build()
+            .expect("builder should include optional fields");
+
+        assert_eq!(ctx.client().instance_id(), Uuid::nil());
+        assert!(ctx.database().is_some());
+        assert!(!ctx.is_shutdown_requested());
+        shutdown_flag.store(true, Ordering::Relaxed);
+        assert!(ctx.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn test_with_persist_task_dry_run_returns_default_persist_result() {
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: true,
+                ..SyncOptions::default()
+            },
+            database: None,
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let (value, persist) = ctx
+            .with_persist_task(|tx| async move {
+                drop(tx);
+                Ok::<usize, PlatformError>(7)
+            })
+            .await
+            .expect("dry-run path should succeed");
+
+        assert_eq!(value, 7);
+        assert_eq!(persist.saved_count, 0);
+        assert!(persist.errors.is_empty());
+        assert!(persist.panic_info.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_with_persist_task_dry_run_propagates_closure_error() {
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: true,
+                ..SyncOptions::default()
+            },
+            database: None,
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let err = ctx
+            .with_persist_task(|tx| async move {
+                drop(tx);
+                Err::<usize, PlatformError>(PlatformError::internal("sync failed"))
+            })
+            .await
+            .expect_err("closure error should propagate");
+
+        assert!(err.to_string().contains("sync failed"));
+    }
+
+    #[tokio::test]
+    async fn test_with_persist_task_infallible_dry_run_returns_default_persist_result() {
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: true,
+                ..SyncOptions::default()
+            },
+            database: None,
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let (value, persist) = ctx
+            .with_persist_task_infallible(|tx| async move {
+                drop(tx);
+                11usize
+            })
+            .await;
+
+        assert_eq!(value, 11);
+        assert_eq!(persist.saved_count, 0);
+        assert!(persist.errors.is_empty());
+        assert!(persist.panic_info.is_none());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "database required for non-dry-run sync")]
+    async fn test_with_persist_task_panics_without_database_in_non_dry_run() {
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: false,
+                ..SyncOptions::default()
+            },
+            database: None,
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let _ = ctx
+            .with_persist_task(|tx| async move {
+                drop(tx);
+                Ok::<usize, PlatformError>(1)
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "database required for non-dry-run sync")]
+    async fn test_with_persist_task_infallible_panics_without_database_in_non_dry_run() {
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: false,
+                ..SyncOptions::default()
+            },
+            database: None,
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let _ = ctx
+            .with_persist_task_infallible(|tx| async move {
+                drop(tx);
+                1usize
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_with_persist_task_non_dry_run_awaits_persist_task() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: false,
+                ..SyncOptions::default()
+            },
+            database: Some(Arc::new(db)),
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let (value, persist) = ctx
+            .with_persist_task(|tx| async move {
+                drop(tx);
+                Ok::<usize, PlatformError>(13)
+            })
+            .await
+            .expect("non-dry-run path should succeed");
+
+        assert_eq!(value, 13);
+        assert_eq!(persist.saved_count, 0);
+        assert!(persist.errors.is_empty());
+        assert!(persist.panic_info.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_with_persist_task_infallible_non_dry_run_awaits_persist_task() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: false,
+                ..SyncOptions::default()
+            },
+            database: Some(Arc::new(db)),
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let (value, persist) = ctx
+            .with_persist_task_infallible(|tx| async move {
+                drop(tx);
+                29usize
+            })
+            .await;
+
+        assert_eq!(value, 29);
+        assert_eq!(persist.saved_count, 0);
+        assert!(persist.errors.is_empty());
+        assert!(persist.panic_info.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_with_persist_task_non_dry_run_propagates_closure_error() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: false,
+                ..SyncOptions::default()
+            },
+            database: Some(Arc::new(db)),
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let err = ctx
+            .with_persist_task(|tx| async move {
+                drop(tx);
+                Err::<usize, PlatformError>(PlatformError::internal("stream failed"))
+            })
+            .await
+            .expect_err("closure error should propagate in non-dry-run mode");
+
+        assert!(err.to_string().contains("stream failed"));
+    }
+
+    #[tokio::test]
+    async fn test_public_sync_methods_propagate_platform_errors() {
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: true,
+                ..SyncOptions::default()
+            },
+            database: None,
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let namespace_err = ctx
+            .sync_namespace("org")
+            .await
+            .expect_err("sync_namespace should propagate client error");
+        assert!(namespace_err.to_string().contains("unused in tests"));
+
+        let namespace_stream_err = ctx
+            .sync_namespace_streaming("org")
+            .await
+            .expect_err("sync_namespace_streaming should propagate client error");
+        assert!(namespace_stream_err.to_string().contains("unused in tests"));
+
+        let user_stream_err = ctx
+            .sync_user_streaming("alice")
+            .await
+            .expect_err("sync_user_streaming should propagate client error");
+        assert!(user_stream_err.to_string().contains("unused in tests"));
+
+        let starred_stream_err = ctx
+            .sync_starred_streaming(false)
+            .await
+            .expect_err("sync_starred_streaming should propagate client error");
+        assert!(starred_stream_err.to_string().contains("unused in tests"));
+    }
+
+    #[tokio::test]
+    async fn test_public_multi_streaming_methods_collect_item_errors() {
+        let ctx = SyncContext {
+            client: TestPlatformClient,
+            options: SyncOptions {
+                dry_run: true,
+                ..SyncOptions::default()
+            },
+            database: None,
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let namespaces = vec!["org-a".to_string(), "org-b".to_string()];
+        let (namespace_results, namespace_persist) =
+            ctx.sync_namespaces_streaming(&namespaces).await;
+        assert_eq!(namespace_results.len(), 2);
+        assert!(namespace_results.iter().all(|r| r.error.is_some()));
+        assert_eq!(namespace_persist.saved_count, 0);
+        assert!(namespace_persist.errors.is_empty());
+        assert!(namespace_persist.panic_info.is_none());
+
+        let users = vec!["alice".to_string(), "bob".to_string()];
+        let (user_results, user_persist) = ctx.sync_users_streaming(&users).await;
+        assert_eq!(user_results.len(), 2);
+        assert!(user_results.iter().all(|r| r.error.is_some()));
+        assert_eq!(user_persist.saved_count, 0);
+        assert!(user_persist.errors.is_empty());
+        assert!(user_persist.panic_info.is_none());
     }
 }

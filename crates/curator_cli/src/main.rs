@@ -360,3 +360,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_migrate_status_subcommand() {
+        let cli = Cli::try_parse_from(["curator", "migrate", "status"])
+            .expect("migrate status should parse");
+
+        match cli.command {
+            Commands::Migrate { action } => assert!(matches!(action, MigrateAction::Status)),
+            _ => panic!("expected migrate command"),
+        }
+    }
+
+    #[test]
+    fn parses_completions_shell_argument() {
+        let cli = Cli::try_parse_from(["curator", "completions", "bash"])
+            .expect("completions should parse");
+
+        match cli.command {
+            Commands::Completions { shell } => assert_eq!(shell, clap_complete::Shell::Bash),
+            _ => panic!("expected completions command"),
+        }
+    }
+
+    #[test]
+    fn parses_man_output_argument() {
+        let cli = Cli::try_parse_from(["curator", "man", "--output", "/tmp/man"])
+            .expect("man output should parse");
+
+        match cli.command {
+            Commands::Man { output } => assert_eq!(output, Some(PathBuf::from("/tmp/man"))),
+            _ => panic!("expected man command"),
+        }
+    }
+
+    #[test]
+    fn rejects_invocation_without_subcommand() {
+        let parsed = Cli::try_parse_from(["curator"]);
+        assert!(parsed.is_err());
+    }
+}

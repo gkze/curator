@@ -112,3 +112,134 @@ pub async fn delete(db: &DatabaseConnection, id: Uuid) -> Result<u64> {
     let result = CodeRepository::delete_by_id(id).exec(db).await?;
     Ok(result.rows_affected)
 }
+
+#[cfg(all(test, feature = "sqlite", feature = "migrate"))]
+mod tests {
+    use chrono::Utc;
+    use sea_orm::{EntityTrait, Set};
+
+    use crate::connect_and_migrate;
+    use crate::entity::code_visibility::CodeVisibility;
+    use crate::entity::instance::{ActiveModel as InstanceActiveModel, Entity as Instance};
+    use crate::entity::platform_type::PlatformType;
+
+    use super::*;
+
+    fn test_instance_id() -> Uuid {
+        Uuid::parse_str("00000000-0000-0000-0000-000000000111").expect("valid uuid")
+    }
+
+    async fn setup_db() -> DatabaseConnection {
+        let db = connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("test db should migrate");
+
+        let now = Utc::now().fixed_offset();
+        let instance = InstanceActiveModel {
+            id: Set(test_instance_id()),
+            name: Set("single-test".to_string()),
+            platform_type: Set(PlatformType::GitHub),
+            host: Set("single-test.example.com".to_string()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set("auto".to_string()),
+            created_at: Set(now),
+        };
+        Instance::insert(instance)
+            .exec(&db)
+            .await
+            .expect("instance should insert");
+
+        db
+    }
+
+    fn model(owner: &str, name: &str, description: Option<&str>) -> ActiveModel {
+        let now = Utc::now().fixed_offset();
+        ActiveModel {
+            id: Set(Uuid::new_v4()),
+            instance_id: Set(test_instance_id()),
+            platform_id: Set(1001),
+            owner: Set(owner.to_string()),
+            name: Set(name.to_string()),
+            description: Set(description.map(|s| s.to_string())),
+            default_branch: Set("main".to_string()),
+            topics: Set(serde_json::json!([])),
+            primary_language: Set(None),
+            license_spdx: Set(None),
+            homepage: Set(None),
+            visibility: Set(CodeVisibility::Public),
+            is_fork: Set(false),
+            is_mirror: Set(false),
+            is_archived: Set(false),
+            is_template: Set(false),
+            is_empty: Set(false),
+            stars: Set(None),
+            forks: Set(None),
+            open_issues: Set(None),
+            watchers: Set(None),
+            size_kb: Set(None),
+            has_issues: Set(true),
+            has_wiki: Set(true),
+            has_pull_requests: Set(true),
+            created_at: Set(Some(now)),
+            updated_at: Set(Some(now)),
+            pushed_at: Set(Some(now)),
+            platform_metadata: Set(serde_json::json!({})),
+            synced_at: Set(now),
+            etag: Set(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upsert_rejects_missing_required_field() {
+        let db = setup_db().await;
+        let mut item = model("owner", "repo", None);
+        item.owner = ActiveValue::NotSet;
+
+        let err = upsert(&db, item).await.expect_err("upsert should fail");
+        match err {
+            RepositoryError::InvalidInput { message } => {
+                assert!(message.contains("owner"));
+            }
+            other => panic!("expected invalid input error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upsert_inserts_when_missing_even_with_unset_id() {
+        let db = setup_db().await;
+        let mut item = model("owner", "repo", Some("first"));
+        item.id = ActiveValue::NotSet;
+
+        let saved = upsert(&db, item).await.expect("upsert should insert");
+
+        assert_eq!(saved.owner, "owner");
+        assert_eq!(saved.name, "repo");
+        assert_ne!(saved.id, Uuid::nil());
+    }
+
+    #[tokio::test]
+    async fn test_upsert_updates_existing_record_in_place() {
+        let db = setup_db().await;
+        let first = upsert(&db, model("owner", "repo", Some("first")))
+            .await
+            .expect("first upsert should insert");
+
+        let mut second = model("owner", "repo", Some("updated"));
+        second.id = ActiveValue::NotSet;
+        second.platform_id = Set(2002);
+        let updated = upsert(&db, second)
+            .await
+            .expect("second upsert should update");
+
+        assert_eq!(updated.id, first.id);
+        assert_eq!(updated.description.as_deref(), Some("updated"));
+        assert_eq!(updated.platform_id, 2002);
+
+        let found = find_by_natural_key(&db, test_instance_id(), "owner", "repo")
+            .await
+            .expect("lookup should succeed")
+            .expect("repo should exist");
+        assert_eq!(found.id, first.id);
+        assert_eq!(found.description.as_deref(), Some("updated"));
+    }
+}

@@ -547,3 +547,383 @@ fn copy_to_clipboard(text: &str) -> bool {
         Err(_) => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseBackend, Set, Statement};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn sample_instance(
+        name: &str,
+        flow: &str,
+        platform_type: PlatformType,
+        host: &str,
+    ) -> InstanceModel {
+        InstanceModel {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            platform_type,
+            host: host.to_string(),
+            oauth_client_id: None,
+            oauth_flow: flow.to_string(),
+            created_at: Utc::now().fixed_offset(),
+        }
+    }
+
+    fn sqlite_test_url(label: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "curator-cli-login-tests-{}-{}.db",
+            label,
+            Uuid::new_v4()
+        ));
+        format!("sqlite://{}?mode=rwc", path.display())
+    }
+
+    async fn setup_db(label: &str) -> DatabaseConnection {
+        curator::db::connect_and_migrate(&sqlite_test_url(label))
+            .await
+            .expect("test database should initialize")
+    }
+
+    #[test]
+    fn login_method_order_prefers_configured_flow() {
+        let token = sample_instance("custom", "token", PlatformType::GitHub, "github.com");
+        assert_eq!(login_method_order(&token), vec![LoginMethod::Token]);
+
+        let spaced_token =
+            sample_instance("custom", "  ToKeN  ", PlatformType::GitHub, "github.com");
+        assert_eq!(login_method_order(&spaced_token), vec![LoginMethod::Token]);
+
+        let pkce = sample_instance("custom", "pkce", PlatformType::Gitea, "codeberg.org");
+        assert_eq!(
+            login_method_order(&pkce),
+            vec![LoginMethod::Pkce, LoginMethod::Token]
+        );
+
+        let auto = sample_instance("custom", "auto", PlatformType::GitLab, "gitlab.com");
+        assert_eq!(
+            login_method_order(&auto),
+            vec![LoginMethod::Device, LoginMethod::Pkce, LoginMethod::Token]
+        );
+
+        let unknown = sample_instance("custom", "mystery", PlatformType::GitLab, "gitlab.com");
+        assert_eq!(
+            login_method_order(&unknown),
+            vec![LoginMethod::Device, LoginMethod::Pkce, LoginMethod::Token]
+        );
+
+        let spaced_device =
+            sample_instance("custom", "  DeViCe  ", PlatformType::GitHub, "github.com");
+        assert_eq!(
+            login_method_order(&spaced_device),
+            vec![LoginMethod::Device, LoginMethod::Pkce, LoginMethod::Token]
+        );
+
+        let spaced_pkce = sample_instance("custom", "  PKcE  ", PlatformType::GitLab, "gitlab.com");
+        assert_eq!(
+            login_method_order(&spaced_pkce),
+            vec![LoginMethod::Pkce, LoginMethod::Token]
+        );
+
+        let blank = sample_instance("custom", "   ", PlatformType::GitHub, "github.com");
+        assert_eq!(
+            login_method_order(&blank),
+            vec![LoginMethod::Device, LoginMethod::Pkce, LoginMethod::Token]
+        );
+    }
+
+    #[test]
+    fn resolve_client_id_prefers_instance_then_well_known() {
+        let mut instance = sample_instance("github", "auto", PlatformType::GitHub, "github.com");
+        instance.oauth_client_id = Some("custom-client-id".to_string());
+        assert_eq!(resolve_client_id(&instance), Some("custom-client-id"));
+
+        let wk = sample_instance("github", "auto", PlatformType::GitHub, "github.com");
+        assert_eq!(resolve_client_id(&wk), Some("Ov23liN0721EfoUpRrLl"));
+
+        let unknown = sample_instance("my-ghe", "auto", PlatformType::GitHub, "ghe.local");
+        assert_eq!(resolve_client_id(&unknown), None);
+
+        let mut empty_but_explicit =
+            sample_instance("github", "auto", PlatformType::GitHub, "github.com");
+        empty_but_explicit.oauth_client_id = Some(String::new());
+        assert_eq!(resolve_client_id(&empty_but_explicit), Some(""));
+
+        let wk_without_client_id = sample_instance(
+            "gnome-gitlab",
+            "auto",
+            PlatformType::GitLab,
+            "gitlab.gnome.org",
+        );
+        assert_eq!(resolve_client_id(&wk_without_client_id), None);
+    }
+
+    #[test]
+    fn read_token_with_prompt_uses_env_and_rejects_empty_tokens() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let key = "CURATOR_TEST_TOKEN_LOGIN";
+        unsafe {
+            std::env::set_var(key, "  abc123  ");
+        }
+        let token = read_token_with_prompt(key, "Provider", None, "Token", false)
+            .expect("env token should be accepted");
+        assert_eq!(token, "abc123");
+
+        unsafe {
+            std::env::set_var(key, "   ");
+        }
+        let err = read_token_with_prompt(key, "Provider", None, "Token", false)
+            .expect_err("empty token should be rejected");
+        assert!(err.to_string().contains("Empty token"));
+
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn read_token_with_prompt_errors_when_non_tty_and_missing_env() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let key = "CURATOR_TEST_TOKEN_MISSING";
+        unsafe {
+            std::env::remove_var(key);
+        }
+
+        let err = read_token_with_prompt(key, "Provider", None, "Token", false)
+            .expect_err("missing env in non-tty mode should fail");
+        assert!(err.to_string().contains("No token provided"));
+        assert!(err.to_string().contains(key));
+        assert!(err.to_string().contains("Provider"));
+    }
+
+    #[test]
+    fn read_token_with_prompt_uses_env_even_when_tty_and_token_url_present() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let key = "CURATOR_TEST_TOKEN_TTY_PRECEDENCE";
+        unsafe {
+            std::env::set_var(key, " from-env ");
+        }
+
+        let token = read_token_with_prompt(
+            key,
+            "Provider",
+            Some("https://example.com/tokens"),
+            "Token",
+            true,
+        )
+        .expect("env token should bypass interactive prompt");
+
+        unsafe {
+            std::env::remove_var(key);
+        }
+
+        assert_eq!(token, "from-env");
+    }
+
+    #[tokio::test]
+    async fn get_or_create_instance_returns_existing_instance() {
+        let db = setup_db("existing-instance").await;
+
+        let model = sample_instance(
+            "my-gitlab",
+            "auto",
+            PlatformType::GitLab,
+            "gitlab.example.com",
+        );
+        curator::entity::instance::ActiveModel {
+            id: Set(model.id),
+            name: Set(model.name.clone()),
+            platform_type: Set(model.platform_type),
+            host: Set(model.host.clone()),
+            oauth_client_id: Set(model.oauth_client_id.clone()),
+            oauth_flow: Set(model.oauth_flow.clone()),
+            created_at: Set(model.created_at),
+        }
+        .insert(&db)
+        .await
+        .expect("insert should succeed");
+
+        let found = get_or_create_instance(&db, &model.name)
+            .await
+            .expect("instance lookup should succeed");
+        assert_eq!(found.id, model.id);
+        assert_eq!(found.host, "gitlab.example.com");
+    }
+
+    #[tokio::test]
+    async fn get_or_create_instance_auto_creates_well_known_instances() {
+        let db = setup_db("autocreate").await;
+
+        let created = get_or_create_instance(&db, "github")
+            .await
+            .expect("well-known instance should auto-create");
+        assert_eq!(created.name, "github");
+        assert_eq!(created.platform_type, PlatformType::GitHub);
+        assert_eq!(created.host, "github.com");
+    }
+
+    #[tokio::test]
+    async fn get_or_create_instance_prefers_existing_even_for_well_known_name() {
+        let db = setup_db("existing-well-known").await;
+
+        let mut existing = Instance::find()
+            .filter(InstanceColumn::Name.eq("github"))
+            .one(&db)
+            .await
+            .expect("query should succeed")
+            .expect("github instance should exist after migration");
+
+        existing.host = "github.enterprise".to_string();
+        existing.oauth_client_id = Some("existing-client".to_string());
+        existing.oauth_flow = "token".to_string();
+
+        curator::entity::instance::ActiveModel {
+            id: Set(existing.id),
+            name: Set(existing.name.clone()),
+            platform_type: Set(existing.platform_type),
+            host: Set(existing.host.clone()),
+            oauth_client_id: Set(existing.oauth_client_id.clone()),
+            oauth_flow: Set(existing.oauth_flow.clone()),
+            created_at: Set(existing.created_at),
+        }
+        .update(&db)
+        .await
+        .expect("existing instance update should succeed");
+
+        let resolved = get_or_create_instance(&db, "github")
+            .await
+            .expect("existing well-known instance should be reused");
+
+        assert_eq!(resolved.id, existing.id);
+        assert_eq!(resolved.host, "github.enterprise");
+        assert_eq!(resolved.oauth_flow, "token");
+        assert_eq!(resolved.oauth_client_id.as_deref(), Some("existing-client"));
+    }
+
+    #[tokio::test]
+    async fn get_or_create_instance_auto_creates_well_known_without_oauth_client_id() {
+        let db = setup_db("autocreate-no-client-id").await;
+
+        let created = get_or_create_instance(&db, "gnome-gitlab")
+            .await
+            .expect("well-known instance without client id should auto-create");
+
+        assert_eq!(created.name, "gnome-gitlab");
+        assert_eq!(created.platform_type, PlatformType::GitLab);
+        assert_eq!(created.host, "gitlab.gnome.org");
+        assert_eq!(created.oauth_client_id, None);
+        assert_eq!(created.oauth_flow, "auto");
+    }
+
+    #[tokio::test]
+    async fn get_or_create_instance_auto_creates_well_known_with_oauth_client_id() {
+        let db = setup_db("autocreate-with-client-id").await;
+
+        let created = get_or_create_instance(&db, "github")
+            .await
+            .expect("well-known github should auto-create with client id");
+
+        assert_eq!(created.name, "github");
+        assert_eq!(created.platform_type, PlatformType::GitHub);
+        assert_eq!(created.host, "github.com");
+        assert_eq!(
+            created.oauth_client_id.as_deref(),
+            Some("Ov23liN0721EfoUpRrLl")
+        );
+        assert_eq!(created.oauth_flow, "auto");
+    }
+
+    #[tokio::test]
+    async fn get_or_create_instance_errors_for_unknown_instance_name() {
+        let db = setup_db("unknown").await;
+
+        let err = get_or_create_instance(&db, "nope")
+            .await
+            .expect_err("unknown instance should fail");
+        assert!(err.to_string().contains("Instance 'nope' not found"));
+        assert!(
+            err.to_string().contains("curator instance add nope"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_or_create_instance_case_mismatched_well_known_name_hits_insert_conflict() {
+        let db = setup_db("well-known-case-sensitive").await;
+
+        let err = get_or_create_instance(&db, "GitHub")
+            .await
+            .expect_err("case-mismatched lookup should not reuse existing github row");
+
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_or_create_instance_propagates_database_errors() {
+        let db = setup_db("query-failure").await;
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "DROP TABLE instances".to_string(),
+        ))
+        .await
+        .expect("instances table should be dropped for error-path test");
+
+        let err = get_or_create_instance(&db, "github")
+            .await
+            .expect_err("query failure should propagate");
+        let message = err.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("no such table")
+                || message.contains("query")
+                || message.contains("connection"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_login_returns_database_error_before_authentication() {
+        let db = setup_db("handle-login-query-failure").await;
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "DROP TABLE instances".to_string(),
+        ))
+        .await
+        .expect("instances table should be dropped for error-path test");
+
+        let err = handle_login("github", &db, &Config::default())
+            .await
+            .expect_err("database query failure should fail before auth flow starts");
+        let message = err.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("no such table")
+                || message.contains("query")
+                || message.contains("connection"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_login_returns_unknown_instance_error_before_authentication() {
+        let db = setup_db("handle-login-unknown-instance").await;
+
+        let err = handle_login("definitely-missing", &db, &Config::default())
+            .await
+            .expect_err("unknown instance should fail before auth flow");
+
+        assert!(
+            err.to_string()
+                .contains("Instance 'definitely-missing' not found"),
+            "unexpected error: {err}"
+        );
+    }
+}

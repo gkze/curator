@@ -126,6 +126,7 @@
               buildInputs = mkBuildInputs pkgs;
               nativeBuildInputs = [ pkgs.pkg-config ];
               strictDeps = true;
+              SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
             };
             cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           in
@@ -194,6 +195,9 @@
           pkgs:
           let
             rustToolchain = mkRustToolchain pkgs;
+            curatorFromSource = pkgs.writeShellScriptBin "curator" ''
+              exec cargo run -p curator_cli -- "$@"
+            '';
 
             preCommitCheck = git-hooks.lib.${pkgs.system}.run {
               src = ./.;
@@ -230,13 +234,13 @@
 
             language.c = {
               includes = mkBuildInputs pkgs;
-              libraries = mkBuildInputs pkgs;
             };
 
             packages =
               with pkgs;
               [
                 act
+                biome
                 cargo-hack
                 cargo-dist
                 cargo-llvm-cov
@@ -245,19 +249,21 @@
                 litecli
                 nixd
                 pkg-config
+                curatorFromSource
                 rustToolchain
                 yq-go
               ]
-              ++ [
-                self.packages.${pkgs.system}.default
-                (mkSwagger2openapi pkgs)
-              ]
+              ++ [ (mkSwagger2openapi pkgs) ]
               ++ mkBuildInputs pkgs;
 
             env = [
               {
                 name = "RUST_SRC_PATH";
                 value = "${rustToolchain}/lib/rustlib/src/rust/library";
+              }
+              {
+                name = "LIBRARY_PATH";
+                value = lib.makeLibraryPath (mkBuildInputs pkgs);
               }
             ];
 
@@ -273,9 +279,18 @@
                 deadnix.enable = true;
                 mdformat.enable = true;
                 nixfmt.enable = true;
-                prettier = {
+                biome = {
                   enable = true;
-                  includes = [ "*.json" ];
+                  includes = [
+                    "*.json"
+                    "*.jsonc"
+                    "*.html"
+                  ];
+                  # Config lives in biome.json at repo root; treefmt-nix's
+                  # --config-path passes a file but Biome v2 expects a
+                  # directory, causing hangs. Skip settings here entirely.
+                  settings = { };
+                  validate.enable = false;
                 };
                 rustfmt = {
                   enable = true;

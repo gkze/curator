@@ -487,6 +487,11 @@ pub fn create_model_channel() -> (
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use tokio::sync::mpsc::error::TrySendError;
+
     use super::*;
 
     #[test]
@@ -558,5 +563,126 @@ mod tests {
         let (tx, _rx) = create_model_channel();
         // Verify the channel was created (tx is usable)
         assert!(!tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_await_persist_task_returns_joined_result() {
+        let handle = tokio::spawn(async {
+            PersistTaskResult {
+                saved_count: 7,
+                errors: vec![],
+                panic_info: None,
+            }
+        });
+
+        let result = await_persist_task(handle).await;
+        assert_eq!(result.saved_count, 7);
+        assert!(result.errors.is_empty());
+        assert!(result.panic_info.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_await_persist_task_captures_panic_message() {
+        let handle = tokio::spawn(async {
+            panic!("persist worker exploded");
+            #[allow(unreachable_code)]
+            PersistTaskResult::default()
+        });
+
+        let result = await_persist_task(handle).await;
+        assert_eq!(result.saved_count, 0);
+        assert!(result.errors.is_empty());
+        assert!(
+            result
+                .panic_info
+                .as_deref()
+                .is_some_and(|msg| msg.contains("persist worker exploded"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_await_persist_task_handles_unknown_panic_payload() {
+        let handle = tokio::spawn(async {
+            std::panic::panic_any(42usize);
+            #[allow(unreachable_code)]
+            PersistTaskResult::default()
+        });
+
+        let result = await_persist_task(handle).await;
+        assert_eq!(result.saved_count, 0);
+        assert!(result.errors.is_empty());
+        assert_eq!(result.panic_info.as_deref(), Some("Unknown panic"));
+    }
+
+    #[tokio::test]
+    async fn test_await_persist_task_reports_cancelled_task() {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            PersistTaskResult::default()
+        });
+        handle.abort();
+
+        let result = await_persist_task(handle).await;
+        assert_eq!(result.saved_count, 0);
+        assert!(result.errors.is_empty());
+        assert_eq!(result.panic_info.as_deref(), Some("Task was cancelled"));
+    }
+
+    #[test]
+    fn test_create_model_channel_respects_buffer_capacity() {
+        let (tx, _rx) = create_model_channel();
+
+        for _ in 0..MODEL_CHANNEL_BUFFER_SIZE {
+            assert!(tx.try_send(CodeRepositoryActiveModel::default()).is_ok());
+        }
+
+        match tx.try_send(CodeRepositoryActiveModel::default()) {
+            Err(TrySendError::Full(_)) => {}
+            other => panic!("expected full channel, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_display_persist_errors_noop_without_errors() {
+        let result = PersistTaskResult::default();
+        display_persist_errors(&result, true);
+        display_persist_errors(&result, false);
+    }
+
+    #[test]
+    fn test_display_persist_errors_handles_panic_and_many_errors() {
+        let errors: Vec<(String, String, String)> = (0..12)
+            .map(|i| {
+                (
+                    format!("owner-{i}"),
+                    format!("repo-{i}"),
+                    format!("db error {i}"),
+                )
+            })
+            .collect();
+        let result = PersistTaskResult {
+            saved_count: 0,
+            errors,
+            panic_info: Some("worker panic".to_string()),
+        };
+
+        display_persist_errors(&result, true);
+        display_persist_errors(&result, false);
+        assert_eq!(result.failed_count(), 13);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_persist_task_exits_immediately_when_shutdown_is_requested() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Sqlite).into_connection());
+        let (_tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(4);
+        let shutdown_flag = Arc::new(AtomicBool::new(true));
+
+        let (handle, saved_counter) = spawn_persist_task(db, rx, Some(shutdown_flag), None);
+        let result = await_persist_task(handle).await;
+
+        assert_eq!(result.saved_count, 0);
+        assert!(result.errors.is_empty());
+        assert!(result.panic_info.is_none());
+        assert_eq!(saved_counter.load(Ordering::Relaxed), 0);
     }
 }

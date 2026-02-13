@@ -109,14 +109,15 @@ pub async fn is_repo_starred(
 ) -> Result<bool, GitHubError> {
     // GET /user/starred/{owner}/{repo} returns 204 if starred, 404 if not
     let route = format!("/user/starred/{}/{}", owner, repo);
-    let response: Result<(), octocrab::Error> = client.get(&route, None::<&()>).await;
+    let response = client._get(&route).await.map_err(GitHubError::Api)?;
 
-    match response {
-        Ok(_) => Ok(true),
-        Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
-            Ok(false)
-        }
-        Err(e) => Err(GitHubError::Api(e)),
+    match response.status().as_u16() {
+        204 => Ok(true),
+        404 => Ok(false),
+        status => Err(GitHubError::Internal(format!(
+            "Unexpected status {} checking starred status for {}/{}",
+            status, owner, repo
+        ))),
     }
 }
 
@@ -443,6 +444,124 @@ mod tests {
         let filtered = filter_by_activity(repos, Duration::days(30));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "recent");
+    }
+
+    #[test]
+    fn test_filter_by_activity_excludes_repo_exactly_at_cutoff() {
+        let now = Utc::now();
+        let active_within = Duration::days(30);
+        let at_cutoff = now - active_within;
+
+        let repos = vec![mock_repo_with_activity("at-cutoff", Some(at_cutoff), None)];
+
+        let filtered = filter_by_activity(repos, active_within);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_activity_prefers_pushed_at_over_updated_at() {
+        let now = Utc::now();
+        let old = now - Duration::days(100);
+        let recent = now - Duration::days(1);
+
+        // Even with a recent updated_at, old pushed_at should be authoritative.
+        let repos = vec![mock_repo_with_activity(
+            "push-wins",
+            Some(old),
+            Some(recent),
+        )];
+
+        let filtered = filter_by_activity(repos, Duration::days(30));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_activity_includes_recent_pushed_at_even_if_updated_at_old() {
+        let now = Utc::now();
+        let recent = now - Duration::hours(1);
+        let old = now - Duration::days(365);
+
+        let repos = vec![mock_repo_with_activity(
+            "recent-push",
+            Some(recent),
+            Some(old),
+        )];
+
+        let filtered = filter_by_activity(repos, Duration::days(30));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "recent-push");
+    }
+
+    #[test]
+    fn test_filter_by_activity_excludes_updated_at_exactly_at_cutoff() {
+        let now = Utc::now();
+        let active_within = Duration::days(14);
+        let at_cutoff = now - active_within;
+
+        let repos = vec![mock_repo_with_activity(
+            "updated-at-cutoff",
+            None,
+            Some(at_cutoff),
+        )];
+
+        let filtered = filter_by_activity(repos, active_within);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_activity_includes_updated_at_just_inside_cutoff() {
+        let now = Utc::now();
+        let active_within = Duration::days(14);
+        let just_inside = now - active_within + Duration::seconds(1);
+
+        let repos = vec![mock_repo_with_activity(
+            "updated-just-inside",
+            None,
+            Some(just_inside),
+        )];
+
+        let filtered = filter_by_activity(repos, active_within);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "updated-just-inside");
+    }
+
+    #[test]
+    fn test_filter_by_activity_with_negative_window_excludes_all_past_activity() {
+        let now = Utc::now();
+        let repos = vec![
+            mock_repo_with_activity("recent", Some(now - Duration::minutes(1)), None),
+            mock_repo_with_activity("fallback", None, Some(now - Duration::seconds(10))),
+        ];
+
+        let filtered = filter_by_activity(repos, Duration::seconds(-1));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_activity_returns_empty_for_empty_input() {
+        let filtered = filter_by_activity(Vec::new(), Duration::days(30));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_activity_with_zero_window_keeps_only_future_activity() {
+        let repos = vec![
+            mock_repo_with_activity("past", Some(Utc::now() - Duration::seconds(1)), None),
+            mock_repo_with_activity("future", Some(Utc::now() + Duration::days(3650)), None),
+            mock_repo_with_activity(
+                "future-updated",
+                None,
+                Some(Utc::now() + Duration::days(3650)),
+            ),
+        ];
+
+        let filtered = filter_by_activity(repos, Duration::zero());
+        let names: Vec<_> = filtered.into_iter().map(|repo| repo.name).collect();
+
+        assert_eq!(
+            names,
+            vec!["future".to_string(), "future-updated".to_string()]
+        );
     }
 
     #[test]

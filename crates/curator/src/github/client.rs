@@ -5,8 +5,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
-use reqwest::StatusCode;
-use reqwest::header::{HeaderMap, IF_NONE_MATCH};
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
@@ -23,15 +21,13 @@ use crate::platform::{
 };
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
+use crate::{HttpHeaders, HttpMethod, HttpRequest, HttpTransport, header_get};
 
 /// Extract ETag from response headers.
 ///
 /// Returns the ETag value if present, handling both strong and weak ETags.
-pub fn extract_etag(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
+pub fn extract_etag(headers: &HttpHeaders) -> Option<String> {
+    header_get(headers, "etag").map(|v| v.to_string())
 }
 
 /// Pagination information extracted from GitHub's Link header.
@@ -200,12 +196,14 @@ pub struct GitHubClient {
     inner: Arc<Octocrab>,
     /// The authentication token, stored for making raw conditional requests.
     token: Arc<String>,
-    /// Shared HTTP client for conditional (ETag) requests.
-    http_client: reqwest::Client,
+    /// HTTP transport used for conditional (ETag) requests.
+    transport: Arc<dyn HttpTransport>,
     /// The instance ID this client is configured for.
     instance_id: Uuid,
     /// Optional adaptive rate limiter for pacing API requests.
     rate_limiter: Option<AdaptiveRateLimiter>,
+    /// Base URL for API requests (defaults to GitHub API).
+    api_base_url: Arc<String>,
 }
 
 impl GitHubClient {
@@ -216,12 +214,16 @@ impl GitHubClient {
         rate_limiter: Option<AdaptiveRateLimiter>,
     ) -> Result<Self, GitHubError> {
         let client = create_client(token)?;
+        let transport = Arc::new(crate::http::reqwest_transport::ReqwestTransport::new(
+            reqwest::Client::new(),
+        ));
         Ok(Self {
             inner: Arc::new(client),
             token: Arc::new(token.to_string()),
-            http_client: reqwest::Client::new(),
+            transport,
             instance_id,
             rate_limiter,
+            api_base_url: Arc::new("https://api.github.com".to_string()),
         })
     }
 
@@ -230,12 +232,33 @@ impl GitHubClient {
     /// Note: This constructor doesn't have access to the token, so conditional
     /// requests with ETags won't work. Use `new()` instead for full functionality.
     pub fn from_octocrab(client: Octocrab, instance_id: Uuid) -> Self {
+        let transport = Arc::new(crate::http::reqwest_transport::ReqwestTransport::new(
+            reqwest::Client::new(),
+        ));
         Self {
             inner: Arc::new(client),
             token: Arc::new(String::new()),
-            http_client: reqwest::Client::new(),
+            transport,
             instance_id,
             rate_limiter: None,
+            api_base_url: Arc::new("https://api.github.com".to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_octocrab_with_transport_and_base_url(
+        client: Octocrab,
+        instance_id: Uuid,
+        transport: Arc<dyn HttpTransport>,
+        api_base_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(client),
+            token: Arc::new(String::new()),
+            transport,
+            instance_id,
+            rate_limiter: None,
+            api_base_url: Arc::new(api_base_url.into().trim_end_matches('/').to_string()),
         }
     }
 
@@ -247,7 +270,7 @@ impl GitHubClient {
     }
 
     /// Update the rate limiter with rate limit info from response headers, if available.
-    fn update_rate_limit(&self, headers: &reqwest::header::HeaderMap) {
+    fn update_rate_limit(&self, headers: &HttpHeaders) {
         if let Some(ref limiter) = self.rate_limiter
             && let Some(info) = Self::parse_rate_limit_headers(headers)
         {
@@ -256,19 +279,16 @@ impl GitHubClient {
     }
 
     /// Extract rate limit info from GitHub response headers.
-    fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Option<RateLimitInfo> {
-        let limit = headers
-            .get("x-ratelimit-limit")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())?;
-        let remaining = headers
-            .get("x-ratelimit-remaining")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())?;
-        let reset_epoch = headers
-            .get("x-ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<i64>().ok())?;
+    fn parse_rate_limit_headers(headers: &HttpHeaders) -> Option<RateLimitInfo> {
+        let limit = header_get(headers, "x-ratelimit-limit")?
+            .parse::<usize>()
+            .ok()?;
+        let remaining = header_get(headers, "x-ratelimit-remaining")?
+            .parse::<usize>()
+            .ok()?;
+        let reset_epoch = header_get(headers, "x-ratelimit-reset")?
+            .parse::<i64>()
+            .ok()?;
         let reset_at = chrono::DateTime::from_timestamp(reset_epoch, 0)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(chrono::Utc::now);
@@ -298,55 +318,60 @@ impl GitHubClient {
         self.wait_for_rate_limit().await;
 
         // Build the request URL
-        let url = format!("https://api.github.com{}", route);
+        let url = format!("{}{}", self.api_base_url.as_str(), route);
 
-        // Build the request with authentication (reuses shared connection pool)
-        let mut request = self
-            .http_client
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "curator")
-            .header("Authorization", format!("Bearer {}", self.token.as_str()));
+        let mut headers: HttpHeaders = vec![
+            (
+                "Accept".to_string(),
+                "application/vnd.github+json".to_string(),
+            ),
+            ("User-Agent".to_string(), "curator".to_string()),
+            (
+                "Authorization".to_string(),
+                format!("Bearer {}", self.token.as_str()),
+            ),
+        ];
 
-        // Add conditional header if we have a cached ETag
         if let Some(etag) = cached_etag {
-            request = request.header(IF_NONE_MATCH, etag);
+            headers.push(("If-None-Match".to_string(), etag.to_string()));
         }
 
-        let response = request
-            .send()
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url: url.clone(),
+            headers,
+            body: Vec::new(),
+        };
+
+        let response = self
+            .transport
+            .send(request)
             .await
             .map_err(|e| GitHubError::Internal(format!("HTTP request failed: {}", e)))?;
 
-        let status = response.status();
-        let headers = response.headers().clone();
-        self.update_rate_limit(&headers);
+        self.update_rate_limit(&response.headers);
 
-        match status {
-            StatusCode::NOT_MODIFIED => Ok(FetchResult::NotModified),
-            StatusCode::OK => {
-                let etag = extract_etag(&headers);
+        match response.status {
+            304 => Ok(FetchResult::NotModified),
+            200 => {
+                let etag = extract_etag(&response.headers);
 
-                // Parse pagination from Link header and convert to shared type
-                let pagination = headers
-                    .get("link")
-                    .and_then(|v| v.to_str().ok())
+                let pagination = header_get(&response.headers, "link")
                     .map(|h| parse_link_header(h).to_pagination_info())
                     .unwrap_or_default();
 
-                let data: T = response
-                    .json()
-                    .await
+                let data: T = serde_json::from_slice(&response.body)
                     .map_err(|e| GitHubError::Internal(format!("JSON parse error: {}", e)))?;
+
                 Ok(FetchResult::Fetched {
                     data,
                     etag,
                     pagination,
                 })
             }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(GitHubError::AuthRequired),
-            StatusCode::NOT_FOUND => Err(GitHubError::OrgNotFound(route.to_string())),
-            _ => Err(GitHubError::Internal(format!(
+            401 | 403 => Err(GitHubError::AuthRequired),
+            404 => Err(GitHubError::OrgNotFound(route.to_string())),
+            status => Err(GitHubError::Internal(format!(
                 "Unexpected HTTP status: {}",
                 status
             ))),
@@ -1484,11 +1509,16 @@ impl PlatformClient for GitHubClient {
             return Ok(total_sent.load(Ordering::Relaxed));
         }
 
-        // Determine last page: use expected_pages if known, otherwise fetch until partial page
+        // Determine last page: use expected_pages if known, otherwise fetch until partial page.
+        //
+        // IMPORTANT: Use `get_conditional` (and thus `api_base_url`) for *all* pages.
+        // Otherwise, tests that override `api_base_url` (e.g. with a mock server) can
+        // accidentally fetch subsequent pages from the real GitHub API via Octocrab's
+        // default base URI.
         let known_last_page = expected_pages;
 
         let semaphore = Arc::new(Semaphore::new(concurrency));
-        let client = self.inner.clone();
+        let client = self.clone();
 
         let mut page = 2u32;
         let mut handles = Vec::new();
@@ -1507,31 +1537,39 @@ impl PlatformClient for GitHubClient {
             let task_total_sent = Arc::clone(&total_sent);
             let current_page = page;
 
-            let handle = tokio::spawn(async move {
-                let _permit = task_semaphore.acquire().await.ok()?;
+            let handle: tokio::task::JoinHandle<platform::Result<(u32, usize)>> =
+                tokio::spawn(async move {
+                    let _permit = task_semaphore
+                        .acquire()
+                        .await
+                        .map_err(|e| PlatformError::internal(format!("semaphore error: {e}")))?;
 
-                if !skip_rate_checks && check_rate_limit(&task_client).await.is_err() {
-                    return None;
-                }
-
-                let route = format!("/user/starred?per_page=100&page={}", current_page);
-                let repos: Result<Vec<octocrab::models::Repository>, _> =
-                    task_client.get(&route, None::<&()>).await;
-
-                match repos {
-                    Ok(repos) => {
-                        let count = repos.len();
-                        for repo in &repos {
-                            let platform_repo = to_platform_repo(repo);
-                            if task_repo_tx.send(platform_repo).await.is_ok() {
-                                task_total_sent.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Some((current_page, count))
+                    if !skip_rate_checks {
+                        check_rate_limit(task_client.inner())
+                            .await
+                            .map_err(PlatformError::from)?;
                     }
-                    Err(_) => None,
-                }
-            });
+
+                    let route = format!("/user/starred?per_page=100&page={}", current_page);
+                    let result: FetchResult<Vec<octocrab::models::Repository>> = task_client
+                        .get_conditional(&route, None)
+                        .await
+                        .map_err(PlatformError::from)?;
+
+                    match result {
+                        FetchResult::NotModified => Ok((current_page, 0)),
+                        FetchResult::Fetched { data: repos, .. } => {
+                            let count = repos.len();
+                            for repo in &repos {
+                                let platform_repo = to_platform_repo(repo);
+                                if task_repo_tx.send(platform_repo).await.is_ok() {
+                                    task_total_sent.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Ok((current_page, count))
+                        }
+                    }
+                });
 
             handles.push(handle);
             page += 1;
@@ -1540,19 +1578,27 @@ impl PlatformClient for GitHubClient {
             if handles.len() >= concurrency {
                 let mut got_partial = false;
                 for handle in handles.drain(..) {
-                    if let Ok(Some((page_num, count))) = handle.await {
-                        emit(
-                            on_progress,
-                            SyncProgress::FetchedPage {
-                                namespace: "starred".to_string(),
-                                page: page_num,
-                                count,
-                                total_so_far: total_sent.load(Ordering::Relaxed),
-                                expected_pages,
-                            },
-                        );
-                        if count < 100 {
-                            got_partial = true;
+                    match handle.await {
+                        Ok(Ok((page_num, count))) => {
+                            emit(
+                                on_progress,
+                                SyncProgress::FetchedPage {
+                                    namespace: "starred".to_string(),
+                                    page: page_num,
+                                    count,
+                                    total_so_far: total_sent.load(Ordering::Relaxed),
+                                    expected_pages,
+                                },
+                            );
+                            if count < 100 {
+                                got_partial = true;
+                            }
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => {
+                            return Err(PlatformError::internal(format!(
+                                "page fetch task failed: {e}"
+                            )));
                         }
                     }
                 }
@@ -1564,17 +1610,25 @@ impl PlatformClient for GitHubClient {
 
         // Collect any remaining results
         for handle in handles {
-            if let Ok(Some((page_num, count))) = handle.await {
-                emit(
-                    on_progress,
-                    SyncProgress::FetchedPage {
-                        namespace: "starred".to_string(),
-                        page: page_num,
-                        count,
-                        total_so_far: total_sent.load(Ordering::Relaxed),
-                        expected_pages,
-                    },
-                );
+            match handle.await {
+                Ok(Ok((page_num, count))) => {
+                    emit(
+                        on_progress,
+                        SyncProgress::FetchedPage {
+                            namespace: "starred".to_string(),
+                            page: page_num,
+                            count,
+                            total_so_far: total_sent.load(Ordering::Relaxed),
+                            expected_pages,
+                        },
+                    );
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    return Err(PlatformError::internal(format!(
+                        "page fetch task failed: {e}"
+                    )));
+                }
             }
         }
 
@@ -1597,6 +1651,113 @@ impl PlatformClient for GitHubClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::{HttpHeaders, HttpMethod, HttpResponse, HttpTransport, MockTransport};
+    use tokio::sync::mpsc;
+
+    const TEST_BASE_URL: &str = "http://local.test";
+
+    /// Build a minimal GitHub API repo JSON for HTTP response mocking.
+    ///
+    /// This is intentionally lightweight (no `license`, `topics`, etc.)
+    /// because client tests only need parseable JSON, not full field coverage.
+    /// See `convert::tests::sample_repo` for a full-field fixture.
+    fn repo_json(id: i64, name: &str) -> serde_json::Value {
+        let template = r#"{
+            "id": __ID__,
+            "node_id": "R_kgDOExample",
+            "name": "__NAME__",
+            "full_name": "owner/__NAME__",
+            "private": false,
+            "owner": {
+                "login": "owner",
+                "id": 1,
+                "node_id": "MDQ6VXNlcjE=",
+                "avatar_url": "https://example.com/avatar.png",
+                "gravatar_id": "",
+                "url": "https://api.github.com/users/owner",
+                "html_url": "https://github.com/owner",
+                "followers_url": "https://api.github.com/users/owner/followers",
+                "following_url": "https://api.github.com/users/owner/following{/other_user}",
+                "gists_url": "https://api.github.com/users/owner/gists{/gist_id}",
+                "starred_url": "https://api.github.com/users/owner/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/owner/subscriptions",
+                "organizations_url": "https://api.github.com/users/owner/orgs",
+                "repos_url": "https://api.github.com/users/owner/repos",
+                "events_url": "https://api.github.com/users/owner/events{/privacy}",
+                "received_events_url": "https://api.github.com/users/owner/received_events",
+                "type": "User",
+                "site_admin": false
+            },
+            "html_url": "https://github.com/owner/__NAME__",
+            "description": null,
+            "fork": false,
+            "url": "https://api.github.com/repos/owner/__NAME__",
+            "forks_url": "https://api.github.com/repos/owner/__NAME__/forks",
+            "keys_url": "https://api.github.com/repos/owner/__NAME__/keys{/key_id}",
+            "collaborators_url": "https://api.github.com/repos/owner/__NAME__/collaborators{/collaborator}",
+            "teams_url": "https://api.github.com/repos/owner/__NAME__/teams",
+            "hooks_url": "https://api.github.com/repos/owner/__NAME__/hooks",
+            "issue_events_url": "https://api.github.com/repos/owner/__NAME__/issues/events{/number}",
+            "events_url": "https://api.github.com/repos/owner/__NAME__/events",
+            "assignees_url": "https://api.github.com/repos/owner/__NAME__/assignees{/user}",
+            "branches_url": "https://api.github.com/repos/owner/__NAME__/branches{/branch}",
+            "tags_url": "https://api.github.com/repos/owner/__NAME__/tags",
+            "blobs_url": "https://api.github.com/repos/owner/__NAME__/git/blobs{/sha}",
+            "git_tags_url": "https://api.github.com/repos/owner/__NAME__/git/tags{/sha}",
+            "git_refs_url": "https://api.github.com/repos/owner/__NAME__/git/refs{/sha}",
+            "trees_url": "https://api.github.com/repos/owner/__NAME__/git/trees{/sha}",
+            "statuses_url": "https://api.github.com/repos/owner/__NAME__/statuses/{sha}",
+            "languages_url": "https://api.github.com/repos/owner/__NAME__/languages",
+            "stargazers_url": "https://api.github.com/repos/owner/__NAME__/stargazers",
+            "contributors_url": "https://api.github.com/repos/owner/__NAME__/contributors",
+            "subscribers_url": "https://api.github.com/repos/owner/__NAME__/subscribers",
+            "subscription_url": "https://api.github.com/repos/owner/__NAME__/subscription",
+            "commits_url": "https://api.github.com/repos/owner/__NAME__/commits{/sha}",
+            "git_commits_url": "https://api.github.com/repos/owner/__NAME__/git/commits{/sha}",
+            "comments_url": "https://api.github.com/repos/owner/__NAME__/comments{/number}",
+            "issue_comment_url": "https://api.github.com/repos/owner/__NAME__/issues/comments{/number}",
+            "contents_url": "https://api.github.com/repos/owner/__NAME__/contents/{+path}",
+            "compare_url": "https://api.github.com/repos/owner/__NAME__/compare/{base}...{head}",
+            "merges_url": "https://api.github.com/repos/owner/__NAME__/merges",
+            "archive_url": "https://api.github.com/repos/owner/__NAME__/{archive_format}{/ref}",
+            "downloads_url": "https://api.github.com/repos/owner/__NAME__/downloads",
+            "issues_url": "https://api.github.com/repos/owner/__NAME__/issues{/number}",
+            "pulls_url": "https://api.github.com/repos/owner/__NAME__/pulls{/number}",
+            "milestones_url": "https://api.github.com/repos/owner/__NAME__/milestones{/number}",
+            "notifications_url": "https://api.github.com/repos/owner/__NAME__/notifications{?since,all,participating}",
+            "labels_url": "https://api.github.com/repos/owner/__NAME__/labels{/name}",
+            "releases_url": "https://api.github.com/repos/owner/__NAME__/releases{/id}",
+            "deployments_url": "https://api.github.com/repos/owner/__NAME__/deployments",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-02T00:00:00Z",
+            "pushed_at": "2024-01-03T00:00:00Z"
+        }"#;
+
+        let json = template
+            .replace("__ID__", &id.to_string())
+            .replace("__NAME__", name);
+        serde_json::from_str(&json).expect("repo JSON should parse")
+    }
+
+    fn push_response(
+        transport: &MockTransport,
+        url: &str,
+        status: u16,
+        headers: HttpHeaders,
+        body: String,
+    ) {
+        transport.push_response(
+            HttpMethod::Get,
+            url.to_string(),
+            HttpResponse {
+                status,
+                headers,
+                body: body.into_bytes(),
+            },
+        );
+    }
 
     #[test]
     fn test_github_error_to_platform_error() {
@@ -1704,5 +1865,474 @@ mod tests {
         let pagination = link.to_pagination_info();
         assert_eq!(pagination.total_pages, Some(5));
         assert_eq!(pagination.next_page, Some(2));
+    }
+
+    #[test]
+    fn test_extract_etag_from_headers() {
+        let headers: HttpHeaders = vec![("etag".to_string(), "\"abc123\"".to_string())];
+        assert_eq!(extract_etag(&headers), Some("\"abc123\"".to_string()));
+    }
+
+    #[test]
+    fn test_extract_etag_missing_header() {
+        let headers: HttpHeaders = Vec::new();
+        assert_eq!(extract_etag(&headers), None);
+    }
+
+    #[test]
+    fn test_parse_link_header_ignores_unknown_rel_and_invalid_pages() {
+        let header = r#"<https://api.github.com/repos?per_page=100&page=oops>; rel="next", <https://api.github.com/repos?per_page=100&page=4>; rel="prev", <https://api.github.com/repos?per_page=100&page=8>; rel="last""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, None);
+        assert_eq!(info.last_page, Some(8));
+    }
+
+    #[test]
+    fn test_parse_link_header_parses_last_when_next_invalid() {
+        let header = r#"<https://api.github.com/repos?page=NaN>; rel="next", <https://api.github.com/repos?page=11>; rel="last""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, None);
+        assert_eq!(info.last_page, Some(11));
+    }
+
+    #[test]
+    fn test_parse_link_header_parses_links_regardless_of_order() {
+        let header = r#"<https://api.github.com/repos?page=20>; rel="last", <https://api.github.com/repos?page=7>; rel="next""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.last_page, Some(20));
+        assert_eq!(info.next_page, Some(7));
+    }
+
+    #[test]
+    fn test_parse_link_header_ignores_malformed_escaped_rel_values() {
+        let header = r#"<https://api.github.com/repos?page=2>; rel=\"next\", <https://api.github.com/repos?page=5>; rel=\"last\""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, None);
+        assert_eq!(info.last_page, None);
+    }
+
+    #[test]
+    fn test_parse_link_header_parses_when_rel_segment_precedes_url() {
+        let header = r#"rel="next"; <https://api.github.com/repos?page=6>, rel="last"; <https://api.github.com/repos?page=9>"#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, Some(6));
+        assert_eq!(info.last_page, Some(9));
+    }
+
+    #[test]
+    fn test_parse_link_header_parses_unquoted_rel_values() {
+        let header = r#"<https://api.github.com/repos?page=3>; rel=next, <https://api.github.com/repos?page=12>; rel=last"#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, Some(3));
+        assert_eq!(info.last_page, Some(12));
+    }
+
+    #[test]
+    fn test_parse_link_header_last_matching_rel_wins() {
+        let header = r#"<https://api.github.com/repos?page=2>; rel="next", <https://api.github.com/repos?page=4>; rel="next", <https://api.github.com/repos?page=8>; rel="last""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, Some(4));
+        assert_eq!(info.last_page, Some(8));
+    }
+
+    #[test]
+    fn test_parse_link_header_rel_matching_is_case_sensitive() {
+        let header = r#"<https://api.github.com/repos?page=2>; rel="NEXT", <https://api.github.com/repos?page=9>; rel="LAST""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, None);
+        assert_eq!(info.last_page, None);
+    }
+
+    #[test]
+    fn test_extract_page_from_url_rejects_invalid_values() {
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?per_page=100&page=NaN"),
+            None
+        );
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?foo=bar&page="),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_page_from_url_ignores_similar_parameter_names() {
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?homepage=2&page=42"),
+            Some(42)
+        );
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?xpage=2&per_page=100"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_page_from_url_uses_first_page_parameter_when_duplicated() {
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?page=3&page=7"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_extract_page_from_url_stops_on_first_page_parameter_even_if_invalid() {
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?page=invalid&page=9"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_page_from_url_rejects_fragment_suffixed_page_value() {
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?per_page=100&page=5#section"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_page_from_url_rejects_negative_page_numbers() {
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?per_page=100&page=-1"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_page_from_url_requires_exact_page_key() {
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?Page=2&page_size=100"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_ignores_links_without_page_query_parameter() {
+        let header = r#"<https://api.github.com/repos?per_page=100>; rel="next", <https://api.github.com/repos?per_page=100&page=9>; rel="last""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, None);
+        assert_eq!(info.last_page, Some(9));
+    }
+
+    #[test]
+    fn test_parse_link_header_ignores_link_without_angle_brackets() {
+        let header = r#"https://api.github.com/repos?page=2; rel="next", <https://api.github.com/repos?page=5>; rel="last""#;
+
+        let info = parse_link_header(header);
+        assert_eq!(info.next_page, None);
+        assert_eq!(info.last_page, Some(5));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_success() {
+        let headers: HttpHeaders = vec![
+            ("x-ratelimit-limit".to_string(), "5000".to_string()),
+            ("x-ratelimit-remaining".to_string(), "4998".to_string()),
+            ("x-ratelimit-reset".to_string(), "1706400000".to_string()),
+        ];
+
+        let info = GitHubClient::parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.limit, 5000);
+        assert_eq!(info.remaining, 4998);
+        assert!(info.retry_after.is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_missing_values() {
+        let headers: HttpHeaders = Vec::new();
+        assert!(GitHubClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_reset_falls_back_to_now() {
+        let headers: HttpHeaders = vec![
+            ("x-ratelimit-limit".to_string(), "5000".to_string()),
+            ("x-ratelimit-remaining".to_string(), "4998".to_string()),
+            (
+                "x-ratelimit-reset".to_string(),
+                "9223372036854775807".to_string(),
+            ),
+        ];
+
+        let before = Utc::now();
+        let info = GitHubClient::parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.limit, 5000);
+        assert_eq!(info.remaining, 4998);
+        assert!(info.reset_at >= before);
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_remaining_returns_none() {
+        let headers: HttpHeaders = vec![
+            ("x-ratelimit-limit".to_string(), "5000".to_string()),
+            (
+                "x-ratelimit-remaining".to_string(),
+                "not-a-number".to_string(),
+            ),
+            ("x-ratelimit-reset".to_string(), "1706400000".to_string()),
+        ];
+
+        assert!(GitHubClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_reset_returns_none() {
+        let headers: HttpHeaders = vec![
+            ("x-ratelimit-limit".to_string(), "5000".to_string()),
+            ("x-ratelimit-remaining".to_string(), "4998".to_string()),
+            ("x-ratelimit-reset".to_string(), "not-an-epoch".to_string()),
+        ];
+
+        assert!(GitHubClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_limit_returns_none() {
+        let headers: HttpHeaders = vec![
+            ("x-ratelimit-limit".to_string(), "broken".to_string()),
+            ("x-ratelimit-remaining".to_string(), "4998".to_string()),
+            ("x-ratelimit-reset".to_string(), "1706400000".to_string()),
+        ];
+
+        assert!(GitHubClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_zero_reset_epoch() {
+        let headers: HttpHeaders = vec![
+            ("x-ratelimit-limit".to_string(), "1".to_string()),
+            ("x-ratelimit-remaining".to_string(), "0".to_string()),
+            ("x-ratelimit-reset".to_string(), "0".to_string()),
+        ];
+
+        let info = GitHubClient::parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.limit, 1);
+        assert_eq!(info.remaining, 0);
+        assert_eq!(info.reset_at.timestamp(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_conditional_ok_with_pagination_and_etag() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let url = format!("{TEST_BASE_URL}/repos");
+
+        push_response(
+            &transport,
+            &url,
+            200,
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"page1\"".to_string()),
+                (
+                    "link".to_string(),
+                    "<http://local.test/repos?page=2>; rel=\"next\", <http://local.test/repos?page=4>; rel=\"last\""
+                        .to_string(),
+                ),
+            ],
+            "[{\"name\":\"repo-1\"}]".to_string(),
+        );
+
+        let octocrab = Octocrab::builder()
+            .build()
+            .expect("octocrab client should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let result = client
+            .get_conditional::<serde_json::Value>("/repos", Some("\"cached\""))
+            .await
+            .expect("request should succeed");
+
+        match result {
+            FetchResult::Fetched {
+                data,
+                etag,
+                pagination,
+            } => {
+                assert!(data.is_array());
+                assert_eq!(etag.as_deref(), Some("\"page1\""));
+                assert_eq!(pagination.next_page, Some(2));
+                assert_eq!(pagination.total_pages, Some(4));
+            }
+            FetchResult::NotModified => panic!("expected fetched response"),
+        }
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, url);
+        assert!(
+            requests[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v == "\"cached\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_conditional_maps_status_codes_and_invalid_json() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        push_response(
+            &transport,
+            &format!("{TEST_BASE_URL}/cached"),
+            304,
+            Vec::new(),
+            String::new(),
+        );
+        push_response(
+            &transport,
+            &format!("{TEST_BASE_URL}/unauthorized"),
+            401,
+            Vec::new(),
+            String::new(),
+        );
+        push_response(
+            &transport,
+            &format!("{TEST_BASE_URL}/missing"),
+            404,
+            Vec::new(),
+            String::new(),
+        );
+        push_response(
+            &transport,
+            &format!("{TEST_BASE_URL}/boom"),
+            500,
+            Vec::new(),
+            String::new(),
+        );
+        push_response(
+            &transport,
+            &format!("{TEST_BASE_URL}/bad-json"),
+            200,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            "not-json".to_string(),
+        );
+
+        let octocrab = Octocrab::builder()
+            .build()
+            .expect("octocrab client should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let not_modified = client
+            .get_conditional::<serde_json::Value>("/cached", None)
+            .await
+            .expect("304 should be handled");
+        assert!(matches!(not_modified, FetchResult::NotModified));
+
+        let unauthorized = client
+            .get_conditional::<serde_json::Value>("/unauthorized", None)
+            .await
+            .expect_err("401 should map to auth error");
+        assert!(matches!(unauthorized, GitHubError::AuthRequired));
+
+        let missing = client
+            .get_conditional::<serde_json::Value>("/missing", None)
+            .await
+            .expect_err("404 should map to not found");
+        assert!(matches!(missing, GitHubError::OrgNotFound(route) if route == "/missing"));
+
+        let unexpected = client
+            .get_conditional::<serde_json::Value>("/boom", None)
+            .await
+            .expect_err("500 should map to internal error");
+        assert!(
+            matches!(unexpected, GitHubError::Internal(msg) if msg.contains("Unexpected HTTP status: 500"))
+        );
+
+        let json_error = client
+            .get_conditional::<serde_json::Value>("/bad-json", None)
+            .await
+            .expect_err("invalid JSON should map to internal error");
+        assert!(
+            matches!(json_error, GitHubError::Internal(msg) if msg.contains("JSON parse error:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_starred_repos_streaming_fetches_next_page_when_first_page_is_full() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+
+        let page1_url = format!("{TEST_BASE_URL}/user/starred?per_page=100&page=1");
+        let page2_url = format!("{TEST_BASE_URL}/user/starred?per_page=100&page=2");
+
+        push_response(
+            &transport,
+            &page1_url,
+            200,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            serde_json::to_string(&vec![repo_json(1, "repo-1"); 100])
+                .expect("first page should serialize"),
+        );
+        push_response(
+            &transport,
+            &page2_url,
+            200,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            "[]".to_string(),
+        );
+
+        let octocrab = Octocrab::builder()
+            .build()
+            .expect("octocrab client should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let (tx, mut rx) = mpsc::channel::<PlatformRepo>(8);
+        // Drain the receiver concurrently with the producer.
+        // Otherwise, a bounded channel can deadlock if we await the producer before receiving.
+        let recv_handle = tokio::spawn(async move {
+            let mut names = Vec::new();
+            while let Some(repo) = rx.recv().await {
+                names.push(repo.name);
+            }
+            names
+        });
+
+        let client_for_task = client.clone();
+        let stream_handle = tokio::spawn(async move {
+            PlatformClient::list_starred_repos_streaming(&client_for_task, tx, None, 1, true, None)
+                .await
+        });
+
+        let sent = stream_handle
+            .await
+            .expect("streaming task should join")
+            .expect("streaming should succeed");
+
+        let mut names = recv_handle.await.expect("receiver task should join");
+
+        names.sort();
+        assert_eq!(sent, 100);
+        assert_eq!(names.len(), 100);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, page1_url);
+        assert_eq!(requests[1].url, page2_url);
     }
 }

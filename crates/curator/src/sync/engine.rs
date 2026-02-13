@@ -1202,8 +1202,304 @@ fn emit_filtered_progress(
 mod tests {
     use super::*;
     use crate::sync::StarringStats;
+    use async_trait::async_trait;
     use chrono::Duration;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    use crate::entity::platform_type::PlatformType;
+    use crate::platform::{OrgInfo, RateLimitInfo, Result as PlatformResult, UserInfo};
+
+    #[derive(Clone, Default)]
+    struct TestClient {
+        starred_repos: Arc<Mutex<Vec<PlatformRepo>>>,
+        repo_results: Arc<Mutex<HashMap<String, PlatformResult<PlatformRepo>>>>,
+        star_results: Arc<Mutex<HashMap<String, PlatformResult<bool>>>>,
+        unstar_results: Arc<Mutex<HashMap<String, PlatformResult<bool>>>>,
+        star_calls: Arc<Mutex<Vec<String>>>,
+        unstar_calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TestClient {
+        fn key(owner: &str, name: &str) -> String {
+            format!("{owner}/{name}")
+        }
+
+        fn set_starred_repos(&self, repos: Vec<PlatformRepo>) {
+            *self.starred_repos.lock().unwrap_or_else(|e| e.into_inner()) = repos;
+        }
+
+        fn set_star_result(&self, owner: &str, name: &str, value: PlatformResult<bool>) {
+            let key = Self::key(owner, name);
+            self.star_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, value);
+        }
+
+        fn set_repo_result(&self, owner: &str, name: &str, value: PlatformResult<PlatformRepo>) {
+            let key = Self::key(owner, name);
+            self.repo_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, value);
+        }
+
+        fn set_unstar_result(&self, owner: &str, name: &str, value: PlatformResult<bool>) {
+            let key = Self::key(owner, name);
+            self.unstar_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, value);
+        }
+
+        fn star_calls_len(&self) -> usize {
+            self.star_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        }
+
+        fn unstar_calls(&self) -> Vec<String> {
+            self.unstar_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct PanicRepoClient;
+
+    #[async_trait]
+    impl PlatformClient for PanicRepoClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> PlatformResult<RateLimitInfo> {
+            panic!("unused in tests")
+        }
+
+        async fn get_org_info(&self, _org: &str) -> PlatformResult<OrgInfo> {
+            panic!("unused in tests")
+        }
+
+        async fn get_authenticated_user(&self) -> PlatformResult<UserInfo> {
+            panic!("unused in tests")
+        }
+
+        async fn get_repo(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> PlatformResult<PlatformRepo> {
+            panic!("intentional panic for join error coverage")
+        }
+
+        async fn list_org_repos(
+            &self,
+            _org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            panic!("unused in tests")
+        }
+
+        async fn list_user_repos(
+            &self,
+            _username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            panic!("unused in tests")
+        }
+
+        async fn is_repo_starred(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn star_repo(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn unstar_repo(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            panic!("unused in tests")
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            _repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<usize> {
+            panic!("unused in tests")
+        }
+
+        fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
+            repo.to_active_model(self.instance_id())
+        }
+    }
+
+    #[async_trait]
+    impl PlatformClient for TestClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> PlatformResult<RateLimitInfo> {
+            panic!("unused in tests")
+        }
+
+        async fn get_org_info(&self, _org: &str) -> PlatformResult<OrgInfo> {
+            panic!("unused in tests")
+        }
+
+        async fn get_authenticated_user(&self) -> PlatformResult<UserInfo> {
+            panic!("unused in tests")
+        }
+
+        async fn get_repo(
+            &self,
+            owner: &str,
+            name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> PlatformResult<PlatformRepo> {
+            let key = Self::key(owner, name);
+            self.repo_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+                .unwrap_or_else(|| Err(PlatformError::internal("missing repo result")))
+        }
+
+        async fn list_org_repos(
+            &self,
+            _org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            panic!("unused in tests")
+        }
+
+        async fn list_user_repos(
+            &self,
+            _username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            panic!("unused in tests")
+        }
+
+        async fn is_repo_starred(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn star_repo(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            owner: &str,
+            name: &str,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<bool> {
+            let key = Self::key(owner, name);
+            self.star_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(key.clone());
+            self.star_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+                .unwrap_or(Ok(false))
+        }
+
+        async fn unstar_repo(&self, owner: &str, name: &str) -> PlatformResult<bool> {
+            let key = Self::key(owner, name);
+            self.unstar_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(key.clone());
+            self.unstar_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+                .unwrap_or(Ok(false))
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            panic!("unused in tests")
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<usize> {
+            let repos = self
+                .starred_repos
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let count = repos.len();
+            for repo in repos {
+                if repo_tx.send(repo).await.is_err() {
+                    break;
+                }
+            }
+            Ok(count)
+        }
+
+        fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
+            repo.to_active_model(self.instance_id())
+        }
+    }
 
     fn mock_repo(name: &str, days_ago: i64) -> PlatformRepo {
         use crate::entity::code_visibility::CodeVisibility;
@@ -1529,5 +1825,700 @@ mod tests {
             total: 42,
         });
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_should_emit_filtered_progress_threshold_and_initial_edges() {
+        assert!(should_emit_filtered_progress(25, 0, 0, 0));
+        assert!(should_emit_filtered_progress(0, 100, 0, 0));
+        assert!(should_emit_filtered_progress(1, 0, 0, 0));
+        assert!(should_emit_filtered_progress(0, 1, 0, 0));
+        assert!(!should_emit_filtered_progress(24, 99, 1, 1));
+    }
+
+    #[test]
+    fn test_take_prune_repos_when_arc_is_still_shared() {
+        let repos = Arc::new(Mutex::new(vec![("org".to_string(), "repo".to_string())]));
+        let shared = Arc::clone(&repos);
+
+        let taken = take_prune_repos(repos);
+        assert_eq!(taken, vec![("org".to_string(), "repo".to_string())]);
+
+        drop(shared);
+    }
+
+    #[test]
+    fn test_take_prune_repos_when_arc_is_unique() {
+        let repos = Arc::new(Mutex::new(vec![
+            ("org-1".to_string(), "repo-1".to_string()),
+            ("org-2".to_string(), "repo-2".to_string()),
+        ]));
+
+        let taken = take_prune_repos(repos);
+        assert_eq!(
+            taken,
+            vec![
+                ("org-1".to_string(), "repo-1".to_string()),
+                ("org-2".to_string(), "repo-2".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_concurrent_sync_empty_input_short_circuits_without_progress() {
+        let items: Vec<String> = Vec::new();
+        let progress_calls = Arc::new(AtomicUsize::new(0));
+        let progress_calls_clone = Arc::clone(&progress_calls);
+        let callback: ProgressCallback = Box::new(move |_event| {
+            progress_calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let results = spawn_concurrent_sync::<NamespaceSyncResult, _, _>(
+            &items,
+            4,
+            |name, _semaphore| async move { NamespaceSyncResult::semaphore_error(name) },
+            Some(&callback),
+        )
+        .await;
+
+        assert!(results.is_empty());
+        assert_eq!(progress_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_concurrent_sync_wraps_panics_into_results() {
+        let items = vec!["one".to_string()];
+
+        let results = spawn_concurrent_sync::<NamespaceSyncResult, _, _>(
+            &items,
+            4,
+            |_item, _semaphore| async move {
+                panic!("boom");
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].namespace, "<unknown>");
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("Task panic:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_concurrent_sync_emits_aggregated_success_and_failure_progress() {
+        let items = vec!["ok".to_string(), "bad".to_string()];
+        let progress_events = Arc::new(Mutex::new(Vec::<SyncProgress>::new()));
+        let progress_events_clone = Arc::clone(&progress_events);
+        let callback: ProgressCallback = Box::new(move |event| {
+            progress_events_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event);
+        });
+
+        let results = spawn_concurrent_sync::<NamespaceSyncResult, _, _>(
+            &items,
+            4,
+            |item, _semaphore| async move {
+                if item == "bad" {
+                    NamespaceSyncResult {
+                        namespace: item,
+                        result: SyncResult::default(),
+                        models: Vec::new(),
+                        error: Some("failed".to_string()),
+                    }
+                } else {
+                    NamespaceSyncResult {
+                        namespace: item,
+                        result: SyncResult::default(),
+                        models: Vec::new(),
+                        error: None,
+                    }
+                }
+            },
+            Some(&callback),
+        )
+        .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.iter().filter(|r| r.error.is_none()).count(), 1);
+        assert_eq!(results.iter().filter(|r| r.error.is_some()).count(), 1);
+
+        let events = progress_events.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(matches!(
+            events.first(),
+            Some(SyncProgress::SyncingNamespaces { count: 2 })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SyncProgress::SyncNamespacesComplete {
+                successful: 1,
+                failed: 1
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_concurrent_sync_streaming_empty_input_short_circuits_without_progress() {
+        let items: Vec<String> = Vec::new();
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(4);
+        let progress_calls = Arc::new(AtomicUsize::new(0));
+        let progress_calls_clone = Arc::clone(&progress_calls);
+        let callback: ProgressCallback = Box::new(move |_event| {
+            progress_calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let results =
+            spawn_concurrent_sync_streaming(
+                &items,
+                4,
+                model_tx,
+                |name, _semaphore, _tx| async move {
+                    NamespaceSyncResultStreaming::semaphore_error(name)
+                },
+                Some(&callback),
+            )
+            .await;
+
+        assert!(results.is_empty());
+        assert_eq!(progress_calls.load(Ordering::SeqCst), 0);
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_concurrent_sync_streaming_emits_progress_and_wraps_panics() {
+        let items = vec!["one".to_string()];
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(4);
+
+        let progress_events = Arc::new(Mutex::new(Vec::<SyncProgress>::new()));
+        let progress_events_clone = Arc::clone(&progress_events);
+        let callback: ProgressCallback = Box::new(move |event| {
+            progress_events_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event);
+        });
+
+        let results = spawn_concurrent_sync_streaming(
+            &items,
+            4,
+            model_tx,
+            |_item, _semaphore, _tx| async move {
+                panic!("boom");
+            },
+            Some(&callback),
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].namespace, "<unknown>");
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("Task panic:"))
+        );
+
+        {
+            let events = progress_events.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(matches!(
+                events.first(),
+                Some(SyncProgress::SyncingNamespaces { count: 1 })
+            ));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SyncProgress::SyncNamespacesComplete {
+                    successful: 0,
+                    failed: 1
+                }
+            )));
+        }
+
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_poll_starred_stream_tasks_returns_processor_join_error() {
+        let fetch_future = async { Ok::<usize, PlatformError>(1) };
+        let processor_handle = tokio::spawn(async move {
+            panic!("processor failed");
+        });
+        let (progress_tx, progress_rx) = mpsc::channel::<(usize, usize)>(1);
+        drop(progress_tx);
+
+        let err = poll_starred_stream_tasks(fetch_future, processor_handle, progress_rx, None)
+            .await
+            .expect_err("processor panic should be surfaced");
+
+        assert!(err.to_string().contains("Processor task failed"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_repos_skips_starring_when_star_disabled() {
+        let client = TestClient::default();
+        client.set_star_result("test-org", "recent", Ok(true));
+
+        let options = SyncOptions {
+            star: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let repos = vec![mock_repo("recent", 1)];
+        let (result, models) = sync_repos(&client, "test-org", repos, &options, None)
+            .await
+            .expect("sync should succeed");
+
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.matched, 1);
+        assert_eq!(result.starred, 0);
+        assert_eq!(result.saved, 1);
+        assert_eq!(models.len(), 1);
+        assert_eq!(client.star_calls_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repos_skips_starring_when_no_active_repos() {
+        let client = TestClient::default();
+        client.set_star_result("test-org", "old", Ok(true));
+
+        let options = SyncOptions {
+            star: true,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let repos = vec![mock_repo("old", 90)];
+        let (result, models) = sync_repos(&client, "test-org", repos, &options, None)
+            .await
+            .expect("sync should succeed");
+
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.matched, 0);
+        assert_eq!(result.starred, 0);
+        assert_eq!(result.saved, 0);
+        assert!(models.is_empty());
+        assert_eq!(client.star_calls_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sync_starred_streaming_prune_disabled_skips_unstar() {
+        let client = TestClient::default();
+        client.set_starred_repos(vec![mock_repo_with_owner("org", "inactive", 90)]);
+        client.set_unstar_result("org", "inactive", Ok(true));
+
+        let options = SyncOptions {
+            prune: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let sync_result = sync_starred_streaming(&client, &options, None, 2, false, model_tx, None)
+            .await
+            .expect("sync should succeed");
+
+        assert_eq!(sync_result.processed, 1);
+        assert_eq!(sync_result.matched, 0);
+        assert_eq!(sync_result.saved, 0);
+        assert_eq!(sync_result.pruned, 0);
+        assert!(sync_result.pruned_repos.is_empty());
+        assert!(model_rx.recv().await.is_none());
+        assert!(client.unstar_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sync_starred_streaming_prune_enabled_unstars_inactive() {
+        let client = TestClient::default();
+        client.set_starred_repos(vec![mock_repo_with_owner("org", "inactive", 90)]);
+        client.set_unstar_result("org", "inactive", Ok(true));
+
+        let options = SyncOptions {
+            prune: true,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let (model_tx, _model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let sync_result = sync_starred_streaming(&client, &options, None, 2, false, model_tx, None)
+            .await
+            .expect("sync should succeed");
+
+        assert_eq!(sync_result.processed, 1);
+        assert_eq!(sync_result.matched, 0);
+        assert_eq!(sync_result.pruned, 1);
+        assert_eq!(
+            sync_result.pruned_repos,
+            vec![("org".to_string(), "inactive".to_string())]
+        );
+        assert_eq!(client.unstar_calls(), vec!["org/inactive".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_starred_streaming_handles_closed_model_channel() {
+        let client = TestClient::default();
+        client.set_starred_repos(vec![mock_repo_with_owner("org", "active", 1)]);
+
+        let options = SyncOptions {
+            prune: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let (model_tx, model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(1);
+        drop(model_rx);
+
+        let sync_result = sync_starred_streaming(&client, &options, None, 2, false, model_tx, None)
+            .await
+            .expect("sync should succeed when model receiver is gone");
+
+        assert_eq!(sync_result.processed, 1);
+        assert_eq!(sync_result.matched, 1);
+        assert_eq!(sync_result.saved, 0);
+        assert!(sync_result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sync_starred_streaming_aggregates_prune_errors() {
+        let client = TestClient::default();
+        client.set_starred_repos(vec![mock_repo_with_owner("org", "inactive", 90)]);
+        client.set_unstar_result(
+            "org",
+            "inactive",
+            Err(PlatformError::internal("unstar failed")),
+        );
+
+        let options = SyncOptions {
+            prune: true,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let sync_result = sync_starred_streaming(&client, &options, None, 2, false, model_tx, None)
+            .await
+            .expect("sync should succeed and report prune failures");
+
+        assert_eq!(sync_result.processed, 1);
+        assert_eq!(sync_result.matched, 0);
+        assert_eq!(sync_result.pruned, 0);
+        assert!(
+            sync_result
+                .errors
+                .iter()
+                .any(|error| error.contains("unstar failed"))
+        );
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn test_should_emit_filtered_progress_exact_step_boundaries() {
+        assert!(!should_emit_filtered_progress(34, 199, 10, 100));
+        assert!(should_emit_filtered_progress(35, 199, 10, 100));
+        assert!(!should_emit_filtered_progress(10, 199, 10, 100));
+        assert!(should_emit_filtered_progress(10, 200, 10, 100));
+    }
+
+    #[tokio::test]
+    async fn test_poll_starred_stream_tasks_propagates_fetch_error() {
+        let fetch_future =
+            async { Err::<usize, PlatformError>(PlatformError::internal("fetch failed")) };
+        let processor_handle = tokio::spawn(async {});
+        let (progress_tx, progress_rx) = mpsc::channel::<(usize, usize)>(1);
+        drop(progress_tx);
+
+        let err = poll_starred_stream_tasks(fetch_future, processor_handle, progress_rx, None)
+            .await
+            .expect_err("fetch error should be returned");
+
+        assert!(err.to_string().contains("fetch failed"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_starred_streaming_dry_run_skips_models_ready_event() {
+        let client = TestClient::default();
+        client.set_starred_repos(vec![mock_repo_with_owner("org", "active", 1)]);
+
+        let options = SyncOptions {
+            dry_run: true,
+            prune: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let models_ready_count = Arc::new(AtomicUsize::new(0));
+        let filter_complete_count = Arc::new(AtomicUsize::new(0));
+        let models_ready_count_clone = Arc::clone(&models_ready_count);
+        let filter_complete_count_clone = Arc::clone(&filter_complete_count);
+        let callback: ProgressCallback = Box::new(move |event| match event {
+            SyncProgress::ModelsReady { .. } => {
+                models_ready_count_clone.fetch_add(1, Ordering::SeqCst);
+            }
+            SyncProgress::FilterComplete { .. } => {
+                filter_complete_count_clone.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        });
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let sync_result =
+            sync_starred_streaming(&client, &options, None, 2, false, model_tx, Some(&callback))
+                .await
+                .expect("sync should succeed");
+
+        assert_eq!(sync_result.processed, 1);
+        assert_eq!(sync_result.matched, 1);
+        assert_eq!(sync_result.saved, 0);
+        assert_eq!(models_ready_count.load(Ordering::SeqCst), 0);
+        assert_eq!(filter_complete_count.load(Ordering::SeqCst), 1);
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_starred_streaming_non_dry_run_emits_models_ready_event() {
+        let client = TestClient::default();
+        client.set_starred_repos(vec![mock_repo_with_owner("org", "active", 1)]);
+
+        let options = SyncOptions {
+            dry_run: false,
+            prune: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let models_ready_count = Arc::new(AtomicUsize::new(0));
+        let filter_complete_count = Arc::new(AtomicUsize::new(0));
+        let models_ready_count_clone = Arc::clone(&models_ready_count);
+        let filter_complete_count_clone = Arc::clone(&filter_complete_count);
+        let callback: ProgressCallback = Box::new(move |event| match event {
+            SyncProgress::ModelsReady { .. } => {
+                models_ready_count_clone.fetch_add(1, Ordering::SeqCst);
+            }
+            SyncProgress::FilterComplete { .. } => {
+                filter_complete_count_clone.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        });
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let sync_result =
+            sync_starred_streaming(&client, &options, None, 2, false, model_tx, Some(&callback))
+                .await
+                .expect("sync should succeed");
+
+        assert_eq!(sync_result.processed, 1);
+        assert_eq!(sync_result.matched, 1);
+        assert_eq!(sync_result.saved, 1);
+        assert_eq!(models_ready_count.load(Ordering::SeqCst), 1);
+        assert_eq!(filter_complete_count.load(Ordering::SeqCst), 1);
+        assert!(model_rx.recv().await.is_some());
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_list_streaming_emits_warning_progress_for_join_error() {
+        let client = PanicRepoClient;
+        let options = SyncOptions {
+            star: false,
+            dry_run: true,
+            ..SyncOptions::default()
+        };
+        let repos = vec![("org".to_string(), "repo".to_string())];
+        let warnings = Arc::new(Mutex::new(Vec::<String>::new()));
+        let warnings_clone = Arc::clone(&warnings);
+        let callback: ProgressCallback = Box::new(move |event| {
+            if let SyncProgress::Warning { message } = event {
+                warnings_clone
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(message);
+            }
+        });
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result = sync_repo_list_streaming(
+            &client,
+            "panic",
+            &repos,
+            &options,
+            None,
+            model_tx,
+            Some(&callback),
+        )
+        .await
+        .expect("sync should succeed while collecting join errors");
+
+        assert_eq!(result.processed, 0);
+        assert!(result.errors.iter().any(|e| e.contains("Task join error:")));
+        assert!(model_rx.recv().await.is_none());
+
+        let warning_messages = warnings.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            warning_messages
+                .iter()
+                .any(|message| message.contains("Task join error:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_list_streaming_aggregates_fetch_and_star_errors() {
+        let client = TestClient::default();
+        let active_repo = mock_repo_with_owner("ok-org", "good", 1);
+        client.set_repo_result("ok-org", "good", Ok(active_repo));
+        client.set_repo_result(
+            "bad-org",
+            "broken",
+            Err(PlatformError::internal("cannot fetch repo")),
+        );
+        client.set_star_result(
+            "ok-org",
+            "good",
+            Err(PlatformError::internal("star failed")),
+        );
+
+        let options = SyncOptions {
+            star: true,
+            dry_run: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let repos = vec![
+            ("ok-org".to_string(), "good".to_string()),
+            ("bad-org".to_string(), "broken".to_string()),
+        ];
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result =
+            sync_repo_list_streaming(&client, "mixed", &repos, &options, None, model_tx, None)
+                .await
+                .expect("sync should complete with collected errors");
+
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.matched, 1);
+        assert_eq!(result.saved, 1);
+        assert_eq!(result.errors.len(), 2);
+        assert!(result.errors.iter().any(|e| e.contains("bad-org/broken:")));
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("cannot fetch repo"))
+        );
+        assert!(result.errors.iter().any(|e| e.contains("star failed")));
+        assert!(model_rx.recv().await.is_some());
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_list_streaming_incremental_without_db_keeps_fetched_repos() {
+        let client = TestClient::default();
+        client.set_repo_result("acme", "one", Ok(mock_repo_with_owner("acme", "one", 1)));
+        client.set_repo_result("acme", "two", Ok(mock_repo_with_owner("acme", "two", 2)));
+
+        let options = SyncOptions {
+            strategy: SyncStrategy::Incremental,
+            star: false,
+            dry_run: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+        let repos = vec![
+            ("acme".to_string(), "one".to_string()),
+            ("acme".to_string(), "two".to_string()),
+        ];
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result = sync_repo_list_streaming(
+            &client,
+            "incremental-no-db",
+            &repos,
+            &options,
+            None,
+            model_tx,
+            None,
+        )
+        .await
+        .expect("incremental sync without db should keep fetched repos");
+
+        assert_eq!(result.processed, 2);
+        assert_eq!(result.matched, 2);
+        assert_eq!(result.saved, 2);
+        assert!(result.errors.is_empty());
+        assert!(model_rx.recv().await.is_some());
+        assert!(model_rx.recv().await.is_some());
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_list_streaming_incremental_with_db_skips_filter_when_none_fetched() {
+        let client = TestClient::default();
+        client.set_repo_result(
+            "missing-org",
+            "missing-repo",
+            Err(PlatformError::internal("cannot fetch repo")),
+        );
+
+        let options = SyncOptions {
+            strategy: SyncStrategy::Incremental,
+            star: false,
+            dry_run: true,
+            ..SyncOptions::default()
+        };
+        let repos = vec![("missing-org".to_string(), "missing-repo".to_string())];
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Sqlite).into_connection());
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result = sync_repo_list_streaming(
+            &client,
+            "incremental-empty",
+            &repos,
+            &options,
+            Some(db),
+            model_tx,
+            None,
+        )
+        .await
+        .expect("sync should succeed and keep fetch errors");
+
+        assert_eq!(result.processed, 0);
+        assert_eq!(result.matched, 0);
+        assert_eq!(result.saved, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("cannot fetch repo"));
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_list_streaming_collects_task_join_errors() {
+        let client = PanicRepoClient;
+        let options = SyncOptions {
+            star: false,
+            dry_run: true,
+            ..SyncOptions::default()
+        };
+        let repos = vec![("org".to_string(), "repo".to_string())];
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result =
+            sync_repo_list_streaming(&client, "panic", &repos, &options, None, model_tx, None)
+                .await
+                .expect("sync should succeed while collecting join errors");
+
+        assert_eq!(result.processed, 0);
+        assert_eq!(result.matched, 0);
+        assert_eq!(result.saved, 0);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("Task join error:"))
+        );
+        assert!(model_rx.recv().await.is_none());
     }
 }

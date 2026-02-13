@@ -391,6 +391,14 @@ mod tests {
     }
 
     #[test]
+    fn test_base_url_with_http_scheme_is_preserved() {
+        assert_eq!(
+            base_url("http://gitlab.example.com"),
+            "http://gitlab.example.com"
+        );
+    }
+
+    #[test]
     fn test_base_url_trailing_slash() {
         assert_eq!(base_url("gitlab.com/"), "https://gitlab.com");
     }
@@ -503,6 +511,18 @@ mod tests {
             .as_secs()
             + 100_000;
         assert!(!token_is_expired(Some(future), 0));
+    }
+
+    #[test]
+    fn test_token_is_expired_with_buffer() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expires_soon = now + 10;
+
+        assert!(token_is_expired(Some(expires_soon), 15));
+        assert!(!token_is_expired(Some(expires_soon), 5));
     }
 
     #[test]

@@ -279,7 +279,27 @@ impl<T> ConditionalResult<T> {
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
     use super::*;
+
+    fn mock_cache_model(
+        instance_id: Uuid,
+        endpoint_type: EndpointType,
+        cache_key: &str,
+        etag: Option<&str>,
+        total_pages: Option<i32>,
+    ) -> Model {
+        Model {
+            id: Uuid::new_v4(),
+            instance_id,
+            endpoint_type,
+            cache_key: cache_key.to_string(),
+            etag: etag.map(std::string::ToString::to_string),
+            total_pages,
+            cached_at: Utc::now().fixed_offset(),
+        }
+    }
 
     #[test]
     fn test_conditional_result_not_modified() {
@@ -368,5 +388,125 @@ mod tests {
             EndpointType::SingleRepo,
         ];
         assert_eq!(types.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_get_etags_batch_populates_missing_keys_with_none() {
+        let instance_id = Uuid::new_v4();
+        let existing_key = "rust-lang/page/1".to_string();
+        let missing_key = "rust-lang/page/2".to_string();
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![mock_cache_model(
+                instance_id,
+                EndpointType::OrgRepos,
+                &existing_key,
+                Some("W/\"etag-1\""),
+                Some(5),
+            )]])
+            .into_connection();
+
+        let etags = get_etags_batch(
+            &db,
+            instance_id,
+            EndpointType::OrgRepos,
+            &[existing_key.clone(), missing_key.clone()],
+        )
+        .await
+        .expect("batch lookup should succeed");
+
+        assert_eq!(etags.len(), 2);
+        assert_eq!(
+            etags.get(&existing_key),
+            Some(&Some("W/\"etag-1\"".to_string()))
+        );
+        assert_eq!(etags.get(&missing_key), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn test_get_etags_batch_returns_empty_map_for_empty_input() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let etags = get_etags_batch(&db, Uuid::new_v4(), EndpointType::UserRepos, &[])
+            .await
+            .expect("empty input should return empty map");
+        assert!(etags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_total_pages_reads_namespace_page_one() {
+        let instance_id = Uuid::new_v4();
+        let namespace = "rust-lang";
+        let page1_key = format!("{namespace}/page/1");
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![mock_cache_model(
+                instance_id,
+                EndpointType::OrgRepos,
+                &page1_key,
+                Some("etag"),
+                Some(42),
+            )]])
+            .into_connection();
+
+        let total = get_total_pages(&db, instance_id, EndpointType::OrgRepos, namespace)
+            .await
+            .expect("lookup should succeed");
+
+        assert_eq!(total, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_get_starred_total_pages_uses_starred_key_format() {
+        let instance_id = Uuid::new_v4();
+        let username = "octocat";
+        let starred_page1 = Model::starred_key(username, 1);
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![mock_cache_model(
+                instance_id,
+                EndpointType::Starred,
+                &starred_page1,
+                Some("etag"),
+                Some(9),
+            )]])
+            .into_connection();
+
+        let total = get_starred_total_pages(&db, instance_id, username)
+            .await
+            .expect("starred lookup should succeed");
+
+        assert_eq!(total, Some(9));
+    }
+
+    #[tokio::test]
+    async fn test_delete_returns_false_when_entry_missing() {
+        let instance_id = Uuid::new_v4();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 0,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        let deleted = delete(&db, instance_id, EndpointType::SingleRepo, "owner/repo")
+            .await
+            .expect("delete should succeed");
+
+        assert!(!deleted);
+    }
+
+    #[tokio::test]
+    async fn test_delete_by_endpoint_type_returns_rows_affected() {
+        let instance_id = Uuid::new_v4();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 3,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        let deleted = delete_by_endpoint_type(&db, instance_id, EndpointType::OrgRepos)
+            .await
+            .expect("delete by endpoint should succeed");
+
+        assert_eq!(deleted, 3);
     }
 }

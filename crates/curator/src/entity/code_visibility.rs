@@ -28,3 +28,20 @@ impl std::fmt::Display for CodeVisibility {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_public() {
+        assert_eq!(CodeVisibility::default(), CodeVisibility::Public);
+    }
+
+    #[test]
+    fn display_outputs_expected_strings() {
+        assert_eq!(CodeVisibility::Public.to_string(), "public");
+        assert_eq!(CodeVisibility::Private.to_string(), "private");
+        assert_eq!(CodeVisibility::Internal.to_string(), "internal");
+    }
+}

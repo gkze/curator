@@ -10,7 +10,7 @@ use crate::platform::PlatformError;
 pub enum GiteaError {
     /// HTTP request failed.
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
 
     /// JSON parsing failed.
     #[error("JSON error: {0}")]
@@ -44,9 +44,7 @@ pub enum GiteaError {
 impl From<GiteaError> for PlatformError {
     fn from(err: GiteaError) -> Self {
         match err {
-            GiteaError::Http(e) => PlatformError::Network {
-                message: e.to_string(),
-            },
+            GiteaError::Http(message) => PlatformError::Network { message },
             GiteaError::Json(e) => PlatformError::Internal {
                 message: format!("JSON parse error: {}", e),
             },
@@ -81,7 +79,9 @@ pub fn is_rate_limit_error(err: &GiteaError) -> bool {
     match err {
         GiteaError::RateLimited { .. } => true,
         GiteaError::Api { status: 429, .. } => true,
-        GiteaError::Http(e) => e.status().map(|s| s.as_u16()) == Some(429),
+        // Http wraps transport-level errors (timeouts, DNS, etc.) — never a rate limit.
+        // Actual 429 responses are represented by GiteaError::Api { status: 429, .. }.
+        GiteaError::Http(_) => false,
         _ => false,
     }
 }
@@ -89,13 +89,7 @@ pub fn is_rate_limit_error(err: &GiteaError) -> bool {
 /// Get a short error message suitable for display.
 pub fn short_error_message(err: &GiteaError) -> String {
     match err {
-        GiteaError::Http(e) => {
-            if let Some(status) = e.status() {
-                format!("HTTP {}", status)
-            } else {
-                "Network error".to_string()
-            }
-        }
+        GiteaError::Http(_) => "Network error".to_string(),
         GiteaError::Json(_) => "JSON parse error".to_string(),
         GiteaError::Api { status, message } => {
             if message.len() > 50 {

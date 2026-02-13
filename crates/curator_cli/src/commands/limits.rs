@@ -286,3 +286,113 @@ fn format_duration(duration: chrono::Duration) -> String {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "github")]
+    fn sample_resource(
+        limit: usize,
+        used: usize,
+        remaining: usize,
+        reset: u64,
+    ) -> curator::github::RateLimitResource {
+        curator::github::RateLimitResource {
+            limit,
+            used,
+            remaining,
+            reset,
+        }
+    }
+
+    #[test]
+    fn output_format_default_is_table() {
+        assert!(matches!(OutputFormat::default(), OutputFormat::Table));
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn format_duration_handles_seconds_minutes_and_hours() {
+        assert_eq!(format_duration(chrono::Duration::seconds(42)), "42s");
+        assert_eq!(format_duration(chrono::Duration::seconds(120)), "2m");
+        assert_eq!(format_duration(chrono::Duration::seconds(125)), "2m 5s");
+        assert_eq!(format_duration(chrono::Duration::seconds(3600)), "1h");
+        assert_eq!(format_duration(chrono::Duration::seconds(3900)), "1h 5m");
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn github_rate_limits_to_display_includes_optional_resources() {
+        let limits = curator::github::GitHubRateLimits {
+            core: sample_resource(5000, 1000, 4000, 2_000_000_000),
+            search: sample_resource(30, 5, 25, 2_000_000_000),
+            code_search: Some(sample_resource(10, 1, 9, 2_000_000_000)),
+            graphql: Some(sample_resource(5000, 50, 4950, 2_000_000_000)),
+            integration_manifest: None,
+            source_import: None,
+            code_scanning_upload: None,
+            actions_runner_registration: None,
+            scim: None,
+            dependency_snapshots: None,
+            audit_log: None,
+            code_scanning_autofix: None,
+        };
+
+        let display = github_rate_limits_to_display(&limits);
+        let names: Vec<_> = display.iter().map(|d| d.resource.as_str()).collect();
+
+        assert!(names.contains(&"core"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"code_search"));
+        assert!(names.contains(&"graphql"));
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn rate_limit_display_from_resource_formats_percent_and_reset() {
+        let resource = sample_resource(100, 25, 75, 2_000_000_000);
+        let display = RateLimitDisplay::from_github_resource("core", &resource);
+
+        assert_eq!(display.resource, "core");
+        assert_eq!(display.limit, "100");
+        assert_eq!(display.used, "25");
+        assert_eq!(display.remaining, "75");
+        assert_eq!(display.usage_percent, "25.0%");
+        assert!(display.reset_at.contains("UTC"));
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn rate_limit_display_print_many_supports_json_and_table() {
+        let items = vec![RateLimitDisplay {
+            resource: "zeta".to_string(),
+            limit: "100".to_string(),
+            used: "10".to_string(),
+            remaining: "90".to_string(),
+            usage_percent: "10.0%".to_string(),
+            reset_at: "2099-01-01 00:00:00 UTC".to_string(),
+            reset_in: "10m".to_string(),
+        }];
+
+        // Smoke tests: this should not panic in either output mode.
+        RateLimitDisplay::print_many(items.clone(), OutputFormat::Json);
+        RateLimitDisplay::print_many(items, OutputFormat::Table);
+    }
+
+    #[cfg(any(feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn rate_limit_info_message_print_supports_json_and_table() {
+        let info = RateLimitInfoMessage {
+            platform: "GitLab (gitlab.com)".to_string(),
+            message: "Header-based rate limiting".to_string(),
+            default_limit: "Varies by endpoint".to_string(),
+            note: "Check response headers".to_string(),
+            docs_url: "https://example.invalid/docs".to_string(),
+        };
+
+        // Smoke tests: this should not panic in either output mode.
+        info.clone().print(OutputFormat::Json);
+        info.print(OutputFormat::Table);
+    }
+}

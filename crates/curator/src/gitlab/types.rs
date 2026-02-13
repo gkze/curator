@@ -431,6 +431,8 @@ mod tests {
         assert!(user.name.is_none());
         assert!(user.email.is_none());
         assert!(user.bio.is_none());
+        assert!(user.public_email.is_none());
+        assert_eq!(user.followers, 0);
     }
 
     #[test]

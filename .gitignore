@@ -10,3 +10,9 @@
 curator.db
 curator.db-shm
 curator.db-wal
+
+# Local artifacts
+/bash_test_output.txt
+/cmd_status.txt
+/coverage.json
+/coverage_report.txt

@@ -387,4 +387,25 @@ mod tests {
         assert_eq!(filtered[1].name, "second");
         assert_eq!(filtered[2].name, "third");
     }
+
+    #[test]
+    fn test_filter_by_activity_owned_matches_borrowed_variant() {
+        let projects = vec![
+            mock_project("recent-a", 2),
+            mock_project("stale", 120),
+            mock_project("recent-b", 7),
+        ];
+
+        let borrowed_names: Vec<String> = filter_by_activity(&projects, Duration::days(30))
+            .into_iter()
+            .map(|p| p.name.clone())
+            .collect();
+
+        let owned_names: Vec<String> = filter_by_activity_owned(projects, Duration::days(30))
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+
+        assert_eq!(borrowed_names, owned_names);
+    }
 }

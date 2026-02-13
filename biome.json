@@ -1,0 +1,68 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.3.14/schema.json",
+	"files": {
+		"includes": ["**/*.json", "**/*.jsonc", "**/*.html"],
+		"ignoreUnknown": true
+	},
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"formatter": {
+		"enabled": true,
+		"indentStyle": "space",
+		"indentWidth": 2,
+		"lineWidth": 100,
+		"lineEnding": "lf"
+	},
+	"html": {
+		"experimentalFullSupportEnabled": true,
+		"formatter": {
+			"enabled": true,
+			"indentStyle": "space",
+			"indentWidth": 4,
+			"lineWidth": 100,
+			"lineEnding": "lf",
+			"attributePosition": "auto",
+			"bracketSameLine": false,
+			"whitespaceSensitivity": "strict",
+			"indentScriptAndStyle": true,
+			"selfCloseVoidElements": "always"
+		},
+		"linter": {
+			"enabled": true
+		}
+	},
+	"json": {
+		"formatter": {
+			"enabled": true,
+			"indentStyle": "space",
+			"indentWidth": 2,
+			"lineWidth": 100,
+			"lineEnding": "lf",
+			"trailingCommas": "none",
+			"expand": "auto"
+		},
+		"linter": {
+			"enabled": true
+		}
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"a11y": "error",
+			"correctness": "error",
+			"suspicious": "error",
+			"nursery": {
+				"recommended": true,
+				"noDuplicateAttributes": "error",
+				"noScriptUrl": "error",
+				"noSyncScripts": "error",
+				"noAmbiguousAnchorText": "error",
+				"noDuplicateDependencies": "error"
+			}
+		}
+	}
+}

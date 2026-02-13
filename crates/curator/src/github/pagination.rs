@@ -570,6 +570,62 @@ impl GitHubClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octocrab::Octocrab;
+    #[cfg(feature = "migrate")]
+    use sea_orm::ActiveValue::Set;
+    #[cfg(feature = "migrate")]
+    use sea_orm::EntityTrait;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    use crate::{HttpHeaders, HttpMethod, HttpRequest, HttpResponse, HttpTransport, MockTransport};
+
+    const TEST_BASE_URL: &str = "http://local.test";
+
+    fn push_response(
+        transport: &MockTransport,
+        url: &str,
+        status: u16,
+        headers: HttpHeaders,
+        body: &str,
+    ) {
+        transport.push_response(
+            HttpMethod::Get,
+            url.to_string(),
+            HttpResponse {
+                status,
+                headers,
+                body: body.as_bytes().to_vec(),
+            },
+        );
+    }
+
+    fn request_header(req: &HttpRequest, name: &str) -> Option<String> {
+        crate::header_get(&req.headers, name).map(|v| v.to_string())
+    }
+
+    #[cfg(feature = "migrate")]
+    async fn setup_db(instance_id: Uuid) -> sea_orm::DatabaseConnection {
+        let db = crate::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("test db should migrate");
+
+        let now = chrono::Utc::now().fixed_offset();
+        crate::entity::instance::Entity::insert(crate::entity::instance::ActiveModel {
+            id: Set(instance_id),
+            name: Set("pagination-test".to_string()),
+            platform_type: Set(crate::entity::platform_type::PlatformType::GitHub),
+            host: Set("pagination.test".to_string()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set("auto".to_string()),
+            created_at: Set(now),
+        })
+        .exec(&db)
+        .await
+        .expect("instance should insert");
+
+        db
+    }
 
     #[test]
     fn test_org_repos_config() {
@@ -608,11 +664,327 @@ mod tests {
 
         let route = (config.route_fn)(2);
         assert_eq!(route, "/users/octocat/repos?per_page=100&page=2");
+
+        let cache_key = (config.cache_key_fn)(4);
+        assert_eq!(cache_key, "octocat/page/4");
+    }
+
+    #[test]
+    fn test_org_repos_config_without_expected_total() {
+        let config = PaginatedFetchConfig::org_repos("rust-lang", None);
+        assert_eq!(config.endpoint_type, EndpointType::OrgRepos);
+        assert_eq!(config.namespace, "rust-lang");
+        assert!(config.expected_total_repos.is_none());
+        assert_eq!(
+            config.route_fn.as_ref()(10),
+            "/orgs/rust-lang/repos?per_page=100&page=10"
+        );
+        assert_eq!(config.cache_key_fn.as_ref()(10), "rust-lang/page/10");
     }
 
     #[test]
     fn test_with_skip_rate_checks() {
         let config = PaginatedFetchConfig::starred("user").with_skip_rate_checks(true);
         assert!(config.skip_rate_checks);
+    }
+
+    #[test]
+    fn test_with_skip_rate_checks_preserves_other_fields() {
+        let config = PaginatedFetchConfig::org_repos("rust-lang", Some(320));
+        let updated = config.with_skip_rate_checks(true);
+
+        assert_eq!(updated.endpoint_type, EndpointType::OrgRepos);
+        assert_eq!(updated.namespace, "rust-lang");
+        assert_eq!(updated.expected_total_repos, Some(320));
+        assert!(updated.skip_rate_checks);
+        assert_eq!(
+            updated.route_fn.as_ref()(3),
+            "/orgs/rust-lang/repos?per_page=100&page=3"
+        );
+        assert_eq!(updated.cache_key_fn.as_ref()(3), "rust-lang/page/3");
+    }
+
+    #[test]
+    fn test_with_skip_rate_checks_can_toggle_back_to_false() {
+        let config = PaginatedFetchConfig::starred("user")
+            .with_skip_rate_checks(true)
+            .with_skip_rate_checks(false);
+        assert!(!config.skip_rate_checks);
+    }
+
+    #[test]
+    fn test_starred_config_cache_key_scopes_to_username() {
+        let config = PaginatedFetchConfig::starred("alice");
+        let cache_key = (config.cache_key_fn)(9);
+        assert_eq!(cache_key, "alice/starred/page/9");
+    }
+
+    #[test]
+    fn test_starred_configs_keep_same_route_but_isolated_cache_keys() {
+        let alice = PaginatedFetchConfig::starred("alice");
+        let bob = PaginatedFetchConfig::starred("bob");
+
+        assert_eq!((alice.route_fn)(4), (bob.route_fn)(4));
+        assert_ne!((alice.cache_key_fn)(4), (bob.cache_key_fn)(4));
+    }
+
+    #[test]
+    fn test_user_repos_config_preserves_namespace_with_slashes() {
+        let config = PaginatedFetchConfig::user_repos("team/user", Some(1));
+
+        assert_eq!(config.namespace, "team/user");
+        assert_eq!(
+            config.route_fn.as_ref()(1),
+            "/users/team/user/repos?per_page=100&page=1"
+        );
+        assert_eq!(config.cache_key_fn.as_ref()(1), "team/user/page/1");
+    }
+
+    #[test]
+    fn test_expected_total_repos_preserves_zero_value() {
+        let config = PaginatedFetchConfig::org_repos("empty-org", Some(0));
+        assert_eq!(config.expected_total_repos, Some(0));
+    }
+
+    #[test]
+    fn test_starred_config_namespace_is_constant_across_usernames() {
+        let alice = PaginatedFetchConfig::starred("alice");
+        let bob = PaginatedFetchConfig::starred("bob");
+
+        assert_eq!(alice.namespace, "starred");
+        assert_eq!(bob.namespace, "starred");
+    }
+
+    #[test]
+    fn test_starred_config_with_empty_username_keeps_namespace_and_builds_cache_key() {
+        let config = PaginatedFetchConfig::starred("");
+
+        assert_eq!(config.namespace, "starred");
+        assert_eq!((config.route_fn)(2), "/user/starred?per_page=100&page=2");
+        assert_eq!((config.cache_key_fn)(2), "/starred/page/2");
+    }
+
+    #[test]
+    fn test_org_and_user_configs_keep_distinct_endpoint_types() {
+        let org_config = PaginatedFetchConfig::org_repos("same-name", Some(10));
+        let user_config = PaginatedFetchConfig::user_repos("same-name", Some(10));
+
+        assert_eq!(org_config.endpoint_type, EndpointType::OrgRepos);
+        assert_eq!(user_config.endpoint_type, EndpointType::UserRepos);
+    }
+
+    #[test]
+    fn test_org_config_preserves_namespace_with_slashes() {
+        let config = PaginatedFetchConfig::org_repos("parent/team", Some(42));
+
+        assert_eq!(config.namespace, "parent/team");
+        assert_eq!(
+            config.route_fn.as_ref()(2),
+            "/orgs/parent/team/repos?per_page=100&page=2"
+        );
+        assert_eq!(config.cache_key_fn.as_ref()(2), "parent/team/page/2");
+    }
+
+    #[test]
+    fn test_org_config_supports_page_zero_route_and_cache_key() {
+        let config = PaginatedFetchConfig::org_repos("rust-lang", Some(1));
+
+        assert_eq!(
+            config.route_fn.as_ref()(0),
+            "/orgs/rust-lang/repos?per_page=100&page=0"
+        );
+        assert_eq!(config.cache_key_fn.as_ref()(0), "rust-lang/page/0");
+    }
+
+    #[test]
+    fn test_user_config_supports_max_u32_page_value() {
+        let config = PaginatedFetchConfig::user_repos("octocat", None);
+
+        assert_eq!(
+            config.route_fn.as_ref()(u32::MAX),
+            "/users/octocat/repos?per_page=100&page=4294967295"
+        );
+        assert_eq!(
+            config.cache_key_fn.as_ref()(u32::MAX),
+            "octocat/page/4294967295"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_pages_collects_multiple_pages_from_link_header() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+
+        push_response(
+            &transport,
+            "http://local.test/repos?page=1",
+            200,
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "link".to_string(),
+                    "<http://local.test/repos?page=2>; rel=\"next\", <http://local.test/repos?page=2>; rel=\"last\""
+                        .to_string(),
+                ),
+                ("etag".to_string(), "\"p1\"".to_string()),
+            ],
+            "[{\"id\":1}]",
+        );
+        push_response(
+            &transport,
+            "http://local.test/repos?page=2",
+            200,
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"p2\"".to_string()),
+            ],
+            "[{\"id\":2}]",
+        );
+
+        let octocrab = Octocrab::builder()
+            .build()
+            .expect("octocrab client should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let config = PaginatedFetchConfig {
+            endpoint_type: EndpointType::UserRepos,
+            namespace: "octocat",
+            route_fn: Box::new(|page| format!("/repos?page={}", page)),
+            cache_key_fn: Box::new(|page| format!("octocat/page/{}", page)),
+            expected_total_repos: None,
+            skip_rate_checks: true,
+        };
+
+        let result = client
+            .fetch_pages::<serde_json::Value>(&config, None, None)
+            .await
+            .expect("fetch should succeed");
+
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.stats.pages_fetched, 2);
+        assert_eq!(result.stats.cache_hits, 0);
+        assert!(!result.all_cache_hits);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_pages_not_modified_without_known_total_stops_after_first_page() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        push_response(
+            &transport,
+            "http://local.test/orgs/acme/repos?page=1",
+            304,
+            Vec::new(),
+            "",
+        );
+
+        let octocrab = Octocrab::builder()
+            .build()
+            .expect("octocrab client should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let config = PaginatedFetchConfig {
+            endpoint_type: EndpointType::OrgRepos,
+            namespace: "acme",
+            route_fn: Box::new(|page| format!("/orgs/acme/repos?page={}", page)),
+            cache_key_fn: Box::new(|page| format!("acme/page/{}", page)),
+            expected_total_repos: None,
+            skip_rate_checks: true,
+        };
+
+        let result = client
+            .fetch_pages::<serde_json::Value>(&config, None, None)
+            .await
+            .expect("cache hit should be handled");
+
+        assert!(result.items.is_empty());
+        assert_eq!(result.stats.pages_fetched, 0);
+        assert_eq!(result.stats.cache_hits, 1);
+        assert!(result.all_cache_hits);
+    }
+
+    #[cfg(feature = "migrate")]
+    #[tokio::test]
+    async fn test_fetch_pages_uses_cached_total_pages_to_continue_after_cache_hit() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        push_response(
+            &transport,
+            "http://local.test/repos?page=1",
+            304,
+            Vec::new(),
+            "",
+        );
+        push_response(
+            &transport,
+            "http://local.test/repos?page=2",
+            200,
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"p2\"".to_string()),
+            ],
+            "[{\"id\":2}]",
+        );
+
+        let instance_id = Uuid::new_v4();
+        let db = setup_db(instance_id).await;
+        crate::api_cache::upsert_with_pagination(
+            &db,
+            instance_id,
+            EndpointType::UserRepos,
+            "octocat/page/1",
+            Some("\"cached-p1\"".to_string()),
+            Some(2),
+        )
+        .await
+        .expect("cache seed should succeed");
+
+        let octocrab = Octocrab::builder()
+            .build()
+            .expect("octocrab client should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            instance_id,
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let config = PaginatedFetchConfig {
+            endpoint_type: EndpointType::UserRepos,
+            namespace: "octocat",
+            route_fn: Box::new(|page| format!("/repos?page={}", page)),
+            cache_key_fn: Box::new(|page| format!("octocat/page/{}", page)),
+            expected_total_repos: None,
+            skip_rate_checks: true,
+        };
+
+        let result = client
+            .fetch_pages::<serde_json::Value>(&config, Some(&db), None)
+            .await
+            .expect("fetch should succeed");
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.stats.cache_hits, 1);
+        assert_eq!(result.stats.pages_fetched, 1);
+        assert!(!result.all_cache_hits);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, "http://local.test/repos?page=1");
+        assert_eq!(
+            request_header(&requests[0], "If-None-Match"),
+            Some("\"cached-p1\"".to_string())
+        );
+        assert_eq!(requests[1].url, "http://local.test/repos?page=2");
     }
 }

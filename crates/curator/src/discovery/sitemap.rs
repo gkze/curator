@@ -4,12 +4,15 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use url::Url;
 
+use crate::{HttpMethod, HttpRequest, HttpTransport};
+
 pub async fn collect_sitemap_urls(
-    client: &reqwest::Client,
+    transport: &dyn HttpTransport,
     start_url: &Url,
     max_urls: usize,
+    user_agent: &str,
 ) -> Vec<Url> {
-    let mut sitemap_urls = robots_sitemaps(client, start_url).await;
+    let mut sitemap_urls = robots_sitemaps(transport, start_url, user_agent).await;
 
     if sitemap_urls.is_empty()
         && let Ok(default_sitemap) = start_url.join("/sitemap.xml")
@@ -31,15 +34,7 @@ pub async fn collect_sitemap_urls(
             continue;
         }
 
-        let Ok(response) = client.get(sitemap_url.clone()).send().await else {
-            continue;
-        };
-
-        if !response.status().is_success() {
-            continue;
-        }
-
-        let Ok(body) = response.text().await else {
+        let Some(body) = http_get_text(transport, &sitemap_url, user_agent).await else {
             continue;
         };
 
@@ -67,20 +62,16 @@ pub async fn collect_sitemap_urls(
     urls
 }
 
-async fn robots_sitemaps(client: &reqwest::Client, start_url: &Url) -> Vec<Url> {
+async fn robots_sitemaps(
+    transport: &dyn HttpTransport,
+    start_url: &Url,
+    user_agent: &str,
+) -> Vec<Url> {
     let Ok(robots_url) = start_url.join("/robots.txt") else {
         return Vec::new();
     };
 
-    let Ok(response) = client.get(robots_url).send().await else {
-        return Vec::new();
-    };
-
-    if !response.status().is_success() {
-        return Vec::new();
-    }
-
-    let Ok(body) = response.text().await else {
+    let Some(body) = http_get_text(transport, &robots_url, user_agent).await else {
         return Vec::new();
     };
 
@@ -95,6 +86,26 @@ async fn robots_sitemaps(client: &reqwest::Client, start_url: &Url) -> Vec<Url> 
             }
         })
         .collect()
+}
+
+async fn http_get_text(
+    transport: &dyn HttpTransport,
+    url: &Url,
+    user_agent: &str,
+) -> Option<String> {
+    let request = HttpRequest {
+        method: HttpMethod::Get,
+        url: url.to_string(),
+        headers: vec![("User-Agent".to_string(), user_agent.to_string())],
+        body: Vec::new(),
+    };
+
+    let response = transport.send(request).await.ok()?;
+    if !(200..=299).contains(&response.status) {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&response.body).to_string())
 }
 
 enum SitemapParse {

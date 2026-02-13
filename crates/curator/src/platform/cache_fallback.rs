@@ -125,3 +125,131 @@ pub async fn load_repos_by_instance_and_owner(
         .await
         .map_err(|e| PlatformError::internal(e.to_string()))
 }
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use chrono::Utc;
+    use sea_orm::Database;
+
+    use crate::entity::code_visibility::CodeVisibility;
+
+    use super::*;
+
+    fn model(owner: &str, name: &str) -> Model {
+        Model {
+            id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            platform_id: 1,
+            owner: owner.to_string(),
+            name: name.to_string(),
+            description: None,
+            default_branch: "main".to_string(),
+            topics: serde_json::json!([]),
+            primary_language: None,
+            license_spdx: None,
+            homepage: None,
+            visibility: CodeVisibility::Public,
+            is_fork: false,
+            is_mirror: false,
+            is_archived: false,
+            is_template: false,
+            is_empty: false,
+            stars: None,
+            forks: None,
+            open_issues: None,
+            watchers: None,
+            size_kb: None,
+            has_issues: true,
+            has_wiki: true,
+            has_pull_requests: true,
+            created_at: None,
+            updated_at: None,
+            pushed_at: None,
+            platform_metadata: serde_json::json!({}),
+            synced_at: Utc::now().fixed_offset(),
+            etag: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_cache_hit_fallback_returns_none_without_db() {
+        let result = handle_cache_hit_fallback(
+            None,
+            2,
+            |_db| async { Ok(vec![model("org", "repo")]) },
+            "org",
+            None,
+        )
+        .await
+        .expect("fallback should not fail");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_cache_hit_fallback_emits_cache_events_for_non_empty_models() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite should connect");
+        let events: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_capture = Arc::clone(&events);
+        let callback: ProgressCallback = Box::new(move |event| {
+            events_capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event);
+        });
+
+        let result = handle_cache_hit_fallback(
+            Some(&db),
+            1,
+            |_db| async { Ok(vec![model("org", "repo1"), model("org", "repo2")]) },
+            "org",
+            Some(&callback),
+        )
+        .await
+        .expect("fallback should not fail")
+        .expect("expected cached models");
+
+        assert_eq!(result.len(), 2);
+        let events = events.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(matches!(
+            events.first(),
+            Some(SyncProgress::CacheHit {
+                cached_count: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(SyncProgress::FetchComplete { total: 2, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_streaming_cache_hit_fallback_counts_only_successful_sends() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite should connect");
+        let (tx, rx) = mpsc::channel::<PlatformRepo>(4);
+        drop(rx);
+        let total_sent = Arc::new(AtomicUsize::new(0));
+
+        let streamed = handle_streaming_cache_hit_fallback(
+            Some(&db),
+            1,
+            |_db| async { Ok(vec![model("org", "repo1"), model("org", "repo2")]) },
+            "org",
+            &tx,
+            &total_sent,
+            None,
+        )
+        .await
+        .expect("streaming fallback should not fail");
+
+        assert_eq!(streamed, 2);
+        assert_eq!(total_sent.load(Ordering::Relaxed), 0);
+    }
+}

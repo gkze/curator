@@ -772,6 +772,7 @@ name = "curator_cli"
 version = "0.3.0"
 dependencies = [
  "arboard",
+ "async-trait",
  "chrono",
  "clap",
  "clap_complete",

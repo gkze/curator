@@ -25,6 +25,7 @@
 pub mod api_cache;
 pub mod db;
 pub mod entity;
+mod http;
 pub mod instance;
 pub mod platform;
 pub mod repository;
@@ -60,3 +61,12 @@ pub use platform::{
     RateLimitInfo as PlatformRateLimitInfo, rate_limits, strip_null_values,
 };
 pub use repository::RepositoryError;
+
+// Expose transport primitives for embedders and internal use.
+pub use http::{
+    HttpError, HttpHeaders, HttpMethod, HttpRequest, HttpResponse, HttpTransport, header_get,
+};
+
+// MockTransport is test-only infrastructure.
+#[cfg(test)]
+pub use http::MockTransport;

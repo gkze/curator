@@ -5,7 +5,6 @@ use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use reqwest::{Client, StatusCode, header};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -21,6 +20,9 @@ use crate::platform::{
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
 
+use crate::http::reqwest_transport::ReqwestTransport;
+use crate::http::{HttpHeaders, HttpMethod, HttpRequest, HttpResponse, HttpTransport, header_get};
+
 /// Default Codeberg host.
 pub const CODEBERG_HOST: &str = "https://codeberg.org";
 
@@ -33,7 +35,7 @@ const PAGE_SIZE: u32 = 50;
 /// compatible with Codeberg, Forgejo, and other Gitea-based forges.
 #[derive(Clone)]
 pub struct GiteaClient {
-    client: Client,
+    transport: Arc<dyn HttpTransport>,
     host: String,
     token: String,
     /// The instance ID this client is configured for.
@@ -69,33 +71,34 @@ impl GiteaClient {
         instance_id: Uuid,
         rate_limiter: Option<AdaptiveRateLimiter>,
     ) -> Result<Self, GiteaError> {
-        // Normalize host URL
+        let host = host.trim_end_matches('/');
+        let transport = ReqwestTransport::with_timeout(StdDuration::from_secs(30))
+            .map_err(|e| GiteaError::Config(e.to_string()))?;
+
+        Ok(Self::new_with_transport(
+            host,
+            token,
+            instance_id,
+            rate_limiter,
+            Arc::new(transport),
+        ))
+    }
+
+    pub fn new_with_transport(
+        host: &str,
+        token: &str,
+        instance_id: Uuid,
+        rate_limiter: Option<AdaptiveRateLimiter>,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Self {
         let host = host.trim_end_matches('/').to_string();
-
-        // Build HTTP client with default headers
-        let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::ACCEPT,
-            header::HeaderValue::from_static("application/json"),
-        );
-        headers.insert(
-            header::USER_AGENT,
-            header::HeaderValue::from_static("curator"),
-        );
-
-        let client = Client::builder()
-            .default_headers(headers)
-            .timeout(StdDuration::from_secs(30))
-            .build()
-            .map_err(GiteaError::Http)?;
-
-        Ok(Self {
-            client,
+        Self {
+            transport,
             host,
             token: token.to_string(),
             instance_id,
             rate_limiter,
-        })
+        }
     }
 
     /// Wait for rate limiter if one is configured.
@@ -106,7 +109,7 @@ impl GiteaClient {
     }
 
     /// Update the rate limiter with rate limit info from response headers, if available.
-    fn update_rate_limit(&self, headers: &reqwest::header::HeaderMap) {
+    fn update_rate_limit(&self, headers: &HttpHeaders) {
         if let Some(ref limiter) = self.rate_limiter
             && let Some(info) = Self::parse_rate_limit_headers(headers)
         {
@@ -115,19 +118,16 @@ impl GiteaClient {
     }
 
     /// Extract rate limit info from Gitea response headers.
-    fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Option<RateLimitInfo> {
-        let limit = headers
-            .get("x-ratelimit-limit")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())?;
-        let remaining = headers
-            .get("x-ratelimit-remaining")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())?;
-        let reset_epoch = headers
-            .get("x-ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<i64>().ok())?;
+    fn parse_rate_limit_headers(headers: &HttpHeaders) -> Option<RateLimitInfo> {
+        let limit = header_get(headers, "x-ratelimit-limit")?
+            .parse::<usize>()
+            .ok()?;
+        let remaining = header_get(headers, "x-ratelimit-remaining")?
+            .parse::<usize>()
+            .ok()?;
+        let reset_epoch = header_get(headers, "x-ratelimit-reset")?
+            .parse::<i64>()
+            .ok()?;
         let reset_at = chrono::DateTime::from_timestamp(reset_epoch, 0)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(chrono::Utc::now);
@@ -154,27 +154,34 @@ impl GiteaClient {
         self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1{}", self.host, path);
 
-        let response = self
-            .client
-            .get(&url)
-            .header(header::AUTHORIZATION, format!("token {}", self.token))
-            .send()
-            .await?;
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers: vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("User-Agent".to_string(), "curator".to_string()),
+                ("Authorization".to_string(), format!("token {}", self.token)),
+            ],
+            body: Vec::new(),
+        };
 
-        let status = response.status();
-        let headers = response.headers().clone();
-        self.update_rate_limit(&headers);
+        let response: HttpResponse = self
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GiteaError::Http(e.to_string()))?;
 
-        if !status.is_success() {
-            let message = response.text().await.unwrap_or_default();
+        self.update_rate_limit(&response.headers);
+
+        if !(200..300).contains(&response.status) {
+            let message = String::from_utf8_lossy(&response.body).to_string();
             return Err(GiteaError::Api {
-                status: status.as_u16(),
+                status: response.status,
                 message,
             });
         }
 
-        let body = response.text().await?;
-        serde_json::from_str(&body).map_err(GiteaError::Json)
+        serde_json::from_slice(&response.body).map_err(GiteaError::Json)
     }
 
     /// Make a conditional GET request with optional `If-None-Match` header.
@@ -191,32 +198,35 @@ impl GiteaClient {
         self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1{}", self.host, path);
 
-        let mut request = self
-            .client
-            .get(&url)
-            .header(header::AUTHORIZATION, format!("token {}", self.token));
-
+        let mut headers = vec![
+            ("Accept".to_string(), "application/json".to_string()),
+            ("User-Agent".to_string(), "curator".to_string()),
+            ("Authorization".to_string(), format!("token {}", self.token)),
+        ];
         if let Some(etag) = cached_etag {
-            request = request.header(header::IF_NONE_MATCH, etag);
+            headers.push(("If-None-Match".to_string(), etag.to_string()));
         }
 
-        let response = request.send().await?;
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers,
+            body: Vec::new(),
+        };
 
-        let status = response.status();
-        let headers = response.headers().clone();
-        self.update_rate_limit(&headers);
+        let response = self
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GiteaError::Http(e.to_string()))?;
 
-        match status {
-            StatusCode::NOT_MODIFIED => Ok(platform::FetchResult::NotModified),
-            s if s.is_success() => {
-                let etag = headers
-                    .get(header::ETAG)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+        self.update_rate_limit(&response.headers);
 
-                let body = response.text().await?;
-                let data: T = serde_json::from_str(&body).map_err(GiteaError::Json)?;
-
+        match response.status {
+            304 => Ok(platform::FetchResult::NotModified),
+            s if (200..300).contains(&s) => {
+                let etag = header_get(&response.headers, "etag").map(|s| s.to_string());
+                let data: T = serde_json::from_slice(&response.body).map_err(GiteaError::Json)?;
                 Ok(platform::FetchResult::Fetched {
                     data,
                     etag,
@@ -224,9 +234,9 @@ impl GiteaClient {
                 })
             }
             _ => {
-                let message = response.text().await.unwrap_or_default();
+                let message = String::from_utf8_lossy(&response.body).to_string();
                 Err(GiteaError::Api {
-                    status: status.as_u16(),
+                    status: response.status,
                     message,
                 })
             }
@@ -234,57 +244,73 @@ impl GiteaClient {
     }
 
     /// Make an authenticated PUT request (for starring).
-    async fn put(&self, path: &str) -> Result<StatusCode, GiteaError> {
+    async fn put(&self, path: &str) -> Result<u16, GiteaError> {
         self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1{}", self.host, path);
 
+        let request = HttpRequest {
+            method: HttpMethod::Put,
+            url,
+            headers: vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("User-Agent".to_string(), "curator".to_string()),
+                ("Authorization".to_string(), format!("token {}", self.token)),
+            ],
+            body: Vec::new(),
+        };
+
         let response = self
-            .client
-            .put(&url)
-            .header(header::AUTHORIZATION, format!("token {}", self.token))
-            .send()
-            .await?;
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GiteaError::Http(e.to_string()))?;
 
-        let status = response.status();
-        let headers = response.headers().clone();
-        self.update_rate_limit(&headers);
+        self.update_rate_limit(&response.headers);
 
-        if !status.is_success() && status != StatusCode::NO_CONTENT {
-            let message = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&response.status) && response.status != 204 {
+            let message = String::from_utf8_lossy(&response.body).to_string();
             return Err(GiteaError::Api {
-                status: status.as_u16(),
+                status: response.status,
                 message,
             });
         }
 
-        Ok(status)
+        Ok(response.status)
     }
 
     /// Make an authenticated DELETE request (for unstarring).
-    async fn delete(&self, path: &str) -> Result<StatusCode, GiteaError> {
+    async fn delete(&self, path: &str) -> Result<u16, GiteaError> {
         self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1{}", self.host, path);
 
+        let request = HttpRequest {
+            method: HttpMethod::Delete,
+            url,
+            headers: vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("User-Agent".to_string(), "curator".to_string()),
+                ("Authorization".to_string(), format!("token {}", self.token)),
+            ],
+            body: Vec::new(),
+        };
+
         let response = self
-            .client
-            .delete(&url)
-            .header(header::AUTHORIZATION, format!("token {}", self.token))
-            .send()
-            .await?;
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GiteaError::Http(e.to_string()))?;
 
-        let status = response.status();
-        let headers = response.headers().clone();
-        self.update_rate_limit(&headers);
+        self.update_rate_limit(&response.headers);
 
-        if !status.is_success() && status != StatusCode::NO_CONTENT {
-            let message = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&response.status) && response.status != 204 {
+            let message = String::from_utf8_lossy(&response.body).to_string();
             return Err(GiteaError::Api {
-                status: status.as_u16(),
+                status: response.status,
                 message,
             });
         }
 
-        Ok(status)
+        Ok(response.status)
     }
 
     /// Get rate limit information.
@@ -362,22 +388,31 @@ impl GiteaClient {
         self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1/user/starred/{}/{}", self.host, owner, repo);
 
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers: vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("User-Agent".to_string(), "curator".to_string()),
+                ("Authorization".to_string(), format!("token {}", self.token)),
+            ],
+            body: Vec::new(),
+        };
+
         let response = self
-            .client
-            .get(&url)
-            .header(header::AUTHORIZATION, format!("token {}", self.token))
-            .send()
-            .await?;
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GiteaError::Http(e.to_string()))?;
 
-        let headers = response.headers().clone();
-        self.update_rate_limit(&headers);
+        self.update_rate_limit(&response.headers);
 
-        match response.status() {
-            StatusCode::NO_CONTENT => Ok(true), // 204 = starred
-            StatusCode::NOT_FOUND => Ok(false), // 404 = not starred
+        match response.status {
+            204 => Ok(true),
+            404 => Ok(false),
             status => Err(GiteaError::Api {
-                status: status.as_u16(),
-                message: response.text().await.unwrap_or_default(),
+                status,
+                message: String::from_utf8_lossy(&response.body).to_string(),
             }),
         }
     }
@@ -1067,6 +1102,62 @@ pub fn create_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::{HttpMethod, HttpResponse, MockTransport};
+    use std::sync::Arc;
+
+    fn to_headers(pairs: Vec<(&str, &str)>) -> HttpHeaders {
+        pairs
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn response(status: u16, headers: Vec<(&str, &str)>, body: impl AsRef<[u8]>) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: to_headers(headers),
+            body: body.as_ref().to_vec(),
+        }
+    }
+
+    fn repo_json(id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": format!("repo-{id}"),
+            "full_name": format!("owner/repo-{id}"),
+            "description": null,
+            "default_branch": "main",
+            "private": false,
+            "fork": false,
+            "archived": false,
+            "mirror": false,
+            "empty": false,
+            "template": false,
+            "stars_count": 0,
+            "forks_count": 0,
+            "open_issues_count": 0,
+            "watchers_count": 0,
+            "size": 1,
+            "language": "Rust",
+            "topics": [],
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-02T00:00:00Z",
+            "pushed_at": "2024-01-03T00:00:00Z",
+            "owner": {
+                "id": 1,
+                "login": "owner",
+                "full_name": "Owner",
+                "avatar_url": null
+            },
+            "html_url": format!("https://forge.test/owner/repo-{id}"),
+            "ssh_url": format!("ssh://git@forge.test/owner/repo-{id}.git"),
+            "clone_url": format!("https://forge.test/owner/repo-{id}.git"),
+            "website": null,
+            "has_issues": true,
+            "has_wiki": true,
+            "has_pull_requests": true
+        })
+    }
 
     #[test]
     fn test_rate_limit_info() {
@@ -1110,5 +1201,486 @@ mod tests {
     #[test]
     fn test_codeberg_host() {
         assert_eq!(CODEBERG_HOST, "https://codeberg.org");
+    }
+
+    #[test]
+    fn test_new_normalizes_host_and_sets_instance_id() {
+        let instance_id = Uuid::new_v4();
+        let transport = MockTransport::new();
+        let client = GiteaClient::new_with_transport(
+            "https://codeberg.org/",
+            "token",
+            instance_id,
+            None,
+            Arc::new(transport),
+        );
+
+        assert_eq!(client.host(), "https://codeberg.org");
+        assert_eq!(client.get_instance_id(), instance_id);
+    }
+
+    #[test]
+    fn test_new_normalizes_host_with_multiple_trailing_slashes() {
+        let transport = MockTransport::new();
+        let client = GiteaClient::new_with_transport(
+            "https://forge.example///",
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport),
+        );
+
+        assert_eq!(client.host(), "https://forge.example");
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_success() {
+        let headers = to_headers(vec![
+            ("x-ratelimit-limit", "1000"),
+            ("x-ratelimit-remaining", "777"),
+            ("x-ratelimit-reset", "1706400000"),
+        ]);
+
+        let info = GiteaClient::parse_rate_limit_headers(&headers).expect("headers should parse");
+        assert_eq!(info.limit, 1000);
+        assert_eq!(info.remaining, 777);
+        assert!(info.retry_after.is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_missing_values() {
+        let headers: HttpHeaders = Vec::new();
+        assert!(GiteaClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_number() {
+        let headers = to_headers(vec![
+            ("x-ratelimit-limit", "invalid"),
+            ("x-ratelimit-remaining", "10"),
+            ("x-ratelimit-reset", "1706400000"),
+        ]);
+
+        assert!(GiteaClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_remaining_returns_none() {
+        let headers = to_headers(vec![
+            ("x-ratelimit-limit", "1000"),
+            ("x-ratelimit-remaining", "bad"),
+            ("x-ratelimit-reset", "1706400000"),
+        ]);
+
+        assert!(GiteaClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_reset_number_returns_none() {
+        let headers = to_headers(vec![
+            ("x-ratelimit-limit", "1000"),
+            ("x-ratelimit-remaining", "10"),
+            ("x-ratelimit-reset", "not-a-number"),
+        ]);
+
+        assert!(GiteaClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_reset_falls_back_to_now() {
+        let headers = to_headers(vec![
+            ("x-ratelimit-limit", "1000"),
+            ("x-ratelimit-remaining", "10"),
+            ("x-ratelimit-reset", "9223372036854775807"),
+        ]);
+
+        let before = Utc::now();
+        let info = GiteaClient::parse_rate_limit_headers(&headers).expect("headers should parse");
+        assert_eq!(info.limit, 1000);
+        assert_eq!(info.remaining, 10);
+        assert!(info.reset_at >= before);
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_zero_reset_epoch() {
+        let headers = to_headers(vec![
+            ("x-ratelimit-limit", "1000"),
+            ("x-ratelimit-remaining", "250"),
+            ("x-ratelimit-reset", "0"),
+        ]);
+
+        let info = GiteaClient::parse_rate_limit_headers(&headers).expect("headers should parse");
+        assert_eq!(info.limit, 1000);
+        assert_eq!(info.remaining, 250);
+        assert_eq!(info.reset_at.timestamp(), 0);
+    }
+
+    #[test]
+    fn test_get_rate_limit_without_limiter_uses_defaults() {
+        let transport = MockTransport::new();
+        let client = GiteaClient::new_with_transport(
+            "https://codeberg.org",
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport),
+        );
+
+        let info = client.get_rate_limit();
+        assert_eq!(info.limit, 1000);
+        assert_eq!(info.remaining, 1000);
+        assert!(info.retry_after.is_none());
+    }
+
+    #[test]
+    fn test_get_rate_limit_with_limiter_uses_current_rps() {
+        let limiter = AdaptiveRateLimiter::new(5);
+        let transport = MockTransport::new();
+        let client = GiteaClient::new_with_transport(
+            "https://codeberg.org",
+            "token",
+            Uuid::new_v4(),
+            Some(limiter),
+            Arc::new(transport),
+        );
+
+        let info = client.get_rate_limit();
+        assert_eq!(info.limit, 300);
+        assert_eq!(info.remaining, 300);
+        assert!(info.retry_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_conditional_not_modified_returns_cache_hit() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred?page=1&limit=50"),
+            response(304, vec![], ""),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport.clone()),
+        );
+
+        let result = client
+            .get_conditional::<Vec<GiteaRepo>>("/user/starred?page=1&limit=50", Some("etag-1"))
+            .await
+            .expect("request should succeed");
+
+        assert!(matches!(result, platform::FetchResult::NotModified));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v == "etag-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_conditional_error_status_maps_to_api_error() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred?page=1&limit=50"),
+            response(429, vec![], "slow down"),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport),
+        );
+
+        let err = client
+            .get_conditional::<Vec<GiteaRepo>>("/user/starred?page=1&limit=50", None)
+            .await
+            .expect_err("429 should return an API error");
+
+        match err {
+            GiteaError::Api { status, message } => {
+                assert_eq!(status, 429);
+                assert_eq!(message, "slow down");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_org_repos_paginates_until_partial_page() {
+        let first_page = serde_json::to_string(&vec![repo_json(1); PAGE_SIZE as usize])
+            .expect("first page should serialize");
+        let second_page = serde_json::to_string(&vec![repo_json(2), repo_json(3)])
+            .expect("second page should serialize");
+
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/orgs/acme/repos?page=1&limit=50"),
+            response(200, vec![("Content-Type", "application/json")], first_page),
+        );
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/orgs/acme/repos?page=2&limit=50"),
+            response(200, vec![("Content-Type", "application/json")], second_page),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport.clone()),
+        );
+
+        let repos = client
+            .list_org_repos("acme")
+            .await
+            .expect("paginated fetch should succeed");
+
+        assert_eq!(repos.len(), PAGE_SIZE as usize + 2);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].url,
+            format!("{host}/api/v1/orgs/acme/repos?page=1&limit=50")
+        );
+        assert_eq!(
+            requests[1].url,
+            format!("{host}/api/v1/orgs/acme/repos?page=2&limit=50")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_starred_repos_internal_stops_after_partial_batch() {
+        let first_page = serde_json::to_string(&vec![repo_json(10); PAGE_SIZE as usize])
+            .expect("first page should serialize");
+        let second_page =
+            serde_json::to_string(&vec![repo_json(20)]).expect("second page should serialize");
+
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred?page=1&limit=50"),
+            response(200, vec![("Content-Type", "application/json")], first_page),
+        );
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred?page=2&limit=50"),
+            response(200, vec![("Content-Type", "application/json")], second_page),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport.clone()),
+        );
+
+        let repos = client
+            .list_starred_repos_internal(1)
+            .await
+            .expect("starred pagination should succeed");
+
+        assert_eq!(repos.len(), PAGE_SIZE as usize + 1);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].url,
+            format!("{host}/api/v1/user/starred?page=1&limit=50")
+        );
+        assert_eq!(
+            requests[1].url,
+            format!("{host}/api/v1/user/starred?page=2&limit=50")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_starred_repos_internal_continues_after_error_until_partial_page() {
+        let first_page = serde_json::to_string(&vec![repo_json(10); PAGE_SIZE as usize])
+            .expect("first page should serialize");
+        let third_page =
+            serde_json::to_string(&vec![repo_json(30)]).expect("third page should serialize");
+
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred?page=1&limit=50"),
+            response(200, vec![("Content-Type", "application/json")], first_page),
+        );
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred?page=2&limit=50"),
+            response(500, vec![], "boom"),
+        );
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred?page=3&limit=50"),
+            response(200, vec![("Content-Type", "application/json")], third_page),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport.clone()),
+        );
+
+        let repos = client
+            .list_starred_repos_internal(1)
+            .await
+            .expect("starred pagination should succeed despite one failed page");
+
+        assert_eq!(repos.len(), PAGE_SIZE as usize + 1);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1].url,
+            format!("{host}/api/v1/user/starred?page=2&limit=50")
+        );
+        assert_eq!(
+            requests[2].url,
+            format!("{host}/api/v1/user/starred?page=3&limit=50")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_repo_starred_returns_true_for_no_content() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred/owner/repo"),
+            response(204, vec![], ""),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport),
+        );
+
+        let is_starred = client
+            .is_repo_starred("owner", "repo")
+            .await
+            .expect("204 should map to starred");
+
+        assert!(is_starred);
+    }
+
+    #[tokio::test]
+    async fn test_is_repo_starred_unexpected_status_returns_api_error() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred/owner/repo"),
+            response(500, vec![], "boom"),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport),
+        );
+
+        let err = client
+            .is_repo_starred("owner", "repo")
+            .await
+            .expect_err("500 should map to API error");
+
+        match err {
+            GiteaError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_star_repo_returns_false_without_put_when_already_starred() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred/owner/repo"),
+            response(204, vec![], ""),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport.clone()),
+        );
+
+        let changed = client
+            .star_repo("owner", "repo")
+            .await
+            .expect("already-starred branch should succeed");
+
+        assert!(!changed);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url,
+            format!("{host}/api/v1/user/starred/owner/repo")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unstar_repo_internal_returns_false_without_delete_when_not_starred() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred/owner/repo"),
+            response(404, vec![], "not starred"),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport.clone()),
+        );
+
+        let changed = client
+            .unstar_repo_internal("owner", "repo")
+            .await
+            .expect("not-starred branch should succeed");
+
+        assert!(!changed);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url,
+            format!("{host}/api/v1/user/starred/owner/repo")
+        );
     }
 }

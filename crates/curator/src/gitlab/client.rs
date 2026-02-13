@@ -1,6 +1,6 @@
 //! GitLab API client creation and management.
 //!
-//! Wraps the Progenitor-generated client from [`super::api`] with pagination,
+//! Uses the [`HttpTransport`] trait for all HTTP I/O, with pagination,
 //! rate-limit header parsing, and starred-project caching.
 
 use std::collections::HashSet;
@@ -8,13 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use reqwest::header::{self, HeaderMap, HeaderValue};
 use sea_orm::DatabaseConnection;
 use tokio::sync::Mutex;
 
 use uuid::Uuid;
 
-use super::api;
 use super::convert::to_platform_repo;
 use super::error::{GitLabError, is_rate_limit_error, short_error_message};
 use super::types::{GitLabGroup, GitLabProject, GitLabUser};
@@ -30,19 +28,25 @@ use crate::platform::{
 use crate::retry::with_retry;
 use crate::sync::{SyncProgress, emit};
 
-/// GitLab API client backed by the Progenitor-generated typed client.
+use crate::http::reqwest_transport::ReqwestTransport;
+use crate::http::{HttpHeaders, HttpMethod, HttpRequest, HttpTransport, header_get};
+
+/// GitLab API client backed by the [`HttpTransport`] abstraction.
 ///
-/// The inner [`api::Client`] provides typed methods for each endpoint defined
-/// in the trimmed OpenAPI spec.  This wrapper adds:
-/// - Automatic pagination (the generated methods return a single page)
-/// - Rate-limit header parsing via [`progenitor_client::ResponseValue::headers`]
+/// All HTTP I/O goes through the injected transport, enabling unit tests
+/// via [`MockTransport`](crate::MockTransport) without a running server.
+///
+/// Key capabilities:
+/// - Automatic pagination with ETag caching per page
+/// - Rate-limit header parsing and adaptive pacing
 /// - Starred-project caching for efficient `is_repo_starred` checks
 #[derive(Clone)]
 pub struct GitLabClient {
-    /// Progenitor-generated typed client.
-    api: api::Client,
+    transport: Arc<dyn HttpTransport>,
     /// Normalised host URL (e.g. `https://gitlab.com`).
     host: String,
+    /// The authentication token (PAT or OAuth access token).
+    token: Arc<String>,
     /// Starred projects cache to avoid re-fetching.
     starred_projects_cache: Arc<Mutex<Option<StarredProjectsCache>>>,
     /// The instance ID this client is configured for.
@@ -60,8 +64,7 @@ struct StarredProjectsCache {
 impl GitLabClient {
     /// Create a new GitLab client.
     ///
-    /// Builds a [`reqwest::Client`] with the supplied token and passes it to
-    /// the Progenitor-generated client via [`api::Client::new_with_client`].
+    /// Builds a real HTTP transport for GitLab API calls.
     pub async fn new(
         host: &str,
         token: &str,
@@ -74,36 +77,40 @@ impl GitLabClient {
             .trim_end_matches('/');
 
         let base_url = format!("https://{}", host_only);
-        let normalized_host = base_url.clone();
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "PRIVATE-TOKEN",
-            HeaderValue::from_str(token)
-                .map_err(|e| GitLabError::Auth(format!("Invalid token: {}", e)))?,
-        );
-        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        let _ = reqwest::header::HeaderValue::from_str(token)
+            .map_err(|e| GitLabError::Auth(format!("Invalid token: {}", e)))?;
 
         let http = reqwest::Client::builder()
-            .default_headers(headers)
             .user_agent("curator")
             .build()
             .map_err(|e| GitLabError::Http(format!("Failed to build HTTP client: {}", e)))?;
+        let transport = Arc::new(ReqwestTransport::new(http));
 
-        let api = api::Client::new_with_client(&base_url, http);
+        let client =
+            Self::new_with_transport(&base_url, token, instance_id, rate_limiter, transport);
 
-        // Validate the token with a typed call
-        let resp = api.get_api_v4_user().await.map_err(GitLabError::from)?;
-        // Discard the body; we only needed to check auth succeeds
-        let _ = resp.into_inner();
+        // Validate credentials with a lightweight call.
+        let _ = client.get_user_info().await?;
 
-        Ok(Self {
-            api,
-            host: normalized_host,
+        Ok(client)
+    }
+
+    pub fn new_with_transport(
+        host: &str,
+        token: &str,
+        instance_id: Uuid,
+        rate_limiter: Option<AdaptiveRateLimiter>,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Self {
+        let host = host.trim_end_matches('/').to_string();
+        Self {
+            transport,
+            host,
+            token: Arc::new(token.to_string()),
             starred_projects_cache: Arc::new(Mutex::new(None)),
             instance_id,
             rate_limiter,
-        })
+        }
     }
 
     /// Wait for rate limiter if one is configured.
@@ -113,8 +120,32 @@ impl GitLabClient {
         }
     }
 
+    fn default_headers(&self) -> HttpHeaders {
+        vec![
+            ("PRIVATE-TOKEN".to_string(), self.token.as_str().to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+            ("User-Agent".to_string(), "curator".to_string()),
+        ]
+    }
+
+    fn url_encode_component(input: &str) -> String {
+        let mut out = String::new();
+        for &b in input.as_bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char);
+                }
+                _ => {
+                    use std::fmt::Write;
+                    let _ = write!(&mut out, "%{:02X}", b);
+                }
+            }
+        }
+        out
+    }
+
     /// Update the rate limiter with rate limit info from response headers, if available.
-    fn update_rate_limit(&self, headers: &reqwest::header::HeaderMap) {
+    fn update_rate_limit(&self, headers: &HttpHeaders) {
         if let Some(ref limiter) = self.rate_limiter
             && let Some(info) = Self::parse_rate_limit_headers(headers)
         {
@@ -138,37 +169,34 @@ impl GitLabClient {
     ) -> Result<FetchResult<T>, GitLabError> {
         self.wait_for_rate_limit().await;
 
-        let mut request = self.api.client.get(url);
-
+        let mut headers = self.default_headers();
         if let Some(etag) = cached_etag {
-            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+            headers.push(("If-None-Match".to_string(), etag.to_string()));
         }
 
-        let response = request
-            .send()
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url: url.to_string(),
+            headers,
+            body: Vec::new(),
+        };
+
+        let response = self
+            .transport
+            .send(request)
             .await
             .map_err(|e| GitLabError::Http(format!("HTTP request failed: {}", e)))?;
 
-        let status = response.status();
-        let headers = response.headers().clone();
-        self.update_rate_limit(&headers);
+        self.update_rate_limit(&response.headers);
 
-        match status {
-            reqwest::StatusCode::NOT_MODIFIED => Ok(FetchResult::NotModified),
-            s if s.is_success() => {
-                let etag = headers
-                    .get(reqwest::header::ETAG)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+        match response.status {
+            304 => Ok(FetchResult::NotModified),
+            status if (200..=299).contains(&status) => {
+                let etag = header_get(&response.headers, "etag").map(|s| s.to_string());
+                let total_pages: Option<i32> = header_get(&response.headers, "x-total-pages")
+                    .and_then(|v| v.parse::<i32>().ok());
 
-                let total_pages: Option<i32> = headers
-                    .get("x-total-pages")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse().ok());
-
-                let data: T = response
-                    .json()
-                    .await
+                let data: T = serde_json::from_slice(&response.body)
                     .map_err(|e| GitLabError::Deserialize(format!("JSON parse error: {}", e)))?;
 
                 Ok(FetchResult::Fetched {
@@ -177,31 +205,26 @@ impl GitLabClient {
                     pagination: PaginationInfo::from_total_pages(total_pages),
                 })
             }
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                Err(GitLabError::Auth("Authentication failed".to_string()))
-            }
-            reqwest::StatusCode::NOT_FOUND => Err(GitLabError::Api(format!("Not found: {}", url))),
-            _ => {
-                let body = response.text().await.unwrap_or_default();
-                Err(GitLabError::from_status(status, &body))
+            401 | 403 => Err(GitLabError::Auth("Authentication failed".to_string())),
+            404 => Err(GitLabError::Api(format!("Not found: {}", url))),
+            status => {
+                let body = String::from_utf8_lossy(&response.body).to_string();
+                Err(GitLabError::from_status_code(status, &body))
             }
         }
     }
 
     /// Extract rate limit info from response headers.
-    fn parse_rate_limit_headers(headers: &HeaderMap) -> Option<RateLimitInfo> {
-        let limit = headers
-            .get("ratelimit-limit")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())?;
-        let remaining = headers
-            .get("ratelimit-remaining")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())?;
-        let reset_epoch = headers
-            .get("ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<i64>().ok())?;
+    fn parse_rate_limit_headers(headers: &HttpHeaders) -> Option<RateLimitInfo> {
+        let limit = header_get(headers, "ratelimit-limit")?
+            .parse::<usize>()
+            .ok()?;
+        let remaining = header_get(headers, "ratelimit-remaining")?
+            .parse::<usize>()
+            .ok()?;
+        let reset_epoch = header_get(headers, "ratelimit-reset")?
+            .parse::<i64>()
+            .ok()?;
 
         let reset_at = chrono::DateTime::from_timestamp(reset_epoch, 0)
             .map(|dt| dt.with_timezone(&Utc))
@@ -367,12 +390,30 @@ impl GitLabClient {
     /// Get information about the authenticated user.
     pub async fn get_user_info(&self) -> Result<GitLabUser, GitLabError> {
         self.wait_for_rate_limit().await;
-        let resp = self
-            .api
-            .get_api_v4_user()
+
+        let url = format!("{}/api/v4/user", self.host);
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers: self.default_headers(),
+            body: Vec::new(),
+        };
+
+        let response = self
+            .transport
+            .send(request)
             .await
-            .map_err(GitLabError::from)?;
-        Ok(GitLabUser::from(resp.into_inner()))
+            .map_err(|e| GitLabError::Http(format!("HTTP request failed: {}", e)))?;
+
+        self.update_rate_limit(&response.headers);
+
+        if !(200..=299).contains(&response.status) {
+            let body = String::from_utf8_lossy(&response.body).to_string();
+            return Err(GitLabError::from_status_code(response.status, &body));
+        }
+
+        serde_json::from_slice::<GitLabUser>(&response.body)
+            .map_err(|e| GitLabError::Deserialize(format!("JSON parse error: {}", e)))
     }
 
     /// List all projects for a specific user with automatic pagination and
@@ -406,25 +447,30 @@ impl GitLabClient {
     /// fall back to the inner reqwest client for this one lookup.
     async fn resolve_user_id(&self, username: &str) -> Result<u64, GitLabError> {
         self.wait_for_rate_limit().await;
-        let url = format!("{}/api/v4/users", self.host);
-        let resp = self
-            .api
-            .client
-            .get(&url)
-            .query(&[("username", username)])
-            .send()
-            .await
-            .map_err(GitLabError::from)?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(GitLabError::from_status(status, &body));
+        let encoded_username = Self::url_encode_component(username);
+        let url = format!("{}/api/v4/users?username={}", self.host, encoded_username);
+
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers: self.default_headers(),
+            body: Vec::new(),
+        };
+        let response = self
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GitLabError::Http(format!("HTTP request failed: {}", e)))?;
+
+        self.update_rate_limit(&response.headers);
+
+        if !(200..=299).contains(&response.status) {
+            let body = String::from_utf8_lossy(&response.body).to_string();
+            return Err(GitLabError::from_status_code(response.status, &body));
         }
 
-        let users: Vec<serde_json::Value> = resp
-            .json()
-            .await
+        let users: Vec<serde_json::Value> = serde_json::from_slice(&response.body)
             .map_err(|e| GitLabError::Deserialize(format!("Failed to parse users list: {}", e)))?;
 
         users
@@ -439,15 +485,30 @@ impl GitLabClient {
     /// Returns `Ok(true)` if the project was starred, `Ok(false)` if already starred.
     pub async fn star_project(&self, project_id: u64) -> Result<bool, GitLabError> {
         self.wait_for_rate_limit().await;
-        let id_str = project_id.to_string();
-        match self.api.post_api_v4_projects_id_star(&id_str).await {
-            Ok(_) => Ok(true),
-            Err(progenitor_client::Error::ErrorResponse(rv))
-                if rv.status() == reqwest::StatusCode::NOT_MODIFIED =>
-            {
-                Ok(false)
+
+        let url = format!("{}/api/v4/projects/{}/star", self.host, project_id);
+        let request = HttpRequest {
+            method: HttpMethod::Post,
+            url,
+            headers: self.default_headers(),
+            body: Vec::new(),
+        };
+
+        let response = self
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GitLabError::Http(format!("HTTP request failed: {}", e)))?;
+
+        self.update_rate_limit(&response.headers);
+
+        match response.status {
+            304 => Ok(false),
+            status if (200..=299).contains(&status) => Ok(true),
+            status => {
+                let body = String::from_utf8_lossy(&response.body).to_string();
+                Err(GitLabError::from_status_code(status, &body))
             }
-            Err(e) => Err(GitLabError::from(e)),
         }
     }
 
@@ -456,15 +517,30 @@ impl GitLabClient {
     /// Returns `Ok(true)` if the project was unstarred, `Ok(false)` if wasn't starred.
     pub async fn unstar_project(&self, project_id: u64) -> Result<bool, GitLabError> {
         self.wait_for_rate_limit().await;
-        let id_str = project_id.to_string();
-        match self.api.post_api_v4_projects_id_unstar(&id_str).await {
-            Ok(_) => Ok(true),
-            Err(progenitor_client::Error::ErrorResponse(rv))
-                if rv.status() == reqwest::StatusCode::NOT_MODIFIED =>
-            {
-                Ok(false)
+
+        let url = format!("{}/api/v4/projects/{}/unstar", self.host, project_id);
+        let request = HttpRequest {
+            method: HttpMethod::Post,
+            url,
+            headers: self.default_headers(),
+            body: Vec::new(),
+        };
+
+        let response = self
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GitLabError::Http(format!("HTTP request failed: {}", e)))?;
+
+        self.update_rate_limit(&response.headers);
+
+        match response.status {
+            304 => Ok(false),
+            status if (200..=299).contains(&status) => Ok(true),
+            status => {
+                let body = String::from_utf8_lossy(&response.body).to_string();
+                Err(GitLabError::from_status_code(status, &body))
             }
-            Err(e) => Err(GitLabError::from(e)),
         }
     }
 
@@ -499,20 +575,29 @@ impl GitLabClient {
     /// Get information about a group.
     pub async fn get_group_info(&self, group: &str) -> Result<OrgInfo, GitLabError> {
         self.wait_for_rate_limit().await;
-        let resp = self
-            .api
-            .get_api_v4_groups_id(
-                group, None, // custom_attributes
-                None, // with_projects
-            )
-            .await;
 
-        match resp {
-            Ok(rv) => {
-                let detail: GitLabGroup = rv.into_inner().into();
+        let encoded_group = group.replace('/', "%2F");
+        let url = format!("{}/api/v4/groups/{}", self.host, encoded_group);
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers: self.default_headers(),
+            body: Vec::new(),
+        };
 
-                // Fetch project count via a lightweight per_page=1 request
-                let encoded_group = group.replace('/', "%2F");
+        let response = self
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GitLabError::Http(format!("HTTP request failed: {}", e)))?;
+        self.update_rate_limit(&response.headers);
+
+        match response.status {
+            404 => Err(GitLabError::GroupNotFound(group.to_string())),
+            status if (200..=299).contains(&status) => {
+                let detail: GitLabGroup = serde_json::from_slice(&response.body)
+                    .map_err(|e| GitLabError::Deserialize(format!("JSON parse error: {}", e)))?;
+
                 let repo_count = self.get_group_project_count(&encoded_group).await;
 
                 Ok(OrgInfo {
@@ -521,12 +606,10 @@ impl GitLabClient {
                     description: detail.description,
                 })
             }
-            Err(progenitor_client::Error::ErrorResponse(rv))
-                if rv.status() == reqwest::StatusCode::NOT_FOUND =>
-            {
-                Err(GitLabError::GroupNotFound(group.to_string()))
+            status => {
+                let body = String::from_utf8_lossy(&response.body).to_string();
+                Err(GitLabError::from_status_code(status, &body))
             }
-            Err(e) => Err(GitLabError::from(e)),
         }
     }
 
@@ -542,71 +625,58 @@ impl GitLabClient {
             self.host, encoded_group,
         );
 
-        let Ok(response) = self.api.client.get(&url).send().await else {
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers: self.default_headers(),
+            body: Vec::new(),
+        };
+
+        let Ok(response) = self.transport.send(request).await else {
             return 0;
         };
 
-        if !response.status().is_success() {
+        self.update_rate_limit(&response.headers);
+
+        if !(200..=299).contains(&response.status) {
             return 0;
         }
 
-        response
-            .headers()
-            .get("x-total")
-            .and_then(|v| v.to_str().ok())
+        header_get(&response.headers, "x-total")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0)
-    }
-
-    /// Get the followers count for the authenticated user via a raw API request.
-    ///
-    /// The progenitor-generated `CurrentUser` type doesn't include the
-    /// `followers` field, so we parse it from the raw JSON response.
-    async fn get_user_followers_count(&self) -> usize {
-        self.wait_for_rate_limit().await;
-
-        let url = format!("{}/api/v4/user", self.host);
-
-        let Ok(response) = self.api.client.get(&url).send().await else {
-            return 0;
-        };
-
-        if !response.status().is_success() {
-            return 0;
-        }
-
-        let Ok(json) = response.json::<serde_json::Value>().await else {
-            return 0;
-        };
-
-        json.get("followers").and_then(|v| v.as_u64()).unwrap_or(0) as usize
     }
 
     /// Look up a project by its full path (owner/name).
     async fn get_project_by_path(&self, full_path: &str) -> Result<GitLabProject, GitLabError> {
         self.wait_for_rate_limit().await;
-        let resp = self
-            .api
-            .get_api_v4_projects_id(
-                full_path, None, // license
-                None, // statistics
-                None, // with_custom_attributes
-            )
-            .await;
 
-        match resp {
-            Ok(rv) => Ok(GitLabProject::from(rv.into_inner())),
-            Err(progenitor_client::Error::ErrorResponse(rv))
-                if rv.status() == reqwest::StatusCode::NOT_FOUND =>
-            {
-                Err(GitLabError::ProjectNotFound(full_path.to_string()))
+        let encoded = full_path.replace('/', "%2F");
+        let url = format!("{}/api/v4/projects/{}", self.host, encoded);
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers: self.default_headers(),
+            body: Vec::new(),
+        };
+
+        let response = self
+            .transport
+            .send(request)
+            .await
+            .map_err(|e| GitLabError::Http(format!("HTTP request failed: {}", e)))?;
+        self.update_rate_limit(&response.headers);
+
+        match response.status {
+            404 => Err(GitLabError::ProjectNotFound(full_path.to_string())),
+            status if (200..=299).contains(&status) => {
+                serde_json::from_slice::<GitLabProject>(&response.body)
+                    .map_err(|e| GitLabError::Deserialize(format!("JSON parse error: {}", e)))
             }
-            Err(progenitor_client::Error::UnexpectedResponse(rv))
-                if rv.status() == reqwest::StatusCode::NOT_FOUND =>
-            {
-                Err(GitLabError::ProjectNotFound(full_path.to_string()))
+            status => {
+                let body = String::from_utf8_lossy(&response.body).to_string();
+                Err(GitLabError::from_status_code(status, &body))
             }
-            Err(e) => Err(GitLabError::from(e)),
         }
     }
 
@@ -646,8 +716,16 @@ impl GitLabClient {
     /// Makes a lightweight request to extract rate limit headers. Falls back to
     /// hardcoded defaults if headers aren't present.
     pub async fn get_rate_limit(&self) -> RateLimitInfo {
-        if let Ok(resp) = self.api.get_api_v4_user().await
-            && let Some(info) = Self::parse_rate_limit_headers(resp.headers())
+        let url = format!("{}/api/v4/user", self.host);
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url,
+            headers: self.default_headers(),
+            body: Vec::new(),
+        };
+
+        if let Ok(resp) = self.transport.send(request).await
+            && let Some(info) = Self::parse_rate_limit_headers(&resp.headers)
         {
             return info;
         }
@@ -687,17 +765,13 @@ impl PlatformClient for GitLabClient {
     async fn get_authenticated_user(&self) -> platform::Result<UserInfo> {
         let user = self.get_user_info().await?;
 
-        // Fetch followers count via raw request since the generated
-        // CurrentUser type doesn't include it
-        let followers = self.get_user_followers_count().await;
-
         Ok(UserInfo {
             username: user.username,
             name: user.name,
             email: user.email.or(user.public_email),
             bio: user.bio,
             public_repos: 0,
-            followers,
+            followers: user.followers,
         })
     }
 
@@ -1443,6 +1517,149 @@ pub async fn create_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use chrono::Duration;
+    #[cfg(feature = "migrate")]
+    use sea_orm::ActiveValue::Set;
+    #[cfg(feature = "migrate")]
+    use sea_orm::EntityTrait;
+
+    use crate::{HttpHeaders, HttpMethod, HttpRequest, HttpResponse, HttpTransport, MockTransport};
+
+    const TEST_BASE_URL: &str = "http://local.test";
+
+    fn push_response(
+        transport: &MockTransport,
+        method: HttpMethod,
+        url: &str,
+        status: u16,
+        headers: HttpHeaders,
+        body: &str,
+    ) {
+        transport.push_response(
+            method,
+            url.to_string(),
+            HttpResponse {
+                status,
+                headers,
+                body: body.as_bytes().to_vec(),
+            },
+        );
+    }
+
+    fn request_header(req: &HttpRequest, name: &str) -> Option<String> {
+        crate::header_get(&req.headers, name).map(|v| v.to_string())
+    }
+
+    fn project_json(path_with_namespace: &str) -> serde_json::Value {
+        let path = path_with_namespace
+            .rsplit('/')
+            .next()
+            .unwrap_or(path_with_namespace);
+        let namespace = path_with_namespace
+            .split('/')
+            .next()
+            .unwrap_or("owner")
+            .to_string();
+
+        serde_json::json!({
+            "id": 1,
+            "name": path,
+            "path": path,
+            "path_with_namespace": path_with_namespace,
+            "description": null,
+            "default_branch": "main",
+            "visibility": "public",
+            "archived": false,
+            "topics": [],
+            "star_count": 0,
+            "forks_count": 0,
+            "open_issues_count": 0,
+            "created_at": "2024-01-01T00:00:00Z",
+            "last_activity_at": "2024-01-02T00:00:00Z",
+            "namespace": {
+                "id": 1,
+                "name": namespace.clone(),
+                "path": namespace.clone(),
+                "full_path": namespace,
+                "kind": "group"
+            },
+            "forked_from_project": null,
+            "mirror": false,
+            "issues_enabled": true,
+            "wiki_enabled": true,
+            "merge_requests_enabled": true,
+            "web_url": format!("https://gitlab.test/{path_with_namespace}"),
+            "ssh_url_to_repo": format!("git@gitlab.test:{path_with_namespace}.git"),
+            "http_url_to_repo": format!("https://gitlab.test/{path_with_namespace}.git")
+        })
+    }
+
+    fn test_client(
+        host: &str,
+        instance_id: Uuid,
+        transport: Arc<dyn HttpTransport>,
+    ) -> GitLabClient {
+        GitLabClient::new_with_transport(host, "test-token", instance_id, None, transport)
+    }
+
+    fn mock_project(path_with_namespace: &str) -> GitLabProject {
+        GitLabProject {
+            id: 1,
+            name: "repo".to_string(),
+            path: "repo".to_string(),
+            path_with_namespace: path_with_namespace.to_string(),
+            description: None,
+            default_branch: Some("main".to_string()),
+            visibility: "public".to_string(),
+            archived: false,
+            topics: vec![],
+            star_count: 0,
+            forks_count: 0,
+            open_issues_count: Some(0),
+            created_at: Utc::now() - Duration::days(10),
+            last_activity_at: Utc::now() - Duration::days(1),
+            namespace: crate::gitlab::types::GitLabNamespace {
+                id: 1,
+                name: "owner".to_string(),
+                path: "owner".to_string(),
+                full_path: "owner".to_string(),
+                kind: "group".to_string(),
+            },
+            forked_from_project: None,
+            mirror: Some(false),
+            issues_enabled: Some(true),
+            wiki_enabled: Some(true),
+            merge_requests_enabled: Some(true),
+            web_url: "https://gitlab.example.com/owner/repo".to_string(),
+            ssh_url_to_repo: Some("git@gitlab.example.com:owner/repo.git".to_string()),
+            http_url_to_repo: Some("https://gitlab.example.com/owner/repo.git".to_string()),
+        }
+    }
+
+    #[cfg(feature = "migrate")]
+    async fn setup_db(instance_id: Uuid) -> sea_orm::DatabaseConnection {
+        let db = crate::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("test db should migrate");
+
+        let now = chrono::Utc::now().fixed_offset();
+        crate::entity::instance::Entity::insert(crate::entity::instance::ActiveModel {
+            id: Set(instance_id),
+            name: Set("gitlab-test".to_string()),
+            platform_type: Set(crate::entity::platform_type::PlatformType::GitLab),
+            host: Set("gitlab.test".to_string()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set("auto".to_string()),
+            created_at: Set(now),
+        })
+        .exec(&db)
+        .await
+        .expect("instance should insert");
+
+        db
+    }
 
     #[test]
     fn test_rate_limit_info() {
@@ -1483,10 +1700,11 @@ mod tests {
 
     #[test]
     fn test_parse_rate_limit_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert("ratelimit-limit", HeaderValue::from_static("2000"));
-        headers.insert("ratelimit-remaining", HeaderValue::from_static("1999"));
-        headers.insert("ratelimit-reset", HeaderValue::from_static("1706400000"));
+        let headers: HttpHeaders = vec![
+            ("ratelimit-limit".to_string(), "2000".to_string()),
+            ("ratelimit-remaining".to_string(), "1999".to_string()),
+            ("ratelimit-reset".to_string(), "1706400000".to_string()),
+        ];
 
         let info = GitLabClient::parse_rate_limit_headers(&headers).unwrap();
         assert_eq!(info.limit, 2000);
@@ -1495,7 +1713,478 @@ mod tests {
 
     #[test]
     fn test_parse_rate_limit_headers_missing() {
-        let headers = HeaderMap::new();
+        let headers: HttpHeaders = Vec::new();
         assert!(GitLabClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_numbers() {
+        let headers: HttpHeaders = vec![
+            ("ratelimit-limit".to_string(), "abc".to_string()),
+            ("ratelimit-remaining".to_string(), "100".to_string()),
+            ("ratelimit-reset".to_string(), "1706400000".to_string()),
+        ];
+
+        assert!(GitLabClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_remaining_returns_none() {
+        let headers: HttpHeaders = vec![
+            ("ratelimit-limit".to_string(), "2000".to_string()),
+            ("ratelimit-remaining".to_string(), "oops".to_string()),
+            ("ratelimit-reset".to_string(), "1706400000".to_string()),
+        ];
+
+        assert!(GitLabClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_timestamp_falls_back() {
+        let headers: HttpHeaders = vec![
+            ("ratelimit-limit".to_string(), "2000".to_string()),
+            ("ratelimit-remaining".to_string(), "1999".to_string()),
+            (
+                "ratelimit-reset".to_string(),
+                "9223372036854775807".to_string(),
+            ),
+        ];
+
+        let now = Utc::now();
+        let info = GitLabClient::parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.limit, 2000);
+        assert_eq!(info.remaining, 1999);
+        assert!(info.reset_at >= now);
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_invalid_reset_number_returns_none() {
+        let headers: HttpHeaders = vec![
+            ("ratelimit-limit".to_string(), "2000".to_string()),
+            ("ratelimit-remaining".to_string(), "1999".to_string()),
+            ("ratelimit-reset".to_string(), "not-a-number".to_string()),
+        ];
+
+        assert!(GitLabClient::parse_rate_limit_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_valid_timestamp_round_trip() {
+        let headers: HttpHeaders = vec![
+            ("ratelimit-limit".to_string(), "120".to_string()),
+            ("ratelimit-remaining".to_string(), "60".to_string()),
+            ("ratelimit-reset".to_string(), "1706400000".to_string()),
+        ];
+
+        let info = GitLabClient::parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.reset_at.timestamp(), 1706400000);
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_zero_reset_timestamp() {
+        let headers: HttpHeaders = vec![
+            ("ratelimit-limit".to_string(), "7".to_string()),
+            ("ratelimit-remaining".to_string(), "3".to_string()),
+            ("ratelimit-reset".to_string(), "0".to_string()),
+        ];
+
+        let info = GitLabClient::parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.limit, 7);
+        assert_eq!(info.remaining, 3);
+        assert_eq!(info.reset_at.timestamp(), 0);
+    }
+
+    #[test]
+    fn test_build_starred_paths_deduplicates_entries() {
+        let projects = vec![
+            mock_project("group/repo-a"),
+            mock_project("group/repo-b"),
+            mock_project("group/repo-a"),
+        ];
+
+        let paths = GitLabClient::build_starred_paths(&projects);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains("group/repo-a"));
+        assert!(paths.contains("group/repo-b"));
+    }
+
+    #[test]
+    fn test_build_starred_paths_empty_input() {
+        let paths = GitLabClient::build_starred_paths(&[]);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_negative_reset_timestamp() {
+        let headers: HttpHeaders = vec![
+            ("ratelimit-limit".to_string(), "10".to_string()),
+            ("ratelimit-remaining".to_string(), "1".to_string()),
+            ("ratelimit-reset".to_string(), "-1".to_string()),
+        ];
+
+        let info = GitLabClient::parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.limit, 10);
+        assert_eq!(info.remaining, 1);
+        assert_eq!(info.reset_at.timestamp(), -1);
+        assert!(info.retry_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cached_starred_status_guard_without_cache() {
+        let transport: Arc<dyn HttpTransport> = Arc::new(MockTransport::new());
+        let client = test_client("https://gitlab.example.com", Uuid::new_v4(), transport);
+
+        let result = client.cached_starred_status(42, "group/repo-a").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cached_starred_status_guard_different_user_id() {
+        let transport: Arc<dyn HttpTransport> = Arc::new(MockTransport::new());
+        let client = test_client("https://gitlab.example.com", Uuid::new_v4(), transport);
+        client
+            .update_starred_cache(7, &[mock_project("group/repo-a")])
+            .await;
+
+        let result = client.cached_starred_status(8, "group/repo-a").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cached_starred_status_exact_path_selection() {
+        let transport: Arc<dyn HttpTransport> = Arc::new(MockTransport::new());
+        let client = test_client("https://gitlab.example.com", Uuid::new_v4(), transport);
+        client
+            .update_starred_cache(7, &[mock_project("group/repo")])
+            .await;
+
+        let exact = client.cached_starred_status(7, "group/repo").await;
+        let different = client.cached_starred_status(7, "group/repo-extra").await;
+
+        assert_eq!(exact, Some(true));
+        assert_eq!(different, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_clear_starred_cache_removes_cached_entries() {
+        let transport: Arc<dyn HttpTransport> = Arc::new(MockTransport::new());
+        let client = test_client("https://gitlab.example.com", Uuid::new_v4(), transport);
+        client
+            .update_starred_cache(99, &[mock_project("group/repo-a")])
+            .await;
+
+        assert_eq!(
+            client.cached_starred_status(99, "group/repo-a").await,
+            Some(true)
+        );
+
+        client.clear_starred_cache().await;
+
+        assert!(
+            client
+                .cached_starred_status(99, "group/repo-a")
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_host_and_instance_id_accessors_return_configured_values() {
+        let instance_id = Uuid::new_v4();
+        let transport: Arc<dyn HttpTransport> = Arc::new(MockTransport::new());
+        let client = test_client("https://self-managed.gitlab", instance_id, transport);
+
+        assert_eq!(client.host(), "https://self-managed.gitlab");
+        assert_eq!(client.instance_id(), instance_id);
+    }
+
+    #[tokio::test]
+    async fn test_get_conditional_not_modified_returns_cache_hit_and_uses_if_none_match() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+
+        let url = format!("{TEST_BASE_URL}/api/v4/groups/acme/projects?page=1");
+        push_response(&transport, HttpMethod::Get, &url, 304, Vec::new(), "");
+
+        let result = client
+            .get_conditional::<Vec<serde_json::Value>>(&url, Some("W/\"etag-1\""))
+            .await
+            .expect("request should succeed");
+
+        assert!(matches!(result, FetchResult::NotModified));
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, url);
+        assert_eq!(
+            request_header(&requests[0], "If-None-Match"),
+            Some("W/\"etag-1\"".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_conditional_unauthorized_maps_to_auth_error() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+        let url = format!("{TEST_BASE_URL}/api/v4/projects");
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            401,
+            Vec::new(),
+            "unauthorized",
+        );
+
+        let err = client
+            .get_conditional::<Vec<serde_json::Value>>(&url, None)
+            .await
+            .expect_err("401 should map to auth error");
+
+        assert!(matches!(err, GitLabError::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_conditional_too_many_requests_maps_to_rate_limited() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+        let url = format!("{TEST_BASE_URL}/api/v4/projects");
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            429,
+            Vec::new(),
+            "slow down",
+        );
+
+        let err = client
+            .get_conditional::<Vec<serde_json::Value>>(&url, None)
+            .await
+            .expect_err("429 should map to rate-limited error");
+
+        assert!(matches!(err, GitLabError::RateLimited { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_get_conditional_success_returns_data_etag_and_total_pages() {
+        let body = serde_json::to_string(&vec![serde_json::json!({"id": 1, "name": "repo"})])
+            .expect("body should serialize");
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+
+        let url = format!("{TEST_BASE_URL}/api/v4/projects");
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("ETag".to_string(), "W/\"etag-abc\"".to_string()),
+                ("x-total-pages".to_string(), "3".to_string()),
+            ],
+            &body,
+        );
+
+        let result = client
+            .get_conditional::<Vec<serde_json::Value>>(&url, None)
+            .await
+            .expect("200 response should be parsed");
+
+        match result {
+            FetchResult::Fetched {
+                data,
+                etag,
+                pagination,
+            } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(etag.as_deref(), Some("W/\"etag-abc\""));
+                assert_eq!(pagination.total_pages, Some(3));
+            }
+            other => panic!("expected fetched result, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_conditional_not_found_embeds_requested_url() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+
+        let request_url = format!("{TEST_BASE_URL}/api/v4/projects/does/not/exist");
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &request_url,
+            404,
+            Vec::new(),
+            "missing",
+        );
+
+        let err = client
+            .get_conditional::<Vec<serde_json::Value>>(&request_url, None)
+            .await
+            .expect_err("404 should map to API not-found error");
+
+        match err {
+            GitLabError::Api(message) => {
+                assert!(message.contains("Not found:"));
+                assert!(message.contains(&request_url));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_group_projects_stops_on_empty_second_page() {
+        let page_one = serde_json::to_string(&vec![project_json("acme/repo-one")])
+            .expect("first page should serialize");
+
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+
+        let url_page_1 = format!(
+            "{TEST_BASE_URL}/api/v4/groups/acme/projects?include_subgroups=false&per_page=100&page=1"
+        );
+        let url_page_2 = format!(
+            "{TEST_BASE_URL}/api/v4/groups/acme/projects?include_subgroups=false&per_page=100&page=2"
+        );
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url_page_1,
+            200,
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("x-total-pages".to_string(), "2".to_string()),
+            ],
+            &page_one,
+        );
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url_page_2,
+            200,
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            "[]",
+        );
+
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+        let (projects, stats) = client
+            .list_group_projects("acme", false, None)
+            .await
+            .expect("group pagination should succeed");
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.pages_fetched, 2);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, url_page_1);
+        assert!(request_header(&requests[0], "If-None-Match").is_none());
+        assert_eq!(requests[1].url, url_page_2);
+    }
+
+    #[cfg(feature = "migrate")]
+    #[tokio::test]
+    async fn test_list_group_projects_continues_from_cached_total_after_page_one_304() {
+        let page_two = serde_json::to_string(&vec![project_json("acme/repo-two")])
+            .expect("second page should serialize");
+
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+
+        let url_page_1 = format!(
+            "{TEST_BASE_URL}/api/v4/groups/acme/projects?include_subgroups=false&per_page=100&page=1"
+        );
+        let url_page_2 = format!(
+            "{TEST_BASE_URL}/api/v4/groups/acme/projects?include_subgroups=false&per_page=100&page=2"
+        );
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url_page_1,
+            304,
+            Vec::new(),
+            "",
+        );
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url_page_2,
+            200,
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            &page_two,
+        );
+
+        let instance_id = Uuid::new_v4();
+        let db = setup_db(instance_id).await;
+        api_cache::upsert_with_pagination(
+            &db,
+            instance_id,
+            EndpointType::OrgRepos,
+            &ApiCacheModel::org_repos_key("acme", 1),
+            Some("W/\"cached-p1\"".to_string()),
+            Some(2),
+        )
+        .await
+        .expect("cache seed should succeed");
+
+        let client = test_client(TEST_BASE_URL, instance_id, transport_arc);
+        let (projects, stats) = client
+            .list_group_projects("acme", false, Some(&db))
+            .await
+            .expect("group pagination should succeed");
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.pages_fetched, 1);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, url_page_1);
+        assert_eq!(
+            request_header(&requests[0], "If-None-Match"),
+            Some("W/\"cached-p1\"".to_string())
+        );
+        assert_eq!(requests[1].url, url_page_2);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_id_returns_api_error_when_user_not_found() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+
+        let url = format!("{TEST_BASE_URL}/api/v4/users?username=missing-user");
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            "[]",
+        );
+        let err = client
+            .resolve_user_id("missing-user")
+            .await
+            .expect_err("empty users list should fail");
+
+        match err {
+            GitLabError::Api(message) => assert!(message.contains("User not found: missing-user")),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, url);
     }
 }

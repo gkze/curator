@@ -477,3 +477,502 @@ async fn display_rate_limit<C: curator::PlatformClient>(client: &C, is_tty: bool
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use sea_orm::{
+        ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, Set, Statement,
+    };
+    use uuid::Uuid;
+
+    fn sample_common_sync_options() -> CommonSyncOptions {
+        CommonSyncOptions {
+            active_within_days: None,
+            no_star: false,
+            dry_run: false,
+            concurrency: None,
+            no_rate_limit: false,
+            incremental: false,
+        }
+    }
+
+    fn sample_starred_sync_options() -> StarredSyncOptions {
+        StarredSyncOptions {
+            active_within_days: None,
+            no_prune: false,
+            dry_run: false,
+            concurrency: None,
+            no_rate_limit: false,
+        }
+    }
+
+    fn sqlite_test_url(label: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "curator-cli-sync-tests-{}-{}.db",
+            label,
+            Uuid::new_v4()
+        ));
+        format!("sqlite://{}?mode=rwc", path.display())
+    }
+
+    async fn setup_db(label: &str) -> DatabaseConnection {
+        curator::db::connect_and_migrate(&sqlite_test_url(label))
+            .await
+            .expect("test database should initialize")
+    }
+
+    fn sample_instance(name: &str, platform_type: PlatformType, host: &str) -> InstanceModel {
+        InstanceModel {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            platform_type,
+            host: host.to_string(),
+            oauth_client_id: None,
+            oauth_flow: "auto".to_string(),
+            created_at: Utc::now().fixed_offset(),
+        }
+    }
+
+    #[test]
+    fn merge_common_sync_options_uses_config_defaults() {
+        let config = Config::default();
+        let opts = sample_common_sync_options();
+
+        let (days, concurrency, star, no_rate_limit, strategy) =
+            merge_common_sync_options(&opts, &config);
+
+        assert_eq!(days, config.sync.active_within_days);
+        assert_eq!(concurrency, config.sync.concurrency);
+        assert_eq!(star, config.sync.star);
+        assert_eq!(no_rate_limit, config.sync.no_rate_limit);
+        assert_eq!(strategy, SyncStrategy::Full);
+    }
+
+    #[test]
+    fn merge_common_sync_options_cli_flags_override_config() {
+        let config = Config::default();
+        let opts = CommonSyncOptions {
+            active_within_days: Some(14),
+            no_star: true,
+            dry_run: true,
+            concurrency: Some(7),
+            no_rate_limit: true,
+            incremental: true,
+        };
+
+        let (days, concurrency, star, no_rate_limit, strategy) =
+            merge_common_sync_options(&opts, &config);
+
+        assert_eq!(days, 14);
+        assert_eq!(concurrency, 7);
+        assert!(!star);
+        assert!(no_rate_limit);
+        assert_eq!(strategy, SyncStrategy::Incremental);
+    }
+
+    #[test]
+    fn merge_common_sync_options_no_star_has_highest_precedence() {
+        let mut config = Config::default();
+        config.sync.star = true;
+
+        let opts = CommonSyncOptions {
+            active_within_days: None,
+            no_star: true,
+            dry_run: false,
+            concurrency: None,
+            no_rate_limit: false,
+            incremental: false,
+        };
+
+        let (_, _, star, _, _) = merge_common_sync_options(&opts, &config);
+        assert!(!star);
+    }
+
+    #[test]
+    fn merge_common_sync_options_respects_config_when_cli_flag_unset() {
+        let mut config = Config::default();
+        config.sync.star = false;
+        config.sync.no_rate_limit = true;
+
+        let opts = CommonSyncOptions {
+            active_within_days: Some(21),
+            no_star: false,
+            dry_run: false,
+            concurrency: Some(4),
+            no_rate_limit: false,
+            incremental: false,
+        };
+
+        let (days, concurrency, star, no_rate_limit, strategy) =
+            merge_common_sync_options(&opts, &config);
+
+        assert_eq!(days, 21);
+        assert_eq!(concurrency, 4);
+        assert!(!star);
+        assert!(no_rate_limit);
+        assert_eq!(strategy, SyncStrategy::Full);
+    }
+
+    #[test]
+    fn merge_common_sync_options_partial_cli_overrides_keep_other_config_values() {
+        let mut config = Config::default();
+        config.sync.active_within_days = 90;
+        config.sync.concurrency = 13;
+        config.sync.star = false;
+        config.sync.no_rate_limit = true;
+
+        let opts = CommonSyncOptions {
+            active_within_days: Some(7),
+            no_star: false,
+            dry_run: true,
+            concurrency: None,
+            no_rate_limit: false,
+            incremental: false,
+        };
+
+        let (days, concurrency, star, no_rate_limit, strategy) =
+            merge_common_sync_options(&opts, &config);
+
+        assert_eq!(days, 7);
+        assert_eq!(concurrency, 13);
+        assert!(!star);
+        assert!(no_rate_limit);
+        assert_eq!(strategy, SyncStrategy::Full);
+    }
+
+    #[test]
+    fn merge_starred_sync_options_combines_values() {
+        let mut config = Config::default();
+        config.sync.active_within_days = 45;
+        config.sync.concurrency = 9;
+        config.sync.no_rate_limit = true;
+
+        let opts = StarredSyncOptions {
+            active_within_days: Some(5),
+            no_prune: true,
+            dry_run: true,
+            concurrency: Some(3),
+            no_rate_limit: false,
+        };
+
+        let (days, concurrency, prune, no_rate_limit) = merge_starred_sync_options(&opts, &config);
+
+        assert_eq!(days, 5);
+        assert_eq!(concurrency, 3);
+        assert!(!prune);
+        assert!(no_rate_limit);
+    }
+
+    #[test]
+    fn merge_starred_sync_options_uses_defaults_when_cli_unset() {
+        let mut config = Config::default();
+        config.sync.active_within_days = 60;
+        config.sync.concurrency = 11;
+        config.sync.no_rate_limit = false;
+
+        let opts = sample_starred_sync_options();
+
+        let (days, concurrency, prune, no_rate_limit) = merge_starred_sync_options(&opts, &config);
+
+        assert_eq!(days, 60);
+        assert_eq!(concurrency, 11);
+        assert!(prune);
+        assert!(!no_rate_limit);
+    }
+
+    #[test]
+    fn merge_starred_sync_options_cli_no_rate_limit_overrides_config() {
+        let mut config = Config::default();
+        config.sync.no_rate_limit = false;
+
+        let opts = StarredSyncOptions {
+            active_within_days: None,
+            no_prune: false,
+            dry_run: false,
+            concurrency: None,
+            no_rate_limit: true,
+        };
+
+        let (_, _, prune, no_rate_limit) = merge_starred_sync_options(&opts, &config);
+        assert!(prune);
+        assert!(no_rate_limit);
+    }
+
+    #[tokio::test]
+    async fn get_instance_returns_not_found_error_for_unknown_name() {
+        let db = setup_db("missing-instance").await;
+
+        let err = get_instance(&db, "does-not-exist")
+            .await
+            .expect_err("missing instance should error");
+
+        assert!(
+            err.to_string()
+                .contains("Instance 'does-not-exist' not found"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("curator instance add does-not-exist"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn get_instance_returns_inserted_record() {
+        let db = setup_db("existing-instance").await;
+        let expected = sample_instance("test-github", PlatformType::GitHub, "github.test");
+
+        curator::entity::instance::ActiveModel {
+            id: Set(expected.id),
+            name: Set(expected.name.clone()),
+            platform_type: Set(expected.platform_type),
+            host: Set(expected.host.clone()),
+            oauth_client_id: Set(expected.oauth_client_id.clone()),
+            oauth_flow: Set(expected.oauth_flow.clone()),
+            created_at: Set(expected.created_at),
+        }
+        .insert(&db)
+        .await
+        .expect("insert should succeed");
+
+        let found = get_instance(&db, &expected.name)
+            .await
+            .expect("instance should be found");
+
+        assert_eq!(found.id, expected.id);
+        assert_eq!(found.name, expected.name);
+        assert_eq!(found.platform_type, PlatformType::GitHub);
+        assert_eq!(found.host, "github.test");
+    }
+
+    #[tokio::test]
+    async fn get_instance_requires_exact_name_match() {
+        let db = setup_db("exact-name-match").await;
+        let stored_name = "custom-github-enterprise";
+        let lookup_name = "custom-github";
+
+        curator::entity::instance::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            name: Set(stored_name.to_string()),
+            platform_type: Set(PlatformType::GitHub),
+            host: Set("github.enterprise.local".to_string()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set("auto".to_string()),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(&db)
+        .await
+        .expect("insert should succeed");
+
+        let err = get_instance(&db, lookup_name)
+            .await
+            .expect_err("partial name should not match");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Instance '{}' not found. Add it first with: curator instance add {}",
+                lookup_name, lookup_name
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn get_instance_lookup_is_case_sensitive() {
+        let db = setup_db("case-sensitive-name").await;
+        let stored_name = "GitHub-Prod";
+        let lookup_name = "github-prod";
+
+        curator::entity::instance::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            name: Set(stored_name.to_string()),
+            platform_type: Set(PlatformType::GitHub),
+            host: Set("github.prod.local".to_string()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set("auto".to_string()),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(&db)
+        .await
+        .expect("insert should succeed");
+
+        let err = get_instance(&db, lookup_name)
+            .await
+            .expect_err("differently cased name should not match");
+
+        assert_eq!(
+            err.to_string(),
+            "Instance 'github-prod' not found. Add it first with: curator instance add github-prod"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_instance_propagates_database_errors() {
+        let db = setup_db("instance-query-failure").await;
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "DROP TABLE instances".to_string(),
+        ))
+        .await
+        .expect("instances table should be dropped for error-path test");
+
+        let err = get_instance(&db, "github")
+            .await
+            .expect_err("query failure should propagate");
+        let message = err.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("no such table")
+                || message.contains("query")
+                || message.contains("connection"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_starred_sync_options_config_no_rate_limit_is_preserved() {
+        let mut config = Config::default();
+        config.sync.no_rate_limit = true;
+
+        let opts = StarredSyncOptions {
+            active_within_days: Some(10),
+            no_prune: false,
+            dry_run: false,
+            concurrency: Some(2),
+            no_rate_limit: false,
+        };
+
+        let (days, concurrency, prune, no_rate_limit) = merge_starred_sync_options(&opts, &config);
+
+        assert_eq!(days, 10);
+        assert_eq!(concurrency, 2);
+        assert!(prune);
+        assert!(no_rate_limit);
+    }
+
+    #[test]
+    fn sync_action_variants_constructable() {
+        let common = sample_common_sync_options();
+        let starred = sample_starred_sync_options();
+
+        let org = SyncAction::Org {
+            instance: "github".to_string(),
+            names: vec!["rust-lang".to_string()],
+            no_subgroups: false,
+            sync_opts: common.clone(),
+        };
+        let user = SyncAction::User {
+            instance: "github".to_string(),
+            names: vec!["octocat".to_string()],
+            sync_opts: common,
+        };
+        let stars = SyncAction::Stars {
+            instance: "github".to_string(),
+            sync_opts: starred,
+        };
+
+        assert!(matches!(org, SyncAction::Org { .. }));
+        assert!(matches!(user, SyncAction::User { .. }));
+        assert!(matches!(stars, SyncAction::Stars { .. }));
+    }
+
+    #[tokio::test]
+    async fn handle_sync_org_returns_instance_not_found_before_auth() {
+        let database_url = sqlite_test_url("handle-sync-org-missing-instance");
+        let _db = curator::db::connect_and_migrate(&database_url)
+            .await
+            .expect("test database should initialize");
+
+        let err = handle_sync(
+            SyncAction::Org {
+                instance: "missing".to_string(),
+                names: vec!["org".to_string()],
+                no_subgroups: false,
+                sync_opts: sample_common_sync_options(),
+            },
+            &Config::default(),
+            &database_url,
+        )
+        .await
+        .expect_err("missing instance should fail sync setup");
+
+        assert!(
+            err.to_string().contains("Instance 'missing' not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_sync_user_returns_instance_not_found_before_auth() {
+        let database_url = sqlite_test_url("handle-sync-user-missing-instance");
+        let _db = curator::db::connect_and_migrate(&database_url)
+            .await
+            .expect("test database should initialize");
+
+        let err = handle_sync(
+            SyncAction::User {
+                instance: "missing".to_string(),
+                names: vec!["octocat".to_string()],
+                sync_opts: sample_common_sync_options(),
+            },
+            &Config::default(),
+            &database_url,
+        )
+        .await
+        .expect_err("missing instance should fail sync setup");
+
+        assert!(
+            err.to_string().contains("Instance 'missing' not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_sync_stars_returns_instance_not_found_before_auth() {
+        let database_url = sqlite_test_url("handle-sync-stars-missing-instance");
+        let _db = curator::db::connect_and_migrate(&database_url)
+            .await
+            .expect("test database should initialize");
+
+        let err = handle_sync(
+            SyncAction::Stars {
+                instance: "missing".to_string(),
+                sync_opts: sample_starred_sync_options(),
+            },
+            &Config::default(),
+            &database_url,
+        )
+        .await
+        .expect_err("missing instance should fail sync setup");
+
+        assert!(
+            err.to_string().contains("Instance 'missing' not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_sync_propagates_database_connection_errors() {
+        let err = handle_sync(
+            SyncAction::Org {
+                instance: "github".to_string(),
+                names: vec!["org".to_string()],
+                no_subgroups: false,
+                sync_opts: sample_common_sync_options(),
+            },
+            &Config::default(),
+            "sqlite://",
+        )
+        .await
+        .expect_err("invalid database URL should fail before instance lookup");
+
+        assert!(
+            !err.to_string().is_empty(),
+            "expected a concrete database error message"
+        );
+    }
+}

@@ -35,7 +35,7 @@
 //! no_rate_limit = false
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use std::{fs, io};
 
@@ -43,6 +43,7 @@ use config::{Config as ConfigBuilder, Environment, File, FileFormat};
 use console::Term;
 use directories::ProjectDirs;
 use serde::Deserialize;
+use url::Url;
 
 /// Top-level configuration.
 #[derive(Debug, Default, Deserialize)]
@@ -239,7 +240,7 @@ impl Config {
         self.database.url.clone().or_else(|| {
             Self::default_state_dir().map(|state_dir| {
                 let db_path = state_dir.join("curator.db");
-                format!("sqlite://{}?mode=rwc", db_path.display())
+                sqlite_database_url(&db_path)
             })
         })
     }
@@ -406,6 +407,20 @@ impl Config {
             doc["gitea"]["host"] = toml_edit::value(host);
             doc["gitea"]["token"] = toml_edit::value(token);
         })
+    }
+}
+
+fn sqlite_database_url(path: &Path) -> String {
+    // Build through file:// first so path components are URL-encoded.
+    match Url::from_file_path(path) {
+        Ok(file_url) => {
+            let encoded_path = file_url.to_string();
+            format!(
+                "sqlite://{}?mode=rwc",
+                encoded_path.trim_start_matches("file://")
+            )
+        }
+        Err(_) => format!("sqlite://{}?mode=rwc", path.display()),
     }
 }
 
@@ -658,6 +673,15 @@ mod tests {
         let url = db_url.unwrap();
         assert!(url.starts_with("sqlite://"));
         assert!(url.contains("curator.db"));
+        assert!(url.ends_with("?mode=rwc"));
+    }
+
+    #[test]
+    fn test_sqlite_database_url_encodes_special_characters() {
+        let db_path = PathBuf::from("/tmp/curator db/with#chars?.db");
+        let url = sqlite_database_url(&db_path);
+
+        assert!(url.starts_with("sqlite:///tmp/curator%20db/with%23chars%3F.db"));
         assert!(url.ends_with("?mode=rwc"));
     }
 

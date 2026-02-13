@@ -712,6 +712,8 @@ fn read_netrc_token(host: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
 
     let mut in_machine = false;
+    let mut in_default = false;
+    let mut default_password: Option<String> = None;
     let mut tokens = content.split_whitespace().peekable();
 
     while let Some(token) = tokens.next() {
@@ -719,22 +721,30 @@ fn read_netrc_token(host: &str) -> Option<String> {
             "machine" => {
                 if let Some(&machine) = tokens.peek() {
                     in_machine = machine == host;
+                    in_default = false;
                     tokens.next();
                 }
             }
             "password" if in_machine => {
                 return tokens.next().map(|s| s.to_string());
             }
+            "password" if in_default => {
+                if default_password.is_none() {
+                    default_password = tokens.next().map(|s| s.to_string());
+                } else {
+                    tokens.next();
+                }
+            }
             // Also support "default" entry as a last resort
             "default" if !in_machine => {
                 // Continue scanning for password in the default block
-                in_machine = true;
+                in_default = true;
             }
             _ => {}
         }
     }
 
-    None
+    default_password
 }
 
 /// Get the Codeberg token, refreshing if expired or near expiry.
@@ -801,4 +811,1008 @@ async fn get_codeberg_token_with_refresh(
         "No Codeberg token configured. Run 'curator login codeberg' or set CURATOR_CODEBERG_TOKEN."
             .into()
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::await_holding_lock)] // env_lock guards are intentionally held across awaits to serialise env-mutating tests
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use curator::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
+    use curator::platform::{OrgInfo, PlatformError, PlatformRepo, RateLimitInfo, UserInfo};
+    use curator::sync::{NamespaceSyncResultStreaming, SyncResult};
+    use sea_orm::Database;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    #[derive(Clone)]
+    enum RateLimitBehavior {
+        Ok,
+        Err,
+        Never,
+    }
+
+    #[derive(Clone)]
+    struct FakeRateLimitClient {
+        behavior: RateLimitBehavior,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeRateLimitClient {
+        fn new(behavior: RateLimitBehavior) -> Self {
+            Self {
+                behavior,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl PlatformClient for FakeRateLimitClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> curator::platform::Result<RateLimitInfo> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            match self.behavior {
+                RateLimitBehavior::Ok => Ok(RateLimitInfo {
+                    limit: 5000,
+                    remaining: 4999,
+                    reset_at: Utc::now(),
+                    retry_after: None,
+                }),
+                RateLimitBehavior::Err => Err(PlatformError::api("boom")),
+                RateLimitBehavior::Never => std::future::pending().await,
+            }
+        }
+
+        async fn get_org_info(&self, _org: &str) -> curator::platform::Result<OrgInfo> {
+            unimplemented!()
+        }
+
+        async fn get_authenticated_user(&self) -> curator::platform::Result<UserInfo> {
+            unimplemented!()
+        }
+
+        async fn get_repo(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> curator::platform::Result<PlatformRepo> {
+            unimplemented!()
+        }
+
+        async fn list_org_repos(
+            &self,
+            _org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&curator::sync::ProgressCallback>,
+        ) -> curator::platform::Result<Vec<PlatformRepo>> {
+            unimplemented!()
+        }
+
+        async fn list_user_repos(
+            &self,
+            _username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&curator::sync::ProgressCallback>,
+        ) -> curator::platform::Result<Vec<PlatformRepo>> {
+            unimplemented!()
+        }
+
+        async fn is_repo_starred(
+            &self,
+            _owner: &str,
+            _name: &str,
+        ) -> curator::platform::Result<bool> {
+            unimplemented!()
+        }
+
+        async fn star_repo(&self, _owner: &str, _name: &str) -> curator::platform::Result<bool> {
+            unimplemented!()
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _on_progress: Option<&curator::sync::ProgressCallback>,
+        ) -> curator::platform::Result<bool> {
+            unimplemented!()
+        }
+
+        async fn unstar_repo(&self, _owner: &str, _name: &str) -> curator::platform::Result<bool> {
+            unimplemented!()
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&curator::sync::ProgressCallback>,
+        ) -> curator::platform::Result<Vec<PlatformRepo>> {
+            unimplemented!()
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            _repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&curator::sync::ProgressCallback>,
+        ) -> curator::platform::Result<usize> {
+            unimplemented!()
+        }
+
+        fn to_active_model(&self, _repo: &PlatformRepo) -> CodeRepositoryActiveModel {
+            unimplemented!()
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn sample_sync_result() -> SyncResult {
+        SyncResult {
+            processed: 10,
+            matched: 8,
+            starred: 3,
+            saved: 0,
+            skipped: 5,
+            pruned: 2,
+            pruned_repos: vec![("owner".to_string(), "repo".to_string())],
+            errors: vec!["boom".to_string()],
+        }
+    }
+
+    fn sample_instance(name: &str, platform: PlatformType, host: &str) -> InstanceModel {
+        InstanceModel {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            platform_type: platform,
+            host: host.to_string(),
+            oauth_client_id: None,
+            oauth_flow: "auto".to_string(),
+            created_at: Utc::now().fixed_offset(),
+        }
+    }
+
+    #[test]
+    fn build_rate_limiter_respects_disable_flag() {
+        assert!(build_rate_limiter(PlatformType::GitHub, true).is_none());
+        assert!(build_rate_limiter(PlatformType::GitHub, false).is_some());
+    }
+
+    #[test]
+    fn aggregated_sync_result_from_single_copies_fields() {
+        let persist = PersistTaskResult {
+            saved_count: 7,
+            errors: Vec::new(),
+            panic_info: None,
+        };
+        let sync = sample_sync_result();
+
+        let agg = AggregatedSyncResult::from_single(sync, persist);
+
+        assert_eq!(agg.total_processed, 10);
+        assert_eq!(agg.total_matched, 8);
+        assert_eq!(agg.total_starred, 3);
+        assert_eq!(agg.total_skipped, 5);
+        assert_eq!(agg.total_pruned, 2);
+        assert_eq!(agg.pruned_repos.len(), 1);
+        assert_eq!(agg.all_errors, vec!["boom".to_string()]);
+        assert_eq!(agg.persist_result.saved_count, 7);
+    }
+
+    #[test]
+    fn aggregated_sync_result_from_multiple_aggregates_successes_and_errors() {
+        let ok_result = NamespaceSyncResultStreaming {
+            namespace: "good".to_string(),
+            result: SyncResult {
+                processed: 2,
+                matched: 1,
+                starred: 1,
+                saved: 0,
+                skipped: 0,
+                pruned: 0,
+                pruned_repos: vec![],
+                errors: vec!["minor".to_string()],
+            },
+            error: None,
+        };
+        let failed_result = NamespaceSyncResultStreaming {
+            namespace: "bad".to_string(),
+            result: SyncResult::default(),
+            error: Some("network failed".to_string()),
+        };
+
+        let agg = AggregatedSyncResult::from_multiple(
+            &[ok_result, failed_result],
+            PersistTaskResult::default(),
+        );
+
+        assert_eq!(agg.total_processed, 2);
+        assert_eq!(agg.total_matched, 1);
+        assert_eq!(agg.total_starred, 1);
+        assert!(agg.all_errors.iter().any(|e| e.contains("good: minor")));
+        assert!(
+            agg.all_errors
+                .iter()
+                .any(|e| e.contains("bad: network failed"))
+        );
+    }
+
+    #[test]
+    fn aggregated_sync_result_from_multiple_skips_counts_for_failed_namespace_entries() {
+        let failed_with_counts = NamespaceSyncResultStreaming {
+            namespace: "bad".to_string(),
+            result: SyncResult {
+                processed: 99,
+                matched: 88,
+                starred: 77,
+                saved: 0,
+                skipped: 66,
+                pruned: 55,
+                pruned_repos: vec![("o".to_string(), "r".to_string())],
+                errors: vec!["should-not-be-included".to_string()],
+            },
+            error: Some("hard failure".to_string()),
+        };
+
+        let agg = AggregatedSyncResult::from_multiple(
+            &[failed_with_counts],
+            PersistTaskResult::default(),
+        );
+
+        assert_eq!(agg.total_processed, 0);
+        assert_eq!(agg.total_matched, 0);
+        assert_eq!(agg.total_starred, 0);
+        assert_eq!(agg.total_skipped, 0);
+        assert_eq!(agg.total_pruned, 0);
+        assert!(agg.pruned_repos.is_empty());
+        assert_eq!(agg.all_errors, vec!["bad: hard failure".to_string()]);
+    }
+
+    #[test]
+    fn aggregated_sync_result_from_multiple_accumulates_pruned_and_skipped_counts() {
+        let first = NamespaceSyncResultStreaming {
+            namespace: "first".to_string(),
+            result: SyncResult {
+                processed: 3,
+                matched: 2,
+                starred: 1,
+                saved: 0,
+                skipped: 4,
+                pruned: 1,
+                pruned_repos: vec![("org-a".to_string(), "repo-a".to_string())],
+                errors: vec![],
+            },
+            error: None,
+        };
+        let second = NamespaceSyncResultStreaming {
+            namespace: "second".to_string(),
+            result: SyncResult {
+                processed: 5,
+                matched: 4,
+                starred: 2,
+                saved: 0,
+                skipped: 6,
+                pruned: 2,
+                pruned_repos: vec![("org-b".to_string(), "repo-b".to_string())],
+                errors: vec![],
+            },
+            error: None,
+        };
+
+        let agg =
+            AggregatedSyncResult::from_multiple(&[first, second], PersistTaskResult::default());
+
+        assert_eq!(agg.total_processed, 8);
+        assert_eq!(agg.total_matched, 6);
+        assert_eq!(agg.total_starred, 3);
+        assert_eq!(agg.total_skipped, 10);
+        assert_eq!(agg.total_pruned, 3);
+        assert_eq!(
+            agg.pruned_repos,
+            vec![
+                ("org-a".to_string(), "repo-a".to_string()),
+                ("org-b".to_string(), "repo-b".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn read_netrc_token_reads_machine_and_default_entries() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("curator-netrc-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "machine github.com login octo password ghp_machine\ndefault login fallback password ghp_default\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let machine_token = read_netrc_token("github.com");
+        let default_token = read_netrc_token("unknown.example");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert_eq!(machine_token.as_deref(), Some("ghp_machine"));
+        assert_eq!(default_token.as_deref(), Some("ghp_default"));
+    }
+
+    #[test]
+    fn read_netrc_token_prefers_machine_when_default_appears_first() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("curator-netrc-order-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "default login fallback password ghp_default\nmachine github.com login octo password ghp_machine\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let machine_token = read_netrc_token("github.com");
+        let default_token = read_netrc_token("unknown.example");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert_eq!(machine_token.as_deref(), Some("ghp_machine"));
+        assert_eq!(default_token.as_deref(), Some("ghp_default"));
+    }
+
+    #[test]
+    fn read_netrc_token_keeps_first_default_password_when_multiple_exist() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("curator-netrc-default-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "default login first password token_one password token_two\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let token = read_netrc_token("missing-host.example");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert_eq!(token.as_deref(), Some("token_one"));
+    }
+
+    #[test]
+    fn read_netrc_token_handles_trailing_machine_keyword_without_host() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("curator-netrc-default-scope-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "default login fallback password ghp_default\nmachine\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let token = read_netrc_token("unknown.example");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert_eq!(token.as_deref(), Some("ghp_default"));
+    }
+
+    #[test]
+    fn read_netrc_token_ignores_default_keyword_inside_machine_entry() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "curator-netrc-default-inside-machine-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "machine github.com login octo default password machine_token\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let token = read_netrc_token("github.com");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert_eq!(token.as_deref(), Some("machine_token"));
+    }
+
+    #[test]
+    fn read_netrc_token_returns_none_for_machine_password_without_value() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("curator-netrc-missing-password-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(&netrc, "machine github.com login octo password\n")
+            .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let token = read_netrc_token("github.com");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn read_netrc_token_returns_none_when_home_is_unset() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+
+        let token = read_netrc_token("github.com");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn read_netrc_token_returns_none_when_netrc_file_is_missing() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("curator-netrc-missing-file-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let token = read_netrc_token("github.com");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert!(token.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_token_for_instance_returns_platform_error_without_fallbacks() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("curator-netrc-missing-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        std::fs::write(dir.join(".netrc"), "").expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+        }
+
+        let config = Config::default();
+        let instance = sample_instance("github", PlatformType::GitHub, "github.com");
+        let err = get_token_for_instance(&instance, &config)
+            .await
+            .expect_err("missing token should return platform error");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert!(
+            err.to_string().contains("No GitHub token configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_token_for_instance_prefers_configured_token() {
+        let mut config = Config::default();
+        config.github.token = Some("token-from-config".to_string());
+        let instance = sample_instance("github", PlatformType::GitHub, "github.com");
+
+        let token = get_token_for_instance(&instance, &config)
+            .await
+            .expect("token should resolve from config");
+
+        assert_eq!(token, "token-from-config");
+    }
+
+    #[tokio::test]
+    async fn get_token_for_instance_uses_netrc_fallback() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("curator-netrc-fallback-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "machine github.com login octo password ghp_from_netrc\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+        }
+
+        let config = Config::default();
+        let instance = sample_instance("github", PlatformType::GitHub, "github.com");
+        let token = get_token_for_instance(&instance, &config)
+            .await
+            .expect("token should fallback to netrc");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert_eq!(token, "ghp_from_netrc");
+    }
+
+    #[tokio::test]
+    async fn get_token_for_instance_returns_platform_error_when_netrc_machine_does_not_match() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("curator-netrc-mismatch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "machine gitlab.com login octo password glpat_from_netrc\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_github_token = std::env::var("CURATOR_GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+        }
+
+        let config = Config::default();
+        let instance = sample_instance("github", PlatformType::GitHub, "github.com");
+        let err = get_token_for_instance(&instance, &config).await.expect_err(
+            "missing github token should keep platform error when netrc does not match",
+        );
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        match original_github_token {
+            Some(token) => unsafe {
+                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+            },
+            None => unsafe {
+                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            },
+        }
+
+        assert!(
+            err.to_string().contains("No GitHub token configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_token_for_instance_uses_default_netrc_fallback_when_machine_missing() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("curator-netrc-default-fallback-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "default login fallback password ghp_default_fallback\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_github_token = std::env::var("CURATOR_GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+        }
+
+        let config = Config::default();
+        let instance =
+            sample_instance("github-enterprise", PlatformType::GitHub, "ghe.example.com");
+        let token = get_token_for_instance(&instance, &config)
+            .await
+            .expect("token should fallback to default netrc entry");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        match original_github_token {
+            Some(token) => unsafe {
+                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+            },
+            None => unsafe {
+                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            },
+        }
+
+        assert_eq!(token, "ghp_default_fallback");
+    }
+
+    #[tokio::test]
+    async fn get_token_for_instance_ignores_platform_env_without_config_load() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("curator-netrc-env-precedence-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "machine github.com login octo password ghp_from_netrc\ndefault login fallback password ghp_default\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_github_token = std::env::var("CURATOR_GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::set_var("CURATOR_GITHUB_TOKEN", "token-from-env");
+        }
+
+        let config = Config::default();
+        let instance = sample_instance("github", PlatformType::GitHub, "github.com");
+        let token = get_token_for_instance(&instance, &config)
+            .await
+            .expect("netrc token should be used when config has no token");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        match original_github_token {
+            Some(token) => unsafe {
+                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+            },
+            None => unsafe {
+                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            },
+        }
+
+        assert_eq!(token, "ghp_from_netrc");
+    }
+
+    #[tokio::test]
+    async fn get_token_for_instance_prefers_config_over_netrc_fallback() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("curator-netrc-precedence-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let netrc = dir.join(".netrc");
+        std::fs::write(
+            &netrc,
+            "machine github.com login octo password ghp_from_netrc\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let mut config = Config::default();
+        config.github.token = Some("token-from-config".to_string());
+        let instance = sample_instance("github", PlatformType::GitHub, "github.com");
+        let token = get_token_for_instance(&instance, &config)
+            .await
+            .expect("config token should have precedence");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert_eq!(token, "token-from-config");
+    }
+
+    #[tokio::test]
+    async fn get_token_for_instance_reads_gitlab_and_gitea_tokens_from_config() {
+        let mut config = Config::default();
+
+        config.gitlab.token = Some("gitlab-config-token".to_string());
+        let gitlab_instance = sample_instance("gitlab", PlatformType::GitLab, "gitlab.com");
+        let gitlab_token = get_token_for_instance(&gitlab_instance, &config)
+            .await
+            .expect("gitlab token should resolve from config");
+        assert_eq!(gitlab_token, "gitlab-config-token");
+
+        config.gitea.token = Some("gitea-config-token".to_string());
+        let gitea_instance = sample_instance(
+            "self-hosted-gitea",
+            PlatformType::Gitea,
+            "gitea.example.com",
+        );
+        let gitea_token = get_token_for_instance(&gitea_instance, &config)
+            .await
+            .expect("self-hosted gitea token should resolve from config");
+        assert_eq!(gitea_token, "gitea-config-token");
+
+        config.codeberg.token = Some("codeberg-config-token".to_string());
+        let codeberg_instance = sample_instance("codeberg", PlatformType::Gitea, "codeberg.org");
+        let codeberg_token = get_token_for_instance(&codeberg_instance, &config)
+            .await
+            .expect("codeberg token should resolve from config without refresh token");
+        assert_eq!(codeberg_token, "codeberg-config-token");
+    }
+
+    #[tokio::test]
+    async fn get_token_for_instance_returns_gitea_error_without_config_or_netrc() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("curator-netrc-gitea-missing-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        std::fs::write(dir.join(".netrc"), "").expect("netrc should be writable");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let config = Config::default();
+        let instance = sample_instance("forgejo-local", PlatformType::Gitea, "forgejo.local");
+        let err = get_token_for_instance(&instance, &config)
+            .await
+            .expect_err("missing gitea token should fail without netrc fallback");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert!(
+            err.to_string()
+                .contains("No Gitea token configured for 'forgejo-local'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_runner_accessors_and_print_helpers_are_callable() {
+        let path = std::env::temp_dir().join(format!("curator-sync-runner-{}.db", Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        if let Some(parent) = Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).expect("parent should be creatable");
+        }
+
+        let db = Database::connect(&url).await.expect("db should connect");
+        let runner = SyncRunner::new(Arc::new(db), SyncOptions::default(), true, 60);
+
+        assert!(runner.no_rate_limit());
+        // is_tty() may vary by environment; ensure method is callable.
+        let _ = runner.is_tty();
+
+        let mut agg =
+            AggregatedSyncResult::from_single(sample_sync_result(), PersistTaskResult::default());
+        agg.persist_result.saved_count = 2;
+
+        runner.print_single_result("test", &agg, SyncKind::Namespace);
+        runner.print_multi_result(1, &agg, SyncKind::User);
+        runner.print_starred_result(&agg, true);
+    }
+
+    #[tokio::test]
+    async fn sync_runner_print_helpers_cover_incremental_starred_and_error_branches() {
+        let path = std::env::temp_dir().join(format!(
+            "curator-sync-runner-branches-{}.db",
+            Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        if let Some(parent) = Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).expect("parent should be creatable");
+        }
+
+        let db = Database::connect(&url).await.expect("db should connect");
+        let options = SyncOptions {
+            star: true,
+            dry_run: true,
+            strategy: curator::sync::SyncStrategy::Incremental,
+            ..SyncOptions::default()
+        };
+
+        let mut runner = SyncRunner::new(Arc::new(db), options, false, 14);
+        runner.is_tty = true;
+
+        let mut dry_run_result = AggregatedSyncResult::from_single(
+            SyncResult {
+                processed: 4,
+                matched: 2,
+                starred: 1,
+                saved: 0,
+                skipped: 3,
+                pruned: 1,
+                pruned_repos: vec![],
+                errors: vec!["dry-run error".to_string()],
+            },
+            PersistTaskResult::default(),
+        );
+        dry_run_result
+            .all_errors
+            .push("namespace failed".to_string());
+
+        runner.print_single_result("starred", &dry_run_result, SyncKind::Starred);
+        runner.print_multi_result(2, &dry_run_result, SyncKind::Starred);
+        runner.print_starred_result(&dry_run_result, true);
+
+        runner.options.dry_run = false;
+        let mut persisted_result = dry_run_result;
+        persisted_result.deleted = 1;
+        persisted_result.persist_result.saved_count = 2;
+        persisted_result.persist_result.errors = vec![(
+            "owner".to_string(),
+            "repo".to_string(),
+            "persist failed".to_string(),
+        )];
+
+        runner.print_single_result("starred", &persisted_result, SyncKind::Namespace);
+        runner.print_multi_result(1, &persisted_result, SyncKind::User);
+        runner.print_starred_result(&persisted_result, true);
+    }
+
+    #[tokio::test]
+    async fn display_final_rate_limit_skips_fetch_when_disabled() {
+        let client = FakeRateLimitClient::new(RateLimitBehavior::Ok);
+
+        display_final_rate_limit(&client, false, true).await;
+
+        assert_eq!(client.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn display_final_rate_limit_fetches_for_success_and_error_results() {
+        let ok_client = FakeRateLimitClient::new(RateLimitBehavior::Ok);
+        display_final_rate_limit(&ok_client, false, false).await;
+        assert_eq!(ok_client.calls(), 1);
+
+        let err_client = FakeRateLimitClient::new(RateLimitBehavior::Err);
+        display_final_rate_limit(&err_client, false, false).await;
+        assert_eq!(err_client.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn display_final_rate_limit_times_out_for_slow_clients() {
+        let slow_client = FakeRateLimitClient::new(RateLimitBehavior::Never);
+
+        display_final_rate_limit(&slow_client, false, false).await;
+
+        assert_eq!(slow_client.calls(), 1);
+    }
 }

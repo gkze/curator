@@ -49,6 +49,16 @@ impl InteractiveReporter {
         }
     }
 
+    /// Create a reporter with a hidden draw target (no terminal output).
+    /// Used in tests to prevent indicatif output from leaking into test output.
+    #[cfg(test)]
+    fn hidden() -> Self {
+        Self {
+            multi: MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden()),
+            state: Mutex::new(ProgressState::default()),
+        }
+    }
+
     /// Create the save bar with proper styling.
     /// Positions it after the filter bar if one exists.
     fn create_save_bar(&self, state: &ProgressState) -> ProgressBar {
@@ -272,6 +282,12 @@ impl InteractiveReporter {
                 }
 
                 if let Some(ref pb) = state.filter_bar {
+                    if let Some(len) = pb.length()
+                        && len > 0
+                        && processed_so_far as u64 > len
+                    {
+                        pb.set_length(processed_so_far as u64);
+                    }
                     if pb.length().is_some() && pb.length() != Some(0) {
                         pb.set_position(processed_so_far as u64);
                     }
@@ -540,5 +556,463 @@ impl InteractiveReporter {
 impl Default for InteractiveReporter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filtered_page_creates_filter_bar_and_tracks_progress() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::FetchingRepos {
+            namespace: "org".to_string(),
+            total_repos: Some(50),
+            expected_pages: None,
+        });
+        reporter.handle(SyncProgress::FilteredPage {
+            matched_so_far: 2,
+            processed_so_far: 10,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let filter_bar = state
+            .filter_bar
+            .as_ref()
+            .expect("filter bar should exist after filtered page");
+
+        assert_eq!(filter_bar.length(), Some(50));
+        assert_eq!(filter_bar.position(), 10);
+        assert_eq!(filter_bar.message().to_string(), "2/10 active");
+    }
+
+    #[test]
+    fn fetch_complete_converts_existing_filter_spinner_to_progress_bar() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::FetchingRepos {
+            namespace: "org".to_string(),
+            total_repos: None,
+            expected_pages: None,
+        });
+        reporter.handle(SyncProgress::FilteringByActivity {
+            namespace: "org".to_string(),
+            days: 30,
+        });
+
+        {
+            let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+            let filter_bar = state
+                .filter_bar
+                .as_ref()
+                .expect("filter bar should exist after filtering starts");
+            assert_eq!(filter_bar.length(), None);
+        }
+
+        reporter.handle(SyncProgress::FetchComplete {
+            namespace: "org".to_string(),
+            total: 42,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let filter_bar = state
+            .filter_bar
+            .as_ref()
+            .expect("filter bar should still exist");
+        assert_eq!(filter_bar.length(), Some(42));
+    }
+
+    #[test]
+    fn save_spinner_is_converted_in_place_after_filter_complete() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::PersistingBatch {
+            count: 5,
+            final_batch: false,
+        });
+        reporter.handle(SyncProgress::Persisted {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+        });
+
+        {
+            let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+            let save_bar = state
+                .save_bar
+                .as_ref()
+                .expect("save bar should exist after first persist");
+            assert_eq!(save_bar.length(), None);
+            assert_eq!(save_bar.position(), 1);
+        }
+
+        reporter.handle(SyncProgress::FilterComplete {
+            namespace: "org".to_string(),
+            matched: 3,
+            total: 10,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let save_bar = state
+            .save_bar
+            .as_ref()
+            .expect("save bar should remain after filter complete");
+
+        assert!(state.filter_complete);
+        assert_eq!(state.save_total, 3);
+        assert_eq!(save_bar.length(), Some(3));
+        assert_eq!(save_bar.position(), 1);
+        assert_eq!(save_bar.message().to_string(), "1/3 saved");
+    }
+
+    #[test]
+    fn filtered_page_expands_filter_length_when_processed_exceeds_estimate() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::FetchingRepos {
+            namespace: "org".to_string(),
+            total_repos: None,
+            expected_pages: Some(1),
+        });
+
+        reporter.handle(SyncProgress::FilteredPage {
+            matched_so_far: 12,
+            processed_so_far: 150,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let filter_bar = state
+            .filter_bar
+            .as_ref()
+            .expect("filter bar should exist after filtered page");
+
+        assert_eq!(filter_bar.length(), Some(150));
+        assert_eq!(filter_bar.position(), 150);
+        assert_eq!(filter_bar.message().to_string(), "12/150 active");
+    }
+
+    #[test]
+    fn filtered_page_uses_fetched_total_when_initial_total_is_unknown() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::FetchingRepos {
+            namespace: "org".to_string(),
+            total_repos: None,
+            expected_pages: None,
+        });
+        reporter.handle(SyncProgress::FetchComplete {
+            namespace: "org".to_string(),
+            total: 42,
+        });
+        reporter.handle(SyncProgress::FilteredPage {
+            matched_so_far: 5,
+            processed_so_far: 10,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let filter_bar = state
+            .filter_bar
+            .as_ref()
+            .expect("filter bar should exist after filtered page");
+
+        assert_eq!(filter_bar.length(), Some(42));
+        assert_eq!(filter_bar.position(), 10);
+        assert_eq!(filter_bar.message().to_string(), "5/10 active");
+    }
+
+    #[test]
+    fn cache_hit_updates_existing_fetch_state() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::FetchingRepos {
+            namespace: "org".to_string(),
+            total_repos: None,
+            expected_pages: None,
+        });
+        reporter.handle(SyncProgress::CacheHit {
+            namespace: "org".to_string(),
+            cached_count: 7,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let fetch_state = state
+            .fetch_bars
+            .get("org")
+            .expect("fetch state should exist for org");
+
+        assert_eq!(fetch_state.total_repos, Some(7));
+        assert_eq!(fetch_state.fetched, 7);
+        assert_eq!(fetch_state.matched, 7);
+        assert!(fetch_state.done);
+        assert!(fetch_state.bar.is_finished());
+        assert_eq!(fetch_state.bar.message().to_string(), "✓ 7 repos (cached)");
+    }
+
+    #[test]
+    fn filter_complete_with_zero_matches_keeps_save_spinner_open() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::PersistingBatch {
+            count: 2,
+            final_batch: false,
+        });
+        reporter.handle(SyncProgress::Persisted {
+            owner: "owner".to_string(),
+            name: "repo".to_string(),
+        });
+        reporter.handle(SyncProgress::FilterComplete {
+            namespace: "org".to_string(),
+            matched: 0,
+            total: 10,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let save_bar = state
+            .save_bar
+            .as_ref()
+            .expect("save bar should still exist");
+
+        assert!(state.filter_complete);
+        assert_eq!(state.save_total, 0);
+        assert_eq!(save_bar.length(), None);
+        assert_eq!(save_bar.position(), 1);
+    }
+
+    #[test]
+    fn models_ready_with_zero_count_does_not_create_save_bar() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::ModelsReady { count: 0 });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(state.save_bar.is_none());
+        assert_eq!(state.save_total, 0);
+    }
+
+    #[test]
+    fn starring_repos_accumulates_total_and_resizes_existing_bar() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::StarringRepos {
+            count: 2,
+            concurrency: 1,
+            dry_run: false,
+        });
+        reporter.handle(SyncProgress::StarringRepos {
+            count: 3,
+            concurrency: 1,
+            dry_run: false,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let star_bar = state
+            .star_bar
+            .as_ref()
+            .expect("star bar should exist after starring starts");
+
+        assert_eq!(state.star_total, 5);
+        assert_eq!(star_bar.length(), Some(5));
+        assert_eq!(star_bar.message().to_string(), "Starring...");
+    }
+
+    #[test]
+    fn persist_error_advances_save_progress_and_formats_message() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::PersistingBatch {
+            count: 1,
+            final_batch: false,
+        });
+        reporter.handle(SyncProgress::PersistError {
+            owner: "rust-lang".to_string(),
+            name: "rust".to_string(),
+            error: "constraint violation".to_string(),
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let save_bar = state
+            .save_bar
+            .as_ref()
+            .expect("save bar should exist after persisting starts");
+
+        assert_eq!(save_bar.position(), 1);
+        assert_eq!(
+            save_bar.message().to_string(),
+            "✗ rust-lang/rust: constraint violation"
+        );
+    }
+
+    #[test]
+    fn sync_namespaces_complete_formats_success_only_message() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::PersistingBatch {
+            count: 1,
+            final_batch: false,
+        });
+        reporter.handle(SyncProgress::SyncNamespacesComplete {
+            successful: 4,
+            failed: 0,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let save_bar = state.save_bar.as_ref().expect("save bar should exist");
+
+        assert!(save_bar.is_finished());
+        assert_eq!(save_bar.message().to_string(), "✓ 4 orgs done");
+    }
+
+    #[test]
+    fn fetched_page_does_not_update_cached_fetch_state() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::FetchingRepos {
+            namespace: "org".to_string(),
+            total_repos: None,
+            expected_pages: Some(2),
+        });
+        reporter.handle(SyncProgress::CacheHit {
+            namespace: "org".to_string(),
+            cached_count: 6,
+        });
+
+        let cached_position = {
+            let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .fetch_bars
+                .get("org")
+                .expect("fetch state should exist after cache hit")
+                .bar
+                .position()
+        };
+
+        reporter.handle(SyncProgress::FetchedPage {
+            namespace: "org".to_string(),
+            page: 10,
+            count: 1,
+            total_so_far: 100,
+            expected_pages: Some(2),
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let fetch_state = state
+            .fetch_bars
+            .get("org")
+            .expect("fetch state should exist");
+
+        assert!(fetch_state.done);
+        assert_eq!(fetch_state.bar.position(), cached_position);
+        assert_eq!(fetch_state.bar.message().to_string(), "✓ 6 repos (cached)");
+    }
+
+    #[test]
+    fn cache_hit_creates_finished_fetch_state_when_missing() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::CacheHit {
+            namespace: "new-org".to_string(),
+            cached_count: 9,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let fetch_state = state
+            .fetch_bars
+            .get("new-org")
+            .expect("cache hit should create state when namespace is missing");
+
+        assert!(fetch_state.done);
+        assert_eq!(fetch_state.total_repos, Some(9));
+        assert_eq!(fetch_state.bar.length(), Some(1));
+        assert_eq!(fetch_state.bar.position(), 1);
+        assert_eq!(fetch_state.bar.message().to_string(), "✓ 9 repos (cached)");
+    }
+
+    #[test]
+    fn starring_repos_uses_checking_message_for_dry_run() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::StarringRepos {
+            count: 1,
+            concurrency: 1,
+            dry_run: true,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let star_bar = state
+            .star_bar
+            .as_ref()
+            .expect("star bar should exist after starring starts");
+
+        assert_eq!(star_bar.message().to_string(), "Checking...");
+    }
+
+    #[test]
+    fn create_bar_helpers_cover_spinner_and_known_total_paths() {
+        let reporter = InteractiveReporter::hidden();
+
+        let mut state = ProgressState {
+            save_total: 4,
+            filter_complete: true,
+            ..Default::default()
+        };
+
+        let save_bar = reporter.create_save_bar(&state);
+        assert_eq!(save_bar.length(), Some(4));
+
+        state.save_bar = Some(save_bar.clone());
+        let filter_bar = reporter.create_filter_bar(&state, false);
+        assert_eq!(filter_bar.length(), None);
+    }
+
+    #[test]
+    fn finish_marks_all_active_bars_finished() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::FetchingRepos {
+            namespace: "org".to_string(),
+            total_repos: Some(2),
+            expected_pages: Some(1),
+        });
+        reporter.handle(SyncProgress::FilteringByActivity {
+            namespace: "org".to_string(),
+            days: 7,
+        });
+        reporter.handle(SyncProgress::StarringRepos {
+            count: 1,
+            concurrency: 1,
+            dry_run: false,
+        });
+        reporter.handle(SyncProgress::PersistingBatch {
+            count: 1,
+            final_batch: false,
+        });
+
+        reporter.finish();
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let fetch = state.fetch_bars.get("org").expect("fetch bar should exist");
+        assert!(fetch.bar.is_finished());
+        assert!(
+            state
+                .filter_bar
+                .as_ref()
+                .expect("filter bar should exist")
+                .is_finished()
+        );
+        assert!(
+            state
+                .star_bar
+                .as_ref()
+                .expect("star bar should exist")
+                .is_finished()
+        );
+        assert!(
+            state
+                .save_bar
+                .as_ref()
+                .expect("save bar should exist")
+                .is_finished()
+        );
     }
 }

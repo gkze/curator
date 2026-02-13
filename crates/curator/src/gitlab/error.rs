@@ -37,17 +37,14 @@ impl GitLabError {
     }
 
     /// Classify an HTTP status code and response body into a typed error.
-    pub fn from_status(status: reqwest::StatusCode, body: &str) -> Self {
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            Self::Auth(format!("{}: {}", status, body))
-        } else if status == reqwest::StatusCode::NOT_FOUND {
-            Self::Api(format!("Not found: {}", body))
-        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            Self::RateLimited {
+    pub fn from_status_code(status: u16, body: &str) -> Self {
+        match status {
+            401 | 403 => Self::Auth(format!("{}: {}", status, body)),
+            404 => Self::Api(format!("Not found: {}", body)),
+            429 => Self::RateLimited {
                 reset_at: Utc::now() + chrono::Duration::minutes(1),
-            }
-        } else {
-            Self::Api(format!("{}: {}", status, body))
+            },
+            _ => Self::Api(format!("{}: {}", status, body)),
         }
     }
 }
@@ -76,20 +73,7 @@ impl<T: std::fmt::Debug> From<progenitor_client::Error<T>> for GitLabError {
             progenitor_client::Error::InvalidRequest(s) => Self::Api(s.clone()),
             progenitor_client::Error::CommunicationError(e) => Self::Http(e.to_string()),
             progenitor_client::Error::ErrorResponse(rv) => {
-                let status = rv.status();
-                if status == reqwest::StatusCode::UNAUTHORIZED
-                    || status == reqwest::StatusCode::FORBIDDEN
-                {
-                    Self::Auth(msg)
-                } else if status == reqwest::StatusCode::NOT_FOUND {
-                    Self::Api(format!("Not found: {}", msg))
-                } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    Self::RateLimited {
-                        reset_at: Utc::now() + chrono::Duration::minutes(1),
-                    }
-                } else {
-                    Self::Api(msg)
-                }
+                Self::from_status_code(rv.status().as_u16(), &msg)
             }
             _ => Self::Api(msg),
         }
@@ -118,9 +102,10 @@ pub use crate::platform::short_error_message;
 pub fn is_rate_limit_error(e: &GitLabError) -> bool {
     match e {
         GitLabError::RateLimited { .. } => true,
-        GitLabError::Api(msg) | GitLabError::Http(msg) => {
-            msg.contains("429") || msg.contains("rate limit")
-        }
+        GitLabError::Api(msg) => msg.contains("429") || msg.contains("rate limit"),
+        // Http wraps transport-level errors (timeouts, DNS, etc.) — never a rate limit.
+        // Actual 429 responses are classified as RateLimited by from_status_code.
+        GitLabError::Http(_) => false,
         _ => false,
     }
 }
@@ -160,14 +145,20 @@ mod tests {
     }
 
     #[test]
-    fn test_from_status() {
-        let err = GitLabError::from_status(reqwest::StatusCode::UNAUTHORIZED, "bad token");
+    fn test_from_status_code() {
+        let err = GitLabError::from_status_code(401, "bad token");
         assert!(matches!(err, GitLabError::Auth(_)));
 
-        let err = GitLabError::from_status(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down");
+        let err = GitLabError::from_status_code(403, "forbidden");
+        assert!(matches!(err, GitLabError::Auth(_)));
+
+        let err = GitLabError::from_status_code(429, "slow down");
         assert!(matches!(err, GitLabError::RateLimited { .. }));
 
-        let err = GitLabError::from_status(reqwest::StatusCode::NOT_FOUND, "no such thing");
+        let err = GitLabError::from_status_code(404, "no such thing");
+        assert!(matches!(err, GitLabError::Api(_)));
+
+        let err = GitLabError::from_status_code(500, "internal server error");
         assert!(matches!(err, GitLabError::Api(_)));
     }
 }

@@ -10,6 +10,7 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, Set,
 };
 use tabled::{Table, Tabled, settings::Style};
+use url::Url;
 use uuid::Uuid;
 
 use curator::{
@@ -303,8 +304,8 @@ async fn add_instance(
                     "Host is required for custom instance '{}'. Use -H/--host (e.g., gitlab.mycompany.com)",
                     name
                 )
-            })?
-            .to_string();
+            })
+            .and_then(|raw| normalize_host(raw).map_err(|e| e.to_string()))?;
 
         (pt, h, oauth_client_id)
     };
@@ -339,6 +340,52 @@ async fn add_instance(
     println!("  OAuth flow: {}", style(oauth_flow.as_str()).dim().cyan());
 
     Ok(())
+}
+
+fn normalize_host(input: &str) -> Result<String, &'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Host cannot be empty");
+    }
+
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+
+    let parsed = Url::parse(&with_scheme).map_err(|_| "Host must be a valid hostname")?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Host must use http or https when a scheme is provided");
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Host must not include credentials");
+    }
+
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("Host must not include query parameters or fragments");
+    }
+
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        return Err("Host must not include a path");
+    }
+
+    let hostname = parsed
+        .host_str()
+        .ok_or("Host must include a valid domain or IP address")?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+
+    if hostname.is_empty() {
+        return Err("Host must include a valid domain or IP address");
+    }
+
+    Ok(match parsed.port() {
+        Some(port) => format!("{hostname}:{port}"),
+        None => hostname,
+    })
 }
 
 /// List all configured instances.
@@ -551,4 +598,401 @@ async fn show_instance(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::DatabaseConnection;
+
+    fn sqlite_test_url(label: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "curator-cli-instance-tests-{}-{}.db",
+            label,
+            Uuid::new_v4()
+        ));
+        format!("sqlite://{}?mode=rwc", path.display())
+    }
+
+    async fn setup_db(label: &str) -> DatabaseConnection {
+        curator::db::connect_and_migrate(&sqlite_test_url(label))
+            .await
+            .expect("test database should initialize")
+    }
+
+    #[test]
+    fn normalize_host_accepts_plain_hostname() {
+        assert_eq!(
+            normalize_host("GitLab.MyCompany.com").unwrap(),
+            "gitlab.mycompany.com"
+        );
+    }
+
+    #[test]
+    fn normalize_host_strips_scheme_and_trailing_dot() {
+        assert_eq!(
+            normalize_host("https://example.com.").unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_host_keeps_port() {
+        assert_eq!(
+            normalize_host("http://example.com:8443").unwrap(),
+            "example.com:8443"
+        );
+    }
+
+    #[test]
+    fn normalize_host_accepts_explicit_root_path() {
+        assert_eq!(
+            normalize_host("https://Example.COM/").unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_host_rejects_path_or_query() {
+        assert!(normalize_host("example.com/path").is_err());
+        assert!(normalize_host("example.com?x=1").is_err());
+        assert_eq!(
+            normalize_host("example.com#frag").unwrap_err(),
+            "Host must not include query parameters or fragments"
+        );
+    }
+
+    #[test]
+    fn normalize_host_rejects_credentials_and_bad_scheme() {
+        assert_eq!(
+            normalize_host("https://user:pass@example.com").unwrap_err(),
+            "Host must not include credentials"
+        );
+        assert_eq!(
+            normalize_host("ftp://example.com").unwrap_err(),
+            "Host must use http or https when a scheme is provided"
+        );
+    }
+
+    #[test]
+    fn normalize_host_rejects_non_root_path_with_scheme() {
+        assert_eq!(
+            normalize_host("https://example.com/api/v4").unwrap_err(),
+            "Host must not include a path"
+        );
+    }
+
+    #[test]
+    fn normalize_host_accepts_ipv4_with_port() {
+        assert_eq!(
+            normalize_host("192.168.1.10:8443").unwrap(),
+            "192.168.1.10:8443"
+        );
+    }
+
+    #[test]
+    fn normalize_host_rejects_empty_and_missing_hostname() {
+        assert_eq!(normalize_host("   ").unwrap_err(), "Host cannot be empty");
+        assert_eq!(
+            normalize_host("https://").unwrap_err(),
+            "Host must be a valid hostname"
+        );
+    }
+
+    #[test]
+    fn oauth_flow_arg_as_str_covers_all_variants() {
+        assert_eq!(OauthFlowArg::Auto.as_str(), "auto");
+        assert_eq!(OauthFlowArg::Device.as_str(), "device");
+        assert_eq!(OauthFlowArg::Pkce.as_str(), "pkce");
+        assert_eq!(OauthFlowArg::Token.as_str(), "token");
+    }
+
+    #[test]
+    fn instance_display_from_model_uses_expected_fields() {
+        let model = InstanceModel {
+            id: Uuid::new_v4(),
+            name: "my-instance".to_string(),
+            platform_type: PlatformType::GitLab,
+            host: "gitlab.example.com".to_string(),
+            oauth_client_id: Some("cid".to_string()),
+            oauth_flow: "pkce".to_string(),
+            created_at: Utc::now().fixed_offset(),
+        };
+
+        let display = InstanceDisplay::from(&model);
+
+        assert_eq!(display.name, "my-instance");
+        assert_eq!(display.platform_type, "gitlab");
+        assert_eq!(display.host, "gitlab.example.com");
+        assert!(display.api_url.contains("gitlab.example.com"));
+        assert_eq!(display.created_at.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn add_instance_rejects_invalid_platform_type_with_clear_error() {
+        let db = setup_db("invalid-platform").await;
+
+        let err = add_instance(
+            &db,
+            "my-custom",
+            Some("not-a-platform"),
+            Some("git.example.com"),
+            None,
+            OauthFlowArg::Token,
+        )
+        .await
+        .expect_err("invalid platform type should fail");
+
+        assert!(
+            err.to_string().contains("Invalid platform type:"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_instance_custom_requires_platform_and_host() {
+        let db = setup_db("custom-required-fields").await;
+
+        let missing_platform = add_instance(
+            &db,
+            "my-custom",
+            None,
+            Some("git.example.com"),
+            None,
+            OauthFlowArg::Auto,
+        )
+        .await
+        .expect_err("custom instance without platform should fail");
+        assert!(
+            missing_platform
+                .to_string()
+                .contains("Platform type is required for custom instance 'my-custom'"),
+            "unexpected error: {missing_platform}"
+        );
+
+        let missing_host = add_instance(
+            &db,
+            "my-custom",
+            Some("gitlab"),
+            None,
+            None,
+            OauthFlowArg::Auto,
+        )
+        .await
+        .expect_err("custom instance without host should fail");
+        assert!(
+            missing_host
+                .to_string()
+                .contains("Host is required for custom instance 'my-custom'"),
+            "unexpected error: {missing_host}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_instance_well_known_prefers_explicit_oauth_client_id() {
+        let db = setup_db("well-known-client-id-precedence").await;
+
+        Instance::delete_many()
+            .filter(InstanceColumn::Name.eq("github"))
+            .exec(&db)
+            .await
+            .expect("existing github seed should be removable for test");
+
+        add_instance(
+            &db,
+            "github",
+            None,
+            None,
+            Some("cli-client-id".to_string()),
+            OauthFlowArg::Auto,
+        )
+        .await
+        .expect("well-known instance should be created");
+
+        let github = Instance::find()
+            .filter(InstanceColumn::Name.eq("github"))
+            .one(&db)
+            .await
+            .expect("query should succeed")
+            .expect("instance should exist");
+
+        assert_eq!(github.oauth_client_id.as_deref(), Some("cli-client-id"));
+    }
+
+    #[tokio::test]
+    async fn update_instance_rejects_conflicts_and_empty_update() {
+        let db = setup_db("update-errors").await;
+
+        add_instance(
+            &db,
+            "my-gitlab",
+            Some("gitlab"),
+            Some("gitlab.example.com"),
+            Some("cid".to_string()),
+            OauthFlowArg::Auto,
+        )
+        .await
+        .expect("seed instance should be created");
+
+        let conflict_err =
+            update_instance(&db, "my-gitlab", Some("new-cid".to_string()), true, None)
+                .await
+                .expect_err("conflicting update flags should fail");
+        assert!(
+            conflict_err
+                .to_string()
+                .contains("Use either --oauth-client-id or --clear-oauth-client-id"),
+            "unexpected error: {conflict_err}"
+        );
+
+        let noop_err = update_instance(&db, "my-gitlab", None, false, None)
+            .await
+            .expect_err("empty update should fail");
+        assert!(
+            noop_err
+                .to_string()
+                .contains("No updates requested. Set --oauth-client-id"),
+            "unexpected error: {noop_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_instance_reports_missing_instance_name() {
+        let db = setup_db("update-missing").await;
+
+        let err = update_instance(&db, "missing", None, false, Some(OauthFlowArg::Token))
+            .await
+            .expect_err("missing instance should fail");
+
+        assert!(
+            err.to_string().contains("Instance 'missing' not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_instance_rejects_duplicate_name_with_clear_error() {
+        let db = setup_db("duplicate-instance").await;
+
+        add_instance(
+            &db,
+            "my-gitlab",
+            Some("gitlab"),
+            Some("gitlab.example.com"),
+            None,
+            OauthFlowArg::Auto,
+        )
+        .await
+        .expect("first insert should succeed");
+
+        let err = add_instance(
+            &db,
+            "my-gitlab",
+            Some("gitlab"),
+            Some("gitlab.example.com"),
+            None,
+            OauthFlowArg::Auto,
+        )
+        .await
+        .expect_err("duplicate insert should fail");
+
+        assert_eq!(err.to_string(), "Instance 'my-gitlab' already exists");
+    }
+
+    #[tokio::test]
+    async fn update_instance_can_clear_client_id_and_switch_flow() {
+        let db = setup_db("update-clear-and-flow").await;
+
+        add_instance(
+            &db,
+            "my-gitea",
+            Some("gitea"),
+            Some("gitea.example.com"),
+            Some("initial-client-id".to_string()),
+            OauthFlowArg::Auto,
+        )
+        .await
+        .expect("seed instance should be created");
+
+        update_instance(&db, "my-gitea", None, true, Some(OauthFlowArg::Token))
+            .await
+            .expect("update should succeed");
+
+        let updated = Instance::find()
+            .filter(InstanceColumn::Name.eq("my-gitea"))
+            .one(&db)
+            .await
+            .expect("query should succeed")
+            .expect("instance should exist");
+
+        assert_eq!(updated.oauth_client_id, None);
+        assert_eq!(updated.oauth_flow, "token");
+    }
+
+    #[tokio::test]
+    async fn update_instance_only_changes_flow_when_requested() {
+        let db = setup_db("update-flow-only").await;
+
+        add_instance(
+            &db,
+            "my-gitlab",
+            Some("gitlab"),
+            Some("gitlab.example.com"),
+            Some("client-id".to_string()),
+            OauthFlowArg::Auto,
+        )
+        .await
+        .expect("seed instance should be created");
+
+        update_instance(&db, "my-gitlab", None, false, Some(OauthFlowArg::Pkce))
+            .await
+            .expect("flow-only update should succeed");
+
+        let updated = Instance::find()
+            .filter(InstanceColumn::Name.eq("my-gitlab"))
+            .one(&db)
+            .await
+            .expect("query should succeed")
+            .expect("instance should exist");
+
+        assert_eq!(updated.oauth_client_id.as_deref(), Some("client-id"));
+        assert_eq!(updated.oauth_flow, "pkce");
+    }
+
+    #[tokio::test]
+    async fn handle_instance_dispatches_show_and_remove_errors_for_missing_instance() {
+        let db = setup_db("handle-instance-dispatch").await;
+
+        let show_err = handle_instance(
+            InstanceAction::Show {
+                name: "missing".to_string(),
+                output: OutputFormat::Json,
+            },
+            &db,
+        )
+        .await
+        .expect_err("show should fail for missing instance");
+        assert!(
+            show_err
+                .to_string()
+                .contains("Instance 'missing' not found"),
+            "unexpected error: {show_err}"
+        );
+
+        let remove_err = handle_instance(
+            InstanceAction::Remove {
+                name: "missing".to_string(),
+                yes: true,
+            },
+            &db,
+        )
+        .await
+        .expect_err("remove should fail for missing instance");
+        assert!(
+            remove_err
+                .to_string()
+                .contains("Instance 'missing' not found"),
+            "unexpected error: {remove_err}"
+        );
+    }
 }

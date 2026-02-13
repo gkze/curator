@@ -264,3 +264,133 @@ pub async fn get_sync_info_by_instance_and_owner(
         )
         .collect())
 }
+
+#[cfg(all(test, feature = "sqlite", feature = "migrate"))]
+mod tests {
+    use chrono::{Duration, Utc};
+    use sea_orm::{EntityTrait, Set};
+
+    use crate::connect_and_migrate;
+    use crate::entity::code_repository::ActiveModel;
+    use crate::entity::code_visibility::CodeVisibility;
+    use crate::entity::instance::{ActiveModel as InstanceActiveModel, Entity as Instance};
+    use crate::entity::platform_type::PlatformType;
+    use crate::repository;
+
+    use super::*;
+
+    fn test_instance_id() -> Uuid {
+        Uuid::parse_str("00000000-0000-0000-0000-000000000222").expect("valid uuid")
+    }
+
+    async fn setup_db() -> DatabaseConnection {
+        let db = connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("test db should migrate");
+
+        let now = Utc::now().fixed_offset();
+        let instance = InstanceActiveModel {
+            id: Set(test_instance_id()),
+            name: Set("query-test".to_string()),
+            platform_type: Set(PlatformType::GitHub),
+            host: Set("query-test.example.com".to_string()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set("auto".to_string()),
+            created_at: Set(now),
+        };
+        Instance::insert(instance)
+            .exec(&db)
+            .await
+            .expect("instance should insert");
+
+        db
+    }
+
+    fn model(
+        owner: &str,
+        name: &str,
+        platform_id: i64,
+        synced_at: chrono::DateTime<Utc>,
+    ) -> ActiveModel {
+        let fixed = synced_at.fixed_offset();
+        ActiveModel {
+            id: Set(Uuid::new_v4()),
+            instance_id: Set(test_instance_id()),
+            platform_id: Set(platform_id),
+            owner: Set(owner.to_string()),
+            name: Set(name.to_string()),
+            description: Set(None),
+            default_branch: Set("main".to_string()),
+            topics: Set(serde_json::json!([])),
+            primary_language: Set(None),
+            license_spdx: Set(None),
+            homepage: Set(None),
+            visibility: Set(CodeVisibility::Public),
+            is_fork: Set(false),
+            is_mirror: Set(false),
+            is_archived: Set(false),
+            is_template: Set(false),
+            is_empty: Set(false),
+            stars: Set(None),
+            forks: Set(None),
+            open_issues: Set(None),
+            watchers: Set(None),
+            size_kb: Set(None),
+            has_issues: Set(true),
+            has_wiki: Set(true),
+            has_pull_requests: Set(true),
+            created_at: Set(Some(fixed)),
+            updated_at: Set(Some(fixed)),
+            pushed_at: Set(Some(fixed)),
+            platform_metadata: Set(serde_json::json!({})),
+            synced_at: Set(fixed),
+            etag: Set(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_stale_orders_oldest_first_and_honors_limit() {
+        let db = setup_db().await;
+        let now = Utc::now();
+        repository::bulk_upsert(
+            &db,
+            vec![
+                model("org", "oldest", 1, now - Duration::days(20)),
+                model("org", "middle", 2, now - Duration::days(10)),
+                model("org", "new", 3, now - Duration::days(1)),
+            ],
+        )
+        .await
+        .expect("seed data should insert");
+
+        let stale = find_stale(&db, now - Duration::days(2), 2)
+            .await
+            .expect("find_stale should succeed");
+
+        assert_eq!(stale.len(), 2);
+        assert_eq!(stale[0].name, "oldest");
+        assert_eq!(stale[1].name, "middle");
+    }
+
+    #[tokio::test]
+    async fn test_get_sync_info_by_instance_and_owner_maps_nullable_timestamps() {
+        let db = setup_db().await;
+        let mut active = model("org", "active", 11, Utc::now());
+        active.updated_at = Set(None);
+        active.pushed_at = Set(None);
+
+        repository::bulk_upsert(&db, vec![active])
+            .await
+            .expect("seed data should insert");
+
+        let info = get_sync_info_by_instance_and_owner(&db, test_instance_id(), "org")
+            .await
+            .expect("sync info query should succeed");
+
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].platform_id, 11);
+        assert_eq!(info[0].name, "active");
+        assert!(info[0].updated_at.is_none());
+        assert!(info[0].pushed_at.is_none());
+    }
+}
