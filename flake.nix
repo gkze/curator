@@ -286,11 +286,6 @@
                     "*.jsonc"
                     "*.html"
                   ];
-                  # Config lives in biome.json at repo root; treefmt-nix's
-                  # --config-path passes a file but Biome v2 expects a
-                  # directory, causing hangs. Skip settings here entirely.
-                  settings = { };
-                  validate.enable = false;
                 };
                 rustfmt = {
                   enable = true;
@@ -318,6 +313,15 @@
                   );
                 };
               };
+              # treefmt-nix unconditionally passes --config-path <file> to
+              # biome, but Biome v2 expects a directory and hangs on a file.
+              # Override options to drop --config-path so biome discovers
+              # ./biome.json via its own config resolution.
+              settings.formatter.biome.options = lib.mkForce [
+                "check"
+                "--write"
+                "--no-errors-on-unmatched"
+              ];
             };
           in
           treefmt-nix.lib.mkWrapper pkgs (
