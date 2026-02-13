@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/curator", "crates/curator_cli"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 
 [workspace.metadata.crane]
 name = "curator"
