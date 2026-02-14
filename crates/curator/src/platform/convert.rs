@@ -165,3 +165,135 @@ impl PlatformRepo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{FixedOffset, TimeZone, Utc};
+
+    use crate::entity::code_visibility::CodeVisibility;
+
+    use super::*;
+
+    fn make_model(topics: serde_json::Value) -> CodeRepositoryModel {
+        let dt = FixedOffset::east_opt(5 * 3600)
+            .expect("offset")
+            .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
+            .single()
+            .expect("datetime");
+
+        CodeRepositoryModel {
+            id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            platform_id: 123,
+            owner: "org".to_string(),
+            name: "repo".to_string(),
+            description: Some("desc".to_string()),
+            default_branch: "main".to_string(),
+            topics,
+            primary_language: Some("Rust".to_string()),
+            license_spdx: Some("MIT".to_string()),
+            homepage: Some("https://example.com".to_string()),
+            visibility: CodeVisibility::Public,
+            is_fork: false,
+            is_mirror: true,
+            is_archived: false,
+            is_template: false,
+            is_empty: false,
+            stars: Some(10),
+            forks: Some(2),
+            open_issues: Some(1),
+            watchers: Some(4),
+            size_kb: Some(123),
+            has_issues: true,
+            has_wiki: true,
+            has_pull_requests: true,
+            created_at: Some(dt),
+            updated_at: Some(dt),
+            pushed_at: Some(dt),
+            platform_metadata: serde_json::json!({"k": "v"}),
+            synced_at: Utc::now().fixed_offset(),
+            etag: Some("etag".to_string()),
+        }
+    }
+
+    #[test]
+    fn strip_null_values_removes_null_object_keys_and_recurses() {
+        let input = serde_json::json!({
+            "keep": 1,
+            "drop": null,
+            "nested": {"a": null, "b": 2},
+            "arr": [
+                {"x": null, "y": 3},
+                null,
+                4
+            ]
+        });
+
+        let stripped = strip_null_values(input);
+
+        assert_eq!(
+            stripped,
+            serde_json::json!({
+                "keep": 1,
+                "nested": {"b": 2},
+                "arr": [
+                    {"y": 3},
+                    null,
+                    4
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn strip_null_values_preserves_scalars() {
+        assert_eq!(
+            strip_null_values(serde_json::json!("x")),
+            serde_json::json!("x")
+        );
+        assert_eq!(
+            strip_null_values(serde_json::json!(123)),
+            serde_json::json!(123)
+        );
+        assert_eq!(
+            strip_null_values(serde_json::json!(null)),
+            serde_json::json!(null)
+        );
+    }
+
+    #[test]
+    fn platform_repo_from_model_maps_fields_and_filters_topics() {
+        let model = make_model(serde_json::json!(["rust", 1, null, "cli"]));
+
+        let repo = PlatformRepo::from_model(&model);
+
+        assert_eq!(repo.platform_id, 123);
+        assert_eq!(repo.owner, "org");
+        assert_eq!(repo.name, "repo");
+        assert_eq!(repo.description.as_deref(), Some("desc"));
+        assert_eq!(repo.default_branch, "main");
+        assert_eq!(repo.visibility, CodeVisibility::Public);
+        assert!(!repo.is_fork);
+        assert!(!repo.is_archived);
+        assert_eq!(repo.stars, Some(10));
+        assert_eq!(repo.forks, Some(2));
+        assert_eq!(repo.language.as_deref(), Some("Rust"));
+        assert_eq!(repo.license.as_deref(), Some("MIT"));
+        assert_eq!(repo.homepage.as_deref(), Some("https://example.com"));
+        assert_eq!(repo.size_kb, Some(123));
+        assert_eq!(repo.topics, vec!["rust".to_string(), "cli".to_string()]);
+        assert_eq!(repo.metadata, serde_json::json!({"k": "v"}));
+
+        let ts = model.created_at.expect("created_at").timestamp();
+        assert_eq!(repo.created_at.expect("created_at").timestamp(), ts);
+        assert_eq!(repo.updated_at.expect("updated_at").timestamp(), ts);
+        assert_eq!(repo.pushed_at.expect("pushed_at").timestamp(), ts);
+    }
+
+    #[test]
+    fn platform_repo_from_model_handles_non_array_topics() {
+        let model = make_model(serde_json::json!({"not": "an array"}));
+        let repo = PlatformRepo::from_model(&model);
+        assert!(repo.topics.is_empty());
+    }
+}

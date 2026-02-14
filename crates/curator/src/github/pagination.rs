@@ -373,6 +373,7 @@ impl GitHubClient {
                 pagination,
             } => {
                 let count = items.len();
+                stats.pages_fetched += 1;
 
                 if let Some(total) = pagination.total_pages {
                     known_total_pages = Some(total);
@@ -602,6 +603,13 @@ mod tests {
 
     fn request_header(req: &HttpRequest, name: &str) -> Option<String> {
         crate::header_get(&req.headers, name).map(|v| v.to_string())
+    }
+
+    fn item_array_json(count: usize) -> String {
+        let entries: Vec<serde_json::Value> = (0..count)
+            .map(|idx| serde_json::json!({"id": idx as u64}))
+            .collect();
+        serde_json::Value::Array(entries).to_string()
     }
 
     #[cfg(feature = "migrate")]
@@ -872,6 +880,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fetch_pages_stops_by_count_heuristic_without_pagination() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+
+        push_response(
+            &transport,
+            "http://local.test/repos?page=1",
+            200,
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"p1\"".to_string()),
+            ],
+            &item_array_json(100),
+        );
+        push_response(
+            &transport,
+            "http://local.test/repos?page=2",
+            200,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            &item_array_json(20),
+        );
+
+        let octocrab = Octocrab::builder()
+            .build()
+            .expect("octocrab client should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let config = PaginatedFetchConfig {
+            endpoint_type: EndpointType::UserRepos,
+            namespace: "octocat",
+            route_fn: Box::new(|page| format!("/repos?page={}", page)),
+            cache_key_fn: Box::new(|page| format!("octocat/page/{}", page)),
+            expected_total_repos: None,
+            skip_rate_checks: true,
+        };
+
+        let result = client
+            .fetch_pages::<serde_json::Value>(&config, None, None)
+            .await
+            .expect("fetch should stop on count heuristic");
+
+        assert_eq!(result.items.len(), 120);
+        assert_eq!(result.stats.pages_fetched, 2);
+        assert_eq!(result.stats.cache_hits, 0);
+        assert!(!result.all_cache_hits);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url, "http://local.test/repos?page=1");
+        assert_eq!(
+            request_header(&requests[0], "Accept").as_deref(),
+            Some("application/vnd.github+json")
+        );
+        assert_eq!(
+            request_header(&requests[0], "User-Agent").as_deref(),
+            Some("curator")
+        );
+        assert!(
+            request_header(&requests[0], "Authorization")
+                .unwrap_or_default()
+                .starts_with("Bearer")
+        );
+        assert_eq!(requests[1].url, "http://local.test/repos?page=2");
+    }
+
+    #[tokio::test]
     async fn test_fetch_pages_not_modified_without_known_total_stops_after_first_page() {
         let transport = MockTransport::new();
         let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
@@ -911,6 +990,118 @@ mod tests {
         assert_eq!(result.stats.pages_fetched, 0);
         assert_eq!(result.stats.cache_hits, 1);
         assert!(result.all_cache_hits);
+    }
+
+    #[cfg(feature = "migrate")]
+    #[tokio::test]
+    async fn test_fetch_pages_streaming_not_modified_first_page_completes_early() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+
+        push_response(
+            &transport,
+            "http://local.test/repos?page=1",
+            304,
+            Vec::new(),
+            "",
+        );
+
+        let octocrab = Octocrab::builder()
+            .build()
+            .expect("octocrab client should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<serde_json::Value>(128);
+        let config = PaginatedFetchConfig {
+            endpoint_type: EndpointType::UserRepos,
+            namespace: "octocat",
+            route_fn: Box::new(|page| format!("/repos?page={}", page)),
+            cache_key_fn: Box::new(|page| format!("octocat/page/{}", page)),
+            expected_total_repos: None,
+            skip_rate_checks: true,
+        };
+
+        let (count, stats) = client
+            .fetch_pages_streaming::<serde_json::Value, serde_json::Value, _>(
+                &config,
+                None,
+                tx,
+                |item| item.clone(),
+                4,
+                None,
+            )
+            .await
+            .expect("streaming fetch should return from not-modified first page");
+
+        assert_eq!(count, 0);
+        assert_eq!(stats.pages_fetched, 0);
+        assert_eq!(stats.cache_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_pages_streaming_first_page_short_count_returns_early() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+
+        push_response(
+            &transport,
+            "http://local.test/repos?page=1",
+            200,
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"p1\"".to_string()),
+            ],
+            &item_array_json(42),
+        );
+
+        let octocrab = Octocrab::builder()
+            .build()
+            .expect("octocrab client should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<serde_json::Value>(128);
+        let config = PaginatedFetchConfig {
+            endpoint_type: EndpointType::UserRepos,
+            namespace: "octocat",
+            route_fn: Box::new(|page| format!("/repos?page={}", page)),
+            cache_key_fn: Box::new(|page| format!("octocat/page/{}", page)),
+            expected_total_repos: None,
+            skip_rate_checks: true,
+        };
+
+        let (count, stats) = client
+            .fetch_pages_streaming::<serde_json::Value, serde_json::Value, _>(
+                &config,
+                None,
+                tx,
+                |item| item.clone(),
+                4,
+                None,
+            )
+            .await
+            .expect("streaming fetch should return from short first page");
+
+        assert_eq!(count, 42);
+        assert_eq!(stats.pages_fetched, 1);
+        assert_eq!(stats.cache_hits, 0);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, "http://local.test/repos?page=1");
+        assert_eq!(
+            request_header(&requests[0], "Accept").as_deref(),
+            Some("application/vnd.github+json")
+        );
     }
 
     #[cfg(feature = "migrate")]

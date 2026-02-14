@@ -552,12 +552,123 @@ fn copy_to_clipboard(text: &str) -> bool {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseBackend, Set, Statement};
-    use std::sync::{Mutex, OnceLock};
+    use sea_orm::{
+        ConnectionTrait, DatabaseBackend, EntityTrait, Set, Statement, sea_query::OnConflict,
+    };
+    use std::ffi::OsString;
+    use std::fs;
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
+    use toml_edit::DocumentMut;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn assert_config_value(path: &std::path::Path, section: &str, key: &str, expected: &str) {
+        let config_contents =
+            fs::read_to_string(path).expect("login flow should write config file");
+        let document = config_contents
+            .parse::<DocumentMut>()
+            .expect("config file should remain valid toml");
+
+        let section = document
+            .get(section)
+            .and_then(|value| value.as_table())
+            .expect("config file should include expected section");
+
+        let actual = section
+            .get(key)
+            .and_then(|value| value.as_str())
+            .expect("config value should be a string");
+
+        assert_eq!(actual, expected);
+    }
+
+    struct TempConfigEnv {
+        temp_dir: std::path::PathBuf,
+        previous_home: Option<OsString>,
+        previous_xdg_config_home: Option<OsString>,
+    }
+
+    impl TempConfigEnv {
+        fn new(label: &str) -> Self {
+            let temp_dir = std::env::temp_dir().join(format!(
+                "curator-cli-login-tests-{}-{}",
+                label,
+                Uuid::new_v4()
+            ));
+            fs::create_dir_all(&temp_dir).unwrap();
+
+            let previous_home = std::env::var_os("HOME");
+            let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+
+            unsafe {
+                std::env::set_var("HOME", &temp_dir);
+                std::env::set_var("XDG_CONFIG_HOME", &temp_dir);
+            }
+
+            Self {
+                temp_dir,
+                previous_home,
+                previous_xdg_config_home,
+            }
+        }
+
+        fn config_path(&self) -> std::path::PathBuf {
+            Config::default_config_path().expect("config path should be available")
+        }
+    }
+
+    impl Drop for TempConfigEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous_home {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+
+                match &self.previous_xdg_config_home {
+                    Some(home) => std::env::set_var("XDG_CONFIG_HOME", home),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+
+            let _ = fs::remove_dir_all(&self.temp_dir);
+        }
+    }
+
+    async fn insert_instance(db: &DatabaseConnection, instance: &InstanceModel) {
+        use curator::entity::instance::{Column, Entity};
+
+        let active = curator::entity::instance::ActiveModel {
+            id: Set(instance.id),
+            name: Set(instance.name.clone()),
+            platform_type: Set(instance.platform_type),
+            host: Set(instance.host.clone()),
+            oauth_client_id: Set(instance.oauth_client_id.clone()),
+            oauth_flow: Set(instance.oauth_flow.clone()),
+            created_at: Set(instance.created_at),
+        };
+
+        // Migrations seed well-known instances (github.com, gitlab.com, codeberg.org, ...).
+        // These tests need to be able to "insert" those instances without failing on the
+        // platform_type+host uniqueness constraint and still force the desired oauth_flow.
+        Entity::insert(active)
+            .on_conflict(
+                OnConflict::columns([Column::PlatformType, Column::Host])
+                    .update_columns([
+                        Column::Name,
+                        Column::OauthClientId,
+                        Column::OauthFlow,
+                        Column::CreatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(db)
+            .await
+            .expect("insert test instance");
     }
 
     fn sample_instance(
@@ -665,9 +776,9 @@ mod tests {
         assert_eq!(resolve_client_id(&wk_without_client_id), None);
     }
 
-    #[test]
-    fn read_token_with_prompt_uses_env_and_rejects_empty_tokens() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    #[tokio::test]
+    async fn read_token_with_prompt_uses_env_and_rejects_empty_tokens() {
+        let _guard = env_lock().lock().await;
         let key = "CURATOR_TEST_TOKEN_LOGIN";
         unsafe {
             std::env::set_var(key, "  abc123  ");
@@ -688,9 +799,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn read_token_with_prompt_errors_when_non_tty_and_missing_env() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    #[tokio::test]
+    async fn read_token_with_prompt_errors_when_non_tty_and_missing_env() {
+        let _guard = env_lock().lock().await;
         let key = "CURATOR_TEST_TOKEN_MISSING";
         unsafe {
             std::env::remove_var(key);
@@ -703,9 +814,9 @@ mod tests {
         assert!(err.to_string().contains("Provider"));
     }
 
-    #[test]
-    fn read_token_with_prompt_uses_env_even_when_tty_and_token_url_present() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    #[tokio::test]
+    async fn read_token_with_prompt_uses_env_even_when_tty_and_token_url_present() {
+        let _guard = env_lock().lock().await;
         let key = "CURATOR_TEST_TOKEN_TTY_PRECEDENCE";
         unsafe {
             std::env::set_var(key, " from-env ");
@@ -925,5 +1036,119 @@ mod tests {
                 .contains("Instance 'definitely-missing' not found"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "github")]
+    async fn handle_login_dispatches_github_token_flow_with_env_token() {
+        let _guard = env_lock().lock().await;
+        let config_env = TempConfigEnv::new("github-token");
+
+        let db = setup_db("handle-login-github-token").await;
+        let instance = sample_instance("github", "token", PlatformType::GitHub, "github.com");
+        insert_instance(&db, &instance).await;
+
+        unsafe {
+            std::env::set_var("CURATOR_GITHUB_TOKEN", "gh_test_token");
+        }
+
+        let result = handle_login(&instance.name, &db, &Config::default()).await;
+        assert!(
+            result.is_ok(),
+            "github token flow should succeed: {result:?}"
+        );
+
+        let config_path = config_env.config_path();
+        assert_config_value(&config_path, "github", "token", "gh_test_token");
+
+        unsafe {
+            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "gitlab")]
+    async fn handle_login_dispatches_gitlab_token_flow_with_env_token() {
+        let _guard = env_lock().lock().await;
+        let config_env = TempConfigEnv::new("gitlab-token");
+
+        let db = setup_db("handle-login-gitlab-token").await;
+        let instance = sample_instance("gitlab", "token", PlatformType::GitLab, "gitlab.com");
+        insert_instance(&db, &instance).await;
+
+        unsafe {
+            std::env::set_var("CURATOR_GITLAB_TOKEN", "gl_test_token");
+        }
+
+        let result = handle_login(&instance.name, &db, &Config::default()).await;
+        assert!(
+            result.is_ok(),
+            "gitlab token flow should succeed: {result:?}"
+        );
+
+        let config_path = config_env.config_path();
+        assert_config_value(&config_path, "gitlab", "token", "gl_test_token");
+
+        unsafe {
+            std::env::remove_var("CURATOR_GITLAB_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "gitea")]
+    async fn handle_login_dispatches_gitea_token_flow_with_env_token() {
+        let _guard = env_lock().lock().await;
+        let config_env = TempConfigEnv::new("gitea-token");
+
+        let db = setup_db("handle-login-gitea-token").await;
+        let instance =
+            sample_instance("login-gitea", "token", PlatformType::Gitea, "gitea.example");
+        insert_instance(&db, &instance).await;
+
+        unsafe {
+            std::env::set_var("CURATOR_GITEA_TOKEN", "gitea_test_token");
+        }
+
+        let result = handle_login(&instance.name, &db, &Config::default()).await;
+        assert!(
+            result.is_ok(),
+            "gitea token flow should succeed: {result:?}"
+        );
+
+        let config_path = config_env.config_path();
+        assert_config_value(&config_path, "gitea", "token", "gitea_test_token");
+        assert_config_value(&config_path, "gitea", "host", "gitea.example");
+
+        unsafe {
+            std::env::remove_var("CURATOR_GITEA_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "gitea")]
+    async fn handle_login_dispatches_codeberg_token_flow_with_env_token() {
+        let _guard = env_lock().lock().await;
+        let config_env = TempConfigEnv::new("codeberg-token");
+
+        let db = setup_db("handle-login-codeberg-token").await;
+        let instance = sample_instance("codeberg", "token", PlatformType::Gitea, "codeberg.org");
+        insert_instance(&db, &instance).await;
+
+        unsafe {
+            std::env::set_var("CURATOR_CODEBERG_TOKEN", "codeberg_test_token");
+        }
+
+        let result = handle_login(&instance.name, &db, &Config::default()).await;
+        assert!(
+            result.is_ok(),
+            "codeberg token flow should succeed: {result:?}"
+        );
+
+        let config_path = config_env.config_path();
+        assert_config_value(&config_path, "codeberg", "token", "codeberg_test_token");
+
+        unsafe {
+            std::env::remove_var("CURATOR_CODEBERG_TOKEN");
+        }
     }
 }

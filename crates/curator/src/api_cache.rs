@@ -509,4 +509,99 @@ mod tests {
 
         assert_eq!(deleted, 3);
     }
+
+    #[tokio::test]
+    async fn test_get_etag_returns_none_when_entry_missing() {
+        let instance_id = Uuid::new_v4();
+        let cache_key = "rust-lang/page/1";
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([Vec::<Model>::new()])
+            .into_connection();
+
+        let etag = get_etag(&db, instance_id, EndpointType::OrgRepos, cache_key)
+            .await
+            .expect("etag lookup should succeed");
+        assert_eq!(etag, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_returns_model_when_present() {
+        let instance_id = Uuid::new_v4();
+        let cache_key = "rust-lang/page/1";
+        let model = mock_cache_model(
+            instance_id,
+            EndpointType::OrgRepos,
+            cache_key,
+            Some("W/\"etag-123\""),
+            Some(10),
+        );
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![model.clone()]])
+            .into_connection();
+
+        let got = get(&db, instance_id, EndpointType::OrgRepos, cache_key)
+            .await
+            .expect("cache get should succeed")
+            .expect("expected entry");
+
+        assert_eq!(got.instance_id, instance_id);
+        assert_eq!(got.endpoint_type, EndpointType::OrgRepos);
+        assert_eq!(got.cache_key, cache_key);
+        assert_eq!(got.etag, Some("W/\"etag-123\"".to_string()));
+        assert_eq!(got.total_pages, Some(10));
+    }
+
+    #[tokio::test]
+    async fn test_upsert_succeeds_and_updates_existing_row() {
+        let instance_id = Uuid::new_v4();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 1,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        upsert(
+            &db,
+            instance_id,
+            EndpointType::SingleRepo,
+            "owner/repo",
+            Some("W/\"etag\"".to_string()),
+        )
+        .await
+        .expect("upsert should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_delete_by_instance_returns_rows_affected() {
+        let instance_id = Uuid::new_v4();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 7,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        let deleted = delete_by_instance(&db, instance_id)
+            .await
+            .expect("delete by instance should succeed");
+
+        assert_eq!(deleted, 7);
+    }
+
+    #[tokio::test]
+    async fn test_delete_stale_returns_rows_affected() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 2,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        let deleted = delete_stale(&db, Utc::now())
+            .await
+            .expect("delete stale should succeed");
+
+        assert_eq!(deleted, 2);
+    }
 }

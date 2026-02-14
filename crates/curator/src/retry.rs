@@ -181,6 +181,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_retry_config_default() {
@@ -218,5 +219,111 @@ mod tests {
     fn test_into_backoff() {
         let config = RetryConfig::default();
         let _backoff = config.into_backoff();
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestError {
+        message: &'static str,
+        rate_limited: bool,
+    }
+
+    impl std::fmt::Display for TestError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
+    #[tokio::test(start_paused = true)]
+    async fn with_retry_retries_rate_limit_errors_and_emits_progress() {
+        let calls = Arc::new(AtomicU32::new(0));
+
+        let events: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_capture = Arc::clone(&events);
+        let callback: ProgressCallback = Box::new(move |event| {
+            events_capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event);
+        });
+
+        // Operation: fail twice with a rate-limit error, then succeed.
+        let calls_capture = Arc::clone(&calls);
+        let mut operation = move || {
+            let calls_capture = Arc::clone(&calls_capture);
+            async move {
+                let n = calls_capture.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(TestError {
+                        message: "rate limited",
+                        rate_limited: true,
+                    })
+                } else {
+                    Ok(42u32)
+                }
+            }
+        };
+
+        let advancer = tokio::spawn(async {
+            // Advance time repeatedly so any backoff sleeps complete.
+            for _ in 0..30 {
+                tokio::time::advance(Duration::from_secs(60)).await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let result = with_retry(
+            &mut operation,
+            |e: &TestError| e.rate_limited,
+            |e: &TestError| e.to_string(),
+            "org",
+            "repo",
+            Some(&callback),
+        )
+        .await;
+
+        advancer.await.expect("advancer task");
+
+        assert_eq!(result.unwrap(), 42);
+        assert!(calls.load(Ordering::SeqCst) >= 3);
+
+        let events = events.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncProgress::RateLimitBackoff { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn with_retry_does_not_retry_non_rate_limit_errors() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_capture = Arc::clone(&calls);
+
+        let mut operation = move || {
+            let calls_capture = Arc::clone(&calls_capture);
+            async move {
+                calls_capture.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(TestError {
+                    message: "boom",
+                    rate_limited: false,
+                })
+            }
+        };
+
+        let err = with_retry(
+            &mut operation,
+            |e: &TestError| e.rate_limited,
+            |e: &TestError| e.to_string(),
+            "org",
+            "repo",
+            None,
+        )
+        .await
+        .expect_err("expected error");
+
+        assert_eq!(err.to_string(), "boom");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -45,6 +45,14 @@ const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 /// GitHub's OAuth token endpoint.
 const TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 
+fn device_code_url() -> String {
+    std::env::var("CURATOR_GITHUB_DEVICE_CODE_URL").unwrap_or_else(|_| DEVICE_CODE_URL.to_string())
+}
+
+fn token_url() -> String {
+    std::env::var("CURATOR_GITHUB_TOKEN_URL").unwrap_or_else(|_| TOKEN_URL.to_string())
+}
+
 /// Response from GitHub's device code endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceCodeResponse {
@@ -124,7 +132,7 @@ pub async fn request_device_code(scope: &str) -> Result<DeviceCodeResponse, OAut
     let client = Client::new();
 
     let response = client
-        .post(DEVICE_CODE_URL)
+        .post(device_code_url())
         .header("Accept", "application/json")
         .form(&[("client_id", CLIENT_ID), ("scope", scope)])
         .send()
@@ -182,7 +190,7 @@ pub async fn poll_for_token(
         tokio::time::sleep(interval).await;
 
         let response = client
-            .post(TOKEN_URL)
+            .post(token_url())
             .header("Accept", "application/json")
             .form(&[
                 ("client_id", CLIENT_ID),
@@ -245,6 +253,193 @@ pub async fn request_device_code_default() -> Result<DeviceCodeResponse, OAuthEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::{ffi::OsString, thread};
+    use tokio::sync::Mutex as TokioMutex;
+    use uuid::Uuid;
+
+    fn env_lock() -> &'static TokioMutex<()> {
+        use std::sync::OnceLock;
+
+        static LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| TokioMutex::new(()))
+    }
+
+    struct TempGithubOAuthEnv {
+        previous_device_code_url: Option<OsString>,
+        previous_token_url: Option<OsString>,
+    }
+
+    impl TempGithubOAuthEnv {
+        fn new(device_code_url: &str, token_url: &str) -> Self {
+            let previous_device_code_url = std::env::var_os("CURATOR_GITHUB_DEVICE_CODE_URL");
+            let previous_token_url = std::env::var_os("CURATOR_GITHUB_TOKEN_URL");
+
+            unsafe {
+                std::env::set_var("CURATOR_GITHUB_DEVICE_CODE_URL", device_code_url);
+                std::env::set_var("CURATOR_GITHUB_TOKEN_URL", token_url);
+            }
+
+            Self {
+                previous_device_code_url,
+                previous_token_url,
+            }
+        }
+    }
+
+    impl Drop for TempGithubOAuthEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous_device_code_url {
+                    Some(value) => std::env::set_var("CURATOR_GITHUB_DEVICE_CODE_URL", value),
+                    None => std::env::remove_var("CURATOR_GITHUB_DEVICE_CODE_URL"),
+                }
+                match &self.previous_token_url {
+                    Some(value) => std::env::set_var("CURATOR_GITHUB_TOKEN_URL", value),
+                    None => std::env::remove_var("CURATOR_GITHUB_TOKEN_URL"),
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PlannedResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    #[derive(Clone)]
+    struct TestServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    }
+
+    impl TestServer {
+        fn spawn(route_responses: HashMap<String, VecDeque<PlannedResponse>>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            let addr = listener.local_addr().expect("server addr");
+
+            let total: usize = route_responses.values().map(|v| v.len()).sum();
+            let state = Arc::new(Mutex::new(route_responses));
+            let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let requests_for_thread = Arc::clone(&requests);
+            thread::spawn(move || {
+                let mut served = 0usize;
+                for mut stream in listener.incoming().flatten() {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut tmp) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    let request_text = String::from_utf8_lossy(&buf);
+                    let mut lines = request_text.lines();
+                    let request_line = lines.next().unwrap_or_default();
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let raw_path = parts.next().unwrap_or("/");
+                    let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
+
+                    let (headers_str, body_str) = request_text
+                        .split_once("\r\n\r\n")
+                        .unwrap_or((&request_text, ""));
+                    let content_length = headers_str
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            if k.eq_ignore_ascii_case("content-length") {
+                                v.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    let mut body = body_str.as_bytes().to_vec();
+                    while body.len() < content_length {
+                        let mut more = vec![0u8; content_length - body.len()];
+                        match stream.read(&mut more) {
+                            Ok(0) => break,
+                            Ok(n) => body.extend_from_slice(&more[..n]),
+                            Err(_) => break,
+                        }
+                    }
+
+                    requests_for_thread
+                        .lock()
+                        .expect("requests lock")
+                        .push(RecordedRequest {
+                            method,
+                            path: path.clone(),
+                            body: String::from_utf8_lossy(&body).to_string(),
+                        });
+
+                    let planned = {
+                        let mut state = state.lock().expect("state lock");
+                        state.get_mut(&path).and_then(|q| q.pop_front()).unwrap_or(
+                            PlannedResponse {
+                                status: 500,
+                                headers: vec![(
+                                    "content-type".to_string(),
+                                    "text/plain".to_string(),
+                                )],
+                                body: "no planned response".to_string(),
+                            },
+                        )
+                    };
+
+                    let body_bytes = planned.body.as_bytes();
+                    let mut response = format!(
+                        "HTTP/1.1 {} OK\r\nConnection: close\r\nContent-Length: {}\r\n",
+                        planned.status,
+                        body_bytes.len()
+                    );
+                    for (k, v) in planned.headers {
+                        response.push_str(&format!("{}: {}\r\n", k, v));
+                    }
+                    response.push_str("\r\n");
+
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(body_bytes);
+                    let _ = stream.flush();
+
+                    served += 1;
+                    if served >= total {
+                        break;
+                    }
+                }
+            });
+
+            Self {
+                base_url: format!("http://{}", addr),
+                requests,
+            }
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
 
     #[test]
     fn test_client_id_is_set() {
@@ -282,5 +477,162 @@ mod tests {
         assert_eq!(response.access_token, "gho_xxxxxxxxxxxx");
         assert_eq!(response.token_type, "bearer");
         assert_eq!(response.scope, "public_repo");
+    }
+
+    #[tokio::test]
+    async fn request_device_code_default_uses_public_repo_scope() {
+        let _guard = env_lock().lock().await;
+
+        let server = TestServer::spawn(HashMap::from([(
+            "/login/device/code".to_string(),
+            VecDeque::from([PlannedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: r#"{"device_code":"abc","user_code":"ABCD-1234","verification_uri":"https://example.test","expires_in":900,"interval":0}"#
+                    .to_string(),
+            }]),
+        )]));
+
+        let _env = TempGithubOAuthEnv::new(
+            &format!("{}/login/device/code", server.base_url),
+            &format!("{}/login/oauth/access_token", server.base_url),
+        );
+
+        let _ = request_device_code_default()
+            .await
+            .expect("request_device_code_default should succeed");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/login/device/code");
+        assert!(requests[0].body.contains("client_id="));
+        assert!(requests[0].body.contains("scope=public_repo"));
+    }
+
+    #[tokio::test]
+    async fn request_device_code_returns_github_error_on_non_success() {
+        let _guard = env_lock().lock().await;
+
+        let server = TestServer::spawn(HashMap::from([(
+            "/login/device/code".to_string(),
+            VecDeque::from([PlannedResponse {
+                status: 400,
+                headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                body: "bad request".to_string(),
+            }]),
+        )]));
+
+        let _env = TempGithubOAuthEnv::new(
+            &format!("{}/login/device/code", server.base_url),
+            &format!("{}/login/oauth/access_token", server.base_url),
+        );
+
+        let err = request_device_code("public_repo")
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("GitHub error:"));
+        assert!(err.to_string().contains("Failed to get device code"));
+        assert!(err.to_string().contains("bad request"));
+    }
+
+    #[tokio::test]
+    async fn poll_for_token_returns_token_after_pending_and_slow_down() {
+        let _guard = env_lock().lock().await;
+
+        let server = TestServer::spawn(HashMap::from([(
+            "/login/oauth/access_token".to_string(),
+            VecDeque::from([
+                PlannedResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: r#"{"error":"authorization_pending"}"#.to_string(),
+                },
+                PlannedResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: r#"{"error":"slow_down","interval":0}"#.to_string(),
+                },
+                PlannedResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body:
+                        r#"{"access_token":"gho_test","token_type":"bearer","scope":"public_repo"}"#
+                            .to_string(),
+                },
+            ]),
+        )]));
+
+        let _env = TempGithubOAuthEnv::new(
+            &format!("{}/login/device/code", server.base_url),
+            &format!("{}/login/oauth/access_token", server.base_url),
+        );
+
+        let device_code = DeviceCodeResponse {
+            device_code: "device".to_string(),
+            user_code: "ABCD-1234".to_string(),
+            verification_uri: "https://example.test".to_string(),
+            expires_in: 60,
+            interval: 0,
+        };
+
+        let token = poll_for_token(&device_code)
+            .await
+            .expect("poll_for_token should succeed");
+        assert_eq!(token.access_token, "gho_test");
+        assert_eq!(token.token_type, "bearer");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.path == "/login/oauth/access_token")
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_for_token_maps_known_error_variants() {
+        let _guard = env_lock().lock().await;
+
+        for (error_json, expected) in [
+            (r#"{"error":"expired_token"}"#, "Expired"),
+            (r#"{"error":"access_denied"}"#, "AccessDenied"),
+            (r#"{"error":"incorrect_device_code"}"#, "InvalidDeviceCode"),
+        ] {
+            let server = TestServer::spawn(HashMap::from([(
+                "/login/oauth/access_token".to_string(),
+                VecDeque::from([PlannedResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: error_json.to_string(),
+                }]),
+            )]));
+
+            let _env = TempGithubOAuthEnv::new(
+                &format!("{}/login/device/code", server.base_url),
+                &format!("{}/login/oauth/access_token", server.base_url),
+            );
+
+            let device_code = DeviceCodeResponse {
+                device_code: Uuid::new_v4().to_string(),
+                user_code: "ABCD-1234".to_string(),
+                verification_uri: "https://example.test".to_string(),
+                expires_in: 60,
+                interval: 0,
+            };
+
+            let err = poll_for_token(&device_code)
+                .await
+                .expect_err("should map to an OAuth error");
+
+            let actual = match err {
+                OAuthError::Expired => "Expired",
+                OAuthError::AccessDenied => "AccessDenied",
+                OAuthError::InvalidDeviceCode => "InvalidDeviceCode",
+                other => panic!("unexpected error variant: {other:?}"),
+            };
+            assert_eq!(actual, expected);
+        }
     }
 }

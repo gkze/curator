@@ -92,3 +92,45 @@ pub async fn connect_and_migrate(database_url: &str) -> Result<DatabaseConnectio
     crate::migration::Migrator::up(&db, None).await?;
     Ok(db)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[tokio::test]
+    async fn configure_sqlite_runs_all_pragmas() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([
+                MockExecResult {
+                    rows_affected: 0,
+                    last_insert_id: 0,
+                },
+                MockExecResult {
+                    rows_affected: 0,
+                    last_insert_id: 0,
+                },
+                MockExecResult {
+                    rows_affected: 0,
+                    last_insert_id: 0,
+                },
+            ])
+            .into_connection();
+
+        configure_sqlite(&db)
+            .await
+            .expect("mock sqlite pragma execs should succeed");
+    }
+
+    #[tokio::test]
+    async fn connect_returns_error_for_invalid_database_url() {
+        let err = connect("this-is-not-a-db-url")
+            .await
+            .expect_err("invalid URL should error");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("error") || msg.contains("invalid"),
+            "unexpected error message: {err}"
+        );
+    }
+}

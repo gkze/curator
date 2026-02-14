@@ -126,12 +126,12 @@ pub async fn load_repos_by_instance_and_owner(
         .map_err(|e| PlatformError::internal(e.to_string()))
 }
 
-#[cfg(all(test, feature = "sqlite"))]
+#[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
-    use sea_orm::Database;
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
 
     use crate::entity::code_visibility::CodeVisibility;
 
@@ -173,6 +173,12 @@ mod tests {
         }
     }
 
+    fn model_for_instance(instance_id: Uuid, owner: &str, name: &str) -> Model {
+        let mut m = model(owner, name);
+        m.instance_id = instance_id;
+        m
+    }
+
     #[tokio::test]
     async fn test_handle_cache_hit_fallback_returns_none_without_db() {
         let result = handle_cache_hit_fallback(
@@ -190,9 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_cache_hit_fallback_emits_cache_events_for_non_empty_models() {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("in-memory sqlite should connect");
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
         let events: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
         let events_capture = Arc::clone(&events);
         let callback: ProgressCallback = Box::new(move |event| {
@@ -230,9 +234,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_streaming_cache_hit_fallback_counts_only_successful_sends() {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("in-memory sqlite should connect");
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
         let (tx, rx) = mpsc::channel::<PlatformRepo>(4);
         drop(rx);
         let total_sent = Arc::new(AtomicUsize::new(0));
@@ -251,5 +253,142 @@ mod tests {
 
         assert_eq!(streamed, 2);
         assert_eq!(total_sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_cache_hit_fallback_returns_none_when_cache_hits_is_zero() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let result = handle_cache_hit_fallback(
+            Some(&db),
+            0,
+            |_db| async { Ok(vec![model("org", "repo")]) },
+            "org",
+            None,
+        )
+        .await
+        .expect("fallback should not fail");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_cache_hit_fallback_returns_none_when_loader_returns_empty_models() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let result =
+            handle_cache_hit_fallback(Some(&db), 1, |_db| async { Ok(Vec::new()) }, "org", None)
+                .await
+                .expect("fallback should not fail");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_streaming_cache_hit_fallback_returns_zero_when_loader_returns_empty() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let (tx, _rx) = mpsc::channel::<PlatformRepo>(8);
+        let total_sent = Arc::new(AtomicUsize::new(0));
+
+        let streamed = handle_streaming_cache_hit_fallback(
+            Some(&db),
+            1,
+            |_db| async { Ok(Vec::new()) },
+            "org",
+            &tx,
+            &total_sent,
+            None,
+        )
+        .await
+        .expect("streaming fallback should not fail");
+
+        assert_eq!(streamed, 0);
+        assert_eq!(total_sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_streaming_cache_hit_fallback_increments_total_sent_on_successful_send() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let (tx, mut rx) = mpsc::channel::<PlatformRepo>(8);
+        let total_sent = Arc::new(AtomicUsize::new(0));
+
+        let streamed = handle_streaming_cache_hit_fallback(
+            Some(&db),
+            2,
+            |_db| async { Ok(vec![model("org", "repo1"), model("org", "repo2")]) },
+            "org",
+            &tx,
+            &total_sent,
+            None,
+        )
+        .await
+        .expect("streaming fallback should not fail");
+
+        assert_eq!(streamed, 2);
+        assert_eq!(total_sent.load(Ordering::Relaxed), 2);
+
+        let got_1 = rx.recv().await.expect("expected repo1");
+        let got_2 = rx.recv().await.expect("expected repo2");
+        assert_eq!(got_1.owner, "org");
+        assert_eq!(got_2.owner, "org");
+    }
+
+    #[tokio::test]
+    async fn load_repos_by_instance_returns_models_from_repository_layer() {
+        let instance_id = Uuid::new_v4();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![
+                model_for_instance(instance_id, "org", "repo-a"),
+                model_for_instance(instance_id, "org", "repo-b"),
+            ]])
+            .into_connection();
+
+        let models = load_repos_by_instance(&db, instance_id)
+            .await
+            .expect("load should succeed");
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].instance_id, instance_id);
+        assert_eq!(models[1].instance_id, instance_id);
+    }
+
+    #[tokio::test]
+    async fn load_repos_by_instance_and_owner_returns_models_from_repository_layer() {
+        let instance_id = Uuid::new_v4();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![
+                model_for_instance(instance_id, "org", "repo-a"),
+                model_for_instance(instance_id, "org", "repo-b"),
+            ]])
+            .into_connection();
+
+        let models = load_repos_by_instance_and_owner(&db, instance_id, "org")
+            .await
+            .expect("load should succeed");
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().all(|m| m.owner == "org"));
+    }
+
+    #[tokio::test]
+    async fn load_repos_by_instance_maps_db_errors_to_platform_internal() {
+        let instance_id = Uuid::new_v4();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_errors([DbErr::Custom("boom".to_string())])
+            .into_connection();
+
+        let err = load_repos_by_instance(&db, instance_id)
+            .await
+            .expect_err("expected error");
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn load_repos_by_instance_and_owner_maps_db_errors_to_platform_internal() {
+        let instance_id = Uuid::new_v4();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_errors([DbErr::Custom("boom".to_string())])
+            .into_connection();
+
+        let err = load_repos_by_instance_and_owner(&db, instance_id, "org")
+            .await
+            .expect_err("expected error");
+        assert!(err.to_string().contains("boom"));
     }
 }

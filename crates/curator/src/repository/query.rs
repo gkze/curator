@@ -85,7 +85,7 @@ pub async fn find_all(
         .paginate(db, pagination.per_page);
 
     let total = paginator.num_items().await?;
-    let total_pages = paginator.num_pages().await?;
+    let total_pages = total.div_ceil(pagination.per_page);
     let items = paginator.fetch_page(pagination.page).await?;
 
     Ok(PaginatedResult {
@@ -110,7 +110,7 @@ pub async fn find_by_instance(
         .paginate(db, pagination.per_page);
 
     let total = paginator.num_items().await?;
-    let total_pages = paginator.num_pages().await?;
+    let total_pages = total.div_ceil(pagination.per_page);
     let items = paginator.fetch_page(pagination.page).await?;
 
     Ok(PaginatedResult {
@@ -135,7 +135,7 @@ pub async fn find_by_owner(
         .paginate(db, pagination.per_page);
 
     let total = paginator.num_items().await?;
-    let total_pages = paginator.num_pages().await?;
+    let total_pages = total.div_ceil(pagination.per_page);
     let items = paginator.fetch_page(pagination.page).await?;
 
     Ok(PaginatedResult {
@@ -265,8 +265,234 @@ pub async fn get_sync_info_by_instance_and_owner(
         .collect())
 }
 
-#[cfg(all(test, feature = "sqlite", feature = "migrate"))]
+#[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use sea_orm::sea_query::Value;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::collections::BTreeMap;
+
+    use crate::entity::code_visibility::CodeVisibility;
+
+    use super::*;
+
+    fn count_row(count: u64) -> BTreeMap<String, Value> {
+        let mut row = BTreeMap::new();
+        // SeaORM decodes paginator/count results from the `num_items` column.
+        // For SQLite (and most backends), SeaORM reads this as an i32.
+        row.insert(
+            "num_items".to_string(),
+            Value::Int(Some(count.try_into().unwrap_or(i32::MAX))),
+        );
+        row
+    }
+
+    fn sync_info_row(
+        platform_id: i64,
+        name: &str,
+        updated_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+        pushed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+        synced_at: chrono::DateTime<chrono::FixedOffset>,
+    ) -> BTreeMap<String, Value> {
+        let mut row = BTreeMap::new();
+        row.insert("0".to_string(), Value::BigInt(Some(platform_id)));
+        row.insert(
+            "1".to_string(),
+            Value::String(Some(Box::new(name.to_string()))),
+        );
+        row.insert(
+            "2".to_string(),
+            Value::ChronoDateTimeWithTimeZone(updated_at.map(Box::new)),
+        );
+        row.insert(
+            "3".to_string(),
+            Value::ChronoDateTimeWithTimeZone(pushed_at.map(Box::new)),
+        );
+        row.insert(
+            "4".to_string(),
+            Value::ChronoDateTimeWithTimeZone(Some(Box::new(synced_at))),
+        );
+        row
+    }
+
+    fn model(instance_id: Uuid, owner: &str, name: &str, platform_id: i64) -> Model {
+        Model {
+            id: Uuid::new_v4(),
+            instance_id,
+            platform_id,
+            owner: owner.to_string(),
+            name: name.to_string(),
+            description: None,
+            default_branch: "main".to_string(),
+            topics: serde_json::json!([]),
+            primary_language: None,
+            license_spdx: None,
+            homepage: None,
+            visibility: CodeVisibility::Public,
+            is_fork: false,
+            is_mirror: false,
+            is_archived: false,
+            is_template: false,
+            is_empty: false,
+            stars: None,
+            forks: None,
+            open_issues: None,
+            watchers: None,
+            size_kb: None,
+            has_issues: true,
+            has_wiki: true,
+            has_pull_requests: true,
+            created_at: None,
+            updated_at: None,
+            pushed_at: None,
+            platform_metadata: serde_json::json!({}),
+            synced_at: Utc::now().fixed_offset(),
+            etag: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn find_all_returns_items_and_total_pages() {
+        let instance_id = Uuid::new_v4();
+        let items = vec![
+            model(instance_id, "a", "one", 1),
+            model(instance_id, "a", "two", 2),
+        ];
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            // num_items()
+            .append_query_results([vec![count_row(3)]])
+            // fetch_page()
+            .append_query_results([items.clone()])
+            .into_connection();
+
+        let result = find_all(&db, Pagination::new(0, 2))
+            .await
+            .expect("find_all should succeed");
+
+        assert_eq!(result.total, 3);
+        assert_eq!(result.total_pages, 2);
+        assert_eq!(result.page, 0);
+        assert_eq!(result.per_page, 2);
+        assert_eq!(result.items, items);
+    }
+
+    #[tokio::test]
+    async fn find_by_instance_filters_and_paginates() {
+        let instance_id = Uuid::new_v4();
+        let items = vec![model(instance_id, "org", "repo", 1)];
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![count_row(1)]])
+            .append_query_results([items.clone()])
+            .into_connection();
+
+        let result = find_by_instance(&db, instance_id, Pagination::new(0, 50))
+            .await
+            .expect("query should succeed");
+        assert_eq!(result.total, 1);
+        assert_eq!(result.total_pages, 1);
+        assert_eq!(result.items, items);
+    }
+
+    #[tokio::test]
+    async fn find_by_owner_filters_and_paginates() {
+        let instance_id = Uuid::new_v4();
+        let items = vec![model(instance_id, "org", "repo", 1)];
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![count_row(1)]])
+            .append_query_results([items.clone()])
+            .into_connection();
+
+        let result = find_by_owner(&db, "org", Pagination::new(0, 50))
+            .await
+            .expect("query should succeed");
+        assert_eq!(result.total, 1);
+        assert_eq!(result.total_pages, 1);
+        assert_eq!(result.items, items);
+    }
+
+    #[tokio::test]
+    async fn find_stale_returns_results() {
+        let instance_id = Uuid::new_v4();
+        let items = vec![model(instance_id, "org", "old", 1)];
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([items.clone()])
+            .into_connection();
+
+        let stale = find_stale(&db, Utc::now(), 10)
+            .await
+            .expect("find_stale should succeed");
+        assert_eq!(stale, items);
+    }
+
+    #[tokio::test]
+    async fn count_and_count_by_instance_return_expected_values() {
+        let instance_id = Uuid::new_v4();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![count_row(42)]])
+            .append_query_results([vec![count_row(7)]])
+            .into_connection();
+
+        let total = count(&db).await.expect("count succeeds");
+        assert_eq!(total, 42);
+
+        let total = count_by_instance(&db, instance_id)
+            .await
+            .expect("count_by_instance succeeds");
+        assert_eq!(total, 7);
+    }
+
+    #[tokio::test]
+    async fn find_all_by_instance_and_owner_queries_return_models() {
+        let instance_id = Uuid::new_v4();
+        let all_items = vec![
+            model(instance_id, "org", "a", 1),
+            model(instance_id, "org", "b", 2),
+        ];
+        let owner_items = vec![model(instance_id, "org", "a", 1)];
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([all_items.clone()])
+            .append_query_results([owner_items.clone()])
+            .into_connection();
+
+        let got = find_all_by_instance(&db, instance_id)
+            .await
+            .expect("find_all_by_instance succeeds");
+        assert_eq!(got, all_items);
+
+        let got = find_all_by_instance_and_owner(&db, instance_id, "org")
+            .await
+            .expect("find_all_by_instance_and_owner succeeds");
+        assert_eq!(got, owner_items);
+    }
+
+    #[tokio::test]
+    async fn get_sync_info_by_instance_and_owner_maps_fixed_offset_to_utc() {
+        let instance_id = Uuid::new_v4();
+        let synced_at = Utc::now().fixed_offset();
+        let rows = vec![sync_info_row(99, "repo", None, None, synced_at)];
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([rows])
+            .into_connection();
+
+        let info = get_sync_info_by_instance_and_owner(&db, instance_id, "org")
+            .await
+            .expect("query should succeed");
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].platform_id, 99);
+        assert_eq!(info[0].name, "repo");
+        assert!(info[0].updated_at.is_none());
+        assert!(info[0].pushed_at.is_none());
+    }
+}
+
+#[cfg(all(test, feature = "sqlite", feature = "migrate"))]
+mod integration_tests {
     use chrono::{Duration, Utc};
     use sea_orm::{EntityTrait, Set};
 

@@ -10,3 +10,7 @@ runs:
 
     - name: Setup Magic Nix Cache
       uses: DeterminateSystems/magic-nix-cache-action@v13
+      env:
+        # Magic Nix Cache uses the GitHub API (and GHA cache) under the hood.
+        # If it runs unauthenticated, it can quickly hit rate limits in CI.
+        GITHUB_TOKEN: ${{ github.token }}

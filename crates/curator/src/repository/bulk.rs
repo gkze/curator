@@ -275,3 +275,187 @@ async fn bulk_upsert_inner(db: &DatabaseConnection, models: Vec<ActiveModel>) ->
         .await
         .map_err(RepositoryError::from)
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult, Set};
+
+    use crate::entity::code_visibility::CodeVisibility;
+
+    use super::*;
+
+    fn active_model(instance_id: Uuid, owner: &str, name: &str, platform_id: i64) -> ActiveModel {
+        let now = Utc::now().fixed_offset();
+        ActiveModel {
+            id: Set(Uuid::new_v4()),
+            instance_id: Set(instance_id),
+            platform_id: Set(platform_id),
+            owner: Set(owner.to_string()),
+            name: Set(name.to_string()),
+            description: Set(None),
+            default_branch: Set("main".to_string()),
+            topics: Set(serde_json::json!([])),
+            primary_language: Set(None),
+            license_spdx: Set(None),
+            homepage: Set(None),
+            visibility: Set(CodeVisibility::Public),
+            is_fork: Set(false),
+            is_mirror: Set(false),
+            is_archived: Set(false),
+            is_template: Set(false),
+            is_empty: Set(false),
+            stars: Set(None),
+            forks: Set(None),
+            open_issues: Set(None),
+            watchers: Set(None),
+            size_kb: Set(None),
+            has_issues: Set(true),
+            has_wiki: Set(true),
+            has_pull_requests: Set(true),
+            created_at: Set(Some(now)),
+            updated_at: Set(Some(now)),
+            pushed_at: Set(Some(now)),
+            platform_metadata: Set(serde_json::json!({})),
+            synced_at: Set(now),
+            etag: Set(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_many_returns_zero_for_empty_input() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let count = insert_many(&db, Vec::new()).await.expect("should succeed");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn insert_many_returns_model_count_for_non_empty_input() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 2,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        let instance_id = Uuid::new_v4();
+        let models = vec![
+            active_model(instance_id, "org", "a", 1),
+            active_model(instance_id, "org", "b", 2),
+        ];
+        let count = insert_many(&db, models)
+            .await
+            .expect("insert_many should succeed");
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_returns_zero_for_empty_input() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let count = bulk_upsert(&db, Vec::new()).await.expect("should succeed");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_returns_rows_affected() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 2,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        let instance_id = Uuid::new_v4();
+        let models = vec![
+            active_model(instance_id, "org", "a", 1),
+            active_model(instance_id, "org", "b", 2),
+        ];
+        let count = bulk_upsert(&db, models)
+            .await
+            .expect("bulk_upsert should succeed");
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_with_retry_retries_transient_errors() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_errors([DbErr::Conn(sea_orm::RuntimeErr::Internal(
+                "temporarily unavailable".to_string(),
+            ))])
+            .append_exec_results([MockExecResult {
+                rows_affected: 1,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        let instance_id = Uuid::new_v4();
+        let models = vec![active_model(instance_id, "org", "a", 1)];
+
+        let count = bulk_upsert_with_retry(&db, models, 1, 0)
+            .await
+            .expect("should succeed after retry");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_many_returns_zero_for_empty_input() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let deleted = delete_many(&db, Vec::new()).await.expect("should succeed");
+        assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_many_returns_rows_affected() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 3,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        let deleted = delete_many(&db, vec![Uuid::new_v4(), Uuid::new_v4()])
+            .await
+            .expect("delete_many should succeed");
+        assert_eq!(deleted, 3);
+    }
+
+    #[tokio::test]
+    async fn delete_by_instance_returns_rows_affected() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 5,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+        let deleted = delete_by_instance(&db, Uuid::new_v4())
+            .await
+            .expect("delete_by_instance should succeed");
+        assert_eq!(deleted, 5);
+    }
+
+    #[tokio::test]
+    async fn delete_by_owner_name_batches_in_chunks() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([
+                MockExecResult {
+                    rows_affected: 100,
+                    last_insert_id: 0,
+                },
+                MockExecResult {
+                    rows_affected: 1,
+                    last_insert_id: 0,
+                },
+            ])
+            .into_connection();
+
+        let instance_id = Uuid::new_v4();
+        let repos: Vec<(String, String)> = (0..101)
+            .map(|i| ("org".to_string(), format!("repo-{i}")))
+            .collect();
+
+        let deleted = delete_by_owner_name(&db, instance_id, &repos)
+            .await
+            .expect("delete_by_owner_name should succeed");
+        assert_eq!(deleted, 101);
+    }
+}

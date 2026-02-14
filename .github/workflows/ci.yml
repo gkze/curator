@@ -42,6 +42,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-nix
+      - name: Prefetch Cargo dependencies
+        run: |-
+          # Allow network access here so `cargo` can populate its registry/cache.
+          # Later steps run with `CARGO_NET_OFFLINE=true` and a bogus proxy to
+          # discourage accidental network calls during builds/tests.
+          nix develop --command cargo fetch --locked
       - name: Generate coverage summary
         run: |-
           mkdir -p coverage
@@ -56,6 +62,7 @@ jobs:
             ALL_PROXY="$PROXY_URL" \
             NO_PROXY="$NO_PROXY_LIST" \
             no_proxy="$NO_PROXY_LIST" \
+            CARGO_NET_OFFLINE=true \
             cargo llvm-cov -p curator --no-default-features \
             --features github --summary-only --ignore-run-fail --fail-under-lines 25 \
             | tee coverage/summary.txt
@@ -70,6 +77,7 @@ jobs:
             ALL_PROXY="$PROXY_URL" \
             NO_PROXY="$NO_PROXY_LIST" \
             no_proxy="$NO_PROXY_LIST" \
+            CARGO_NET_OFFLINE=true \
             cargo llvm-cov -p curator --no-default-features \
             --features github --lcov --output-path coverage/lcov.info --ignore-run-fail
       - name: Upload coverage artifacts
@@ -102,6 +110,12 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-nix
+      - name: Prefetch Cargo dependencies
+        run: |-
+          # This job runs `cargo nextest` inside a devShell (not Nix sandboxed).
+          # Fetch dependencies first with normal network access, then run tests
+          # in offline mode to avoid surprise network activity.
+          nix develop --command cargo fetch --locked
       - name: Detect changed crates
         id: changes
         if: github.event_name == 'pull_request'
@@ -134,6 +148,7 @@ jobs:
               ALL_PROXY="$PROXY_URL" \
               NO_PROXY="$NO_PROXY_LIST" \
               no_proxy="$NO_PROXY_LIST" \
+              CARGO_NET_OFFLINE=true \
               cargo nextest run -p curator --no-default-features \
                 --features "$FEATURES" -E "$FILTER"
           else
@@ -145,6 +160,7 @@ jobs:
               ALL_PROXY="$PROXY_URL" \
               NO_PROXY="$NO_PROXY_LIST" \
               no_proxy="$NO_PROXY_LIST" \
+              CARGO_NET_OFFLINE=true \
               cargo nextest run -p curator --no-default-features \
                 --features "$FEATURES"
           fi

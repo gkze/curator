@@ -291,6 +291,208 @@ mod tests {
     use super::*;
     use crate::github::types::RepoIdentity;
     use chrono::{Duration, Utc};
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    #[derive(Clone, Debug)]
+    struct ResponseSpec {
+        method: &'static str,
+        path_prefix: &'static str,
+        status: u16,
+        content_type: Option<&'static str>,
+        body: String,
+    }
+
+    struct TestServer {
+        addr: SocketAddr,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn new(specs: Vec<ResponseSpec>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            listener.set_nonblocking(true).expect("set_nonblocking");
+            let addr = listener.local_addr().expect("local_addr");
+            let specs = Arc::new(Mutex::new(VecDeque::from(specs)));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let specs_thread = Arc::clone(&specs);
+            let seen_thread = Arc::clone(&seen);
+
+            let handle = thread::spawn(move || {
+                let mut last_progress = std::time::Instant::now();
+                while !specs_thread
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()
+                {
+                    let stream = match listener.accept() {
+                        Ok((s, _)) => Ok(s),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if last_progress.elapsed() > std::time::Duration::from_secs(5) {
+                                let remaining =
+                                    specs_thread.lock().unwrap_or_else(|e| e.into_inner()).len();
+                                let seen = seen_thread
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                panic!(
+                                    "timed out waiting for request; remaining specs={remaining}; seen={seen:?}"
+                                );
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(e) => Err(e),
+                    };
+
+                    let mut stream = stream.expect("accept");
+                    stream
+                        .set_nonblocking(false)
+                        .expect("set_nonblocking(false)");
+
+                    let (method, path) = read_request_line(&mut stream);
+                    seen_thread
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((method.clone(), path.clone()));
+
+                    let spec = specs_thread
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pop_front()
+                        .expect("unexpected request (no remaining response specs)");
+
+                    assert_eq!(method, spec.method, "method mismatch for {path}");
+                    assert!(
+                        path.starts_with(spec.path_prefix),
+                        "path mismatch. expected prefix {:?}, got {:?}",
+                        spec.path_prefix,
+                        path
+                    );
+
+                    write_response(&mut stream, &spec);
+
+                    last_progress = std::time::Instant::now();
+                }
+            });
+
+            Self {
+                addr,
+                seen,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn build_octocrab(&self) -> Octocrab {
+            Octocrab::builder()
+                .base_uri(self.base_url())
+                .expect("base_uri")
+                // Any token is fine; we only assert routing.
+                .personal_token("token".to_string())
+                .build()
+                .expect("build octocrab")
+        }
+
+        fn seen_requests(&self) -> Vec<(String, String)> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let res = handle.join();
+                if res.is_err() && !std::thread::panicking() {
+                    panic!("test server thread panicked");
+                }
+            }
+        }
+    }
+
+    fn read_request_line(stream: &mut TcpStream) -> (String, String) {
+        let mut buf = [0u8; 8192];
+        let mut raw = Vec::new();
+        loop {
+            let n = stream.read(&mut buf).expect("read request");
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if raw.len() > 64 * 1024 {
+                panic!("request too large");
+            }
+        }
+
+        let text = String::from_utf8_lossy(&raw);
+        let first_line = text.lines().next().expect("request line");
+        let mut parts = first_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let path = parts.next().unwrap_or("").to_string();
+        (method, path)
+    }
+
+    fn write_response(stream: &mut TcpStream, spec: &ResponseSpec) {
+        let body = spec.body.as_bytes();
+        let mut headers = String::new();
+        if let Some(ct) = spec.content_type {
+            headers.push_str(&format!("Content-Type: {}\r\n", ct));
+        }
+        headers.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        headers.push_str("Connection: close\r\n");
+
+        let status_text = match spec.status {
+            200 => "OK",
+            204 => "No Content",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            _ => "OK",
+        };
+
+        let response = format!(
+            "HTTP/1.1 {} {}\r\n{}\r\n",
+            spec.status, status_text, headers
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write headers");
+        stream.write_all(body).expect("write body");
+        stream.flush().ok();
+    }
+
+    fn rate_limit_json(remaining: u32) -> String {
+        // Octocrab's ratelimit model expects a nested resources/core structure.
+        // Include both `rate` and `resources.core` to be tolerant to model changes.
+        let reset = (Utc::now() + Duration::hours(1)).timestamp();
+        serde_json::json!({
+            "rate": {"limit": 5000, "used": 0, "remaining": remaining, "reset": reset},
+            "resources": {
+                "core": {"limit": 5000, "used": 0, "remaining": remaining, "reset": reset},
+                "search": {"limit": 30, "used": 0, "remaining": 30, "reset": reset},
+                "graphql": {"limit": 5000, "used": 0, "remaining": 5000, "reset": reset}
+            },
+        })
+        .to_string()
+    }
+
+    fn org_info_json(org: &str, public_repos: usize) -> String {
+        serde_json::json!({"login": org, "public_repos": public_repos, "description": "test"})
+            .to_string()
+    }
 
     /// Create a mock GitHubRepo for testing.
     /// Note: octocrab::models::Repository has many fields, we set required ones.
@@ -580,5 +782,201 @@ mod tests {
     fn test_default_backoff_builder() {
         // Just verify it builds without panicking
         let _backoff = default_backoff();
+    }
+
+    #[tokio::test]
+    async fn is_repo_starred_maps_204_and_404() {
+        let server = TestServer::new(vec![
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/user/starred/org/repo",
+                status: 204,
+                content_type: None,
+                body: String::new(),
+            },
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/user/starred/org/other",
+                status: 404,
+                content_type: None,
+                body: String::new(),
+            },
+        ]);
+        let client = server.build_octocrab();
+
+        assert!(is_repo_starred(&client, "org", "repo").await.unwrap());
+        assert!(!is_repo_starred(&client, "org", "other").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn star_repo_stars_when_not_already_starred_and_skips_when_already_starred() {
+        let server = TestServer::new(vec![
+            // not starred => PUT
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/user/starred/org/new",
+                status: 404,
+                content_type: None,
+                body: String::new(),
+            },
+            ResponseSpec {
+                method: "PUT",
+                path_prefix: "/user/starred/org/new",
+                status: 204,
+                content_type: None,
+                body: String::new(),
+            },
+            // already starred => no PUT
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/user/starred/org/already",
+                status: 204,
+                content_type: None,
+                body: String::new(),
+            },
+        ]);
+        let client = server.build_octocrab();
+
+        assert!(star_repo(&client, "org", "new").await.unwrap());
+        assert!(!star_repo(&client, "org", "already").await.unwrap());
+
+        let seen = server.seen_requests();
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn unstar_repo_unstars_only_when_starred() {
+        let server = TestServer::new(vec![
+            // starred => DELETE
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/user/starred/org/starred",
+                status: 204,
+                content_type: None,
+                body: String::new(),
+            },
+            ResponseSpec {
+                method: "DELETE",
+                path_prefix: "/user/starred/org/starred",
+                status: 204,
+                content_type: None,
+                body: String::new(),
+            },
+            // not starred => no DELETE
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/user/starred/org/not-starred",
+                status: 404,
+                content_type: None,
+                body: String::new(),
+            },
+        ]);
+        let client = server.build_octocrab();
+
+        assert!(unstar_repo(&client, "org", "starred").await.unwrap());
+        assert!(!unstar_repo(&client, "org", "not-starred").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_starred_repos_stops_after_short_page() {
+        let repo_a = mock_repo_with_activity("a", None, None);
+        let repo_b = mock_repo_with_activity("b", None, None);
+        let body = serde_json::to_string(&vec![repo_a, repo_b]).expect("serialize repos");
+
+        let server = TestServer::new(vec![
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/rate_limit",
+                status: 200,
+                content_type: Some("application/json"),
+                body: rate_limit_json(1),
+            },
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/user/starred?per_page=100&page=1",
+                status: 200,
+                content_type: Some("application/json"),
+                body,
+            },
+        ]);
+        let client = server.build_octocrab();
+
+        let repos = list_starred_repos(&client, None).await.unwrap();
+        assert_eq!(repos.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_org_repos_paginates_until_end() {
+        let page1: Vec<GitHubRepo> = (0..100)
+            .map(|i| mock_repo_with_activity(&format!("repo-{i}"), None, None))
+            .collect();
+        let page2: Vec<GitHubRepo> = vec![mock_repo_with_activity("last", None, None)];
+
+        let server = TestServer::new(vec![
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/orgs/test-org",
+                status: 200,
+                content_type: Some("application/json"),
+                body: org_info_json("test-org", 101),
+            },
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/rate_limit",
+                status: 200,
+                content_type: Some("application/json"),
+                body: rate_limit_json(1),
+            },
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/orgs/test-org/repos?",
+                status: 200,
+                content_type: Some("application/json"),
+                body: serde_json::to_string(&page1).expect("serialize page1"),
+            },
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/rate_limit",
+                status: 200,
+                content_type: Some("application/json"),
+                body: rate_limit_json(1),
+            },
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/orgs/test-org/repos?",
+                status: 200,
+                content_type: Some("application/json"),
+                body: serde_json::to_string(&page2).expect("serialize page2"),
+            },
+        ]);
+        let client = server.build_octocrab();
+
+        let repos = list_org_repos(&client, "test-org", None).await.unwrap();
+        assert_eq!(repos.len(), 101);
+    }
+
+    #[tokio::test]
+    async fn star_repo_with_retry_succeeds_without_retry_on_first_put() {
+        let server = TestServer::new(vec![
+            ResponseSpec {
+                method: "GET",
+                path_prefix: "/user/starred/org/repo",
+                status: 404,
+                content_type: None,
+                body: String::new(),
+            },
+            ResponseSpec {
+                method: "PUT",
+                path_prefix: "/user/starred/org/repo",
+                status: 204,
+                content_type: None,
+                body: String::new(),
+            },
+        ]);
+        let client = server.build_octocrab();
+        let ok = star_repo_with_retry(&client, "org", "repo", None)
+            .await
+            .unwrap();
+        assert!(ok);
     }
 }

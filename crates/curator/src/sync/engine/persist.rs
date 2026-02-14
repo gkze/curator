@@ -306,4 +306,101 @@ mod tests {
             .count();
         assert_eq!(warnings, 1);
     }
+
+    #[test]
+    fn test_build_models_maps_each_repo() {
+        let client = TestClient;
+        let r1 = repo("org", "one", 1);
+        let r2 = repo("org", "two", 2);
+
+        let models = build_models(&client, &[&r1, &r2]);
+        assert_eq!(models.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_testclient_unused_methods_panic() {
+        async fn assert_panics<F>(f: F)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let handle = tokio::spawn(f);
+            let err = handle.await.expect_err("expected task to panic");
+            assert!(err.is_panic(), "expected panic, got: {err}");
+        }
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.get_rate_limit().await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.get_org_info("org").await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.get_authenticated_user().await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.get_repo("org", "repo", None).await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.list_org_repos("org", None, None).await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.list_user_repos("me", None, None).await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.is_repo_starred("org", "repo").await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.star_repo("org", "repo").await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.star_repo_with_retry("org", "repo", None).await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.unstar_repo("org", "repo").await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let _ = client.list_starred_repos(None, 1, false, None).await;
+        })
+        .await;
+
+        assert_panics(async {
+            let client = TestClient;
+            let (tx, _rx) = mpsc::channel(1);
+            let _ = client
+                .list_starred_repos_streaming(tx, None, 1, false, None)
+                .await;
+        })
+        .await;
+    }
 }

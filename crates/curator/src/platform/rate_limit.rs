@@ -184,3 +184,117 @@ impl AdaptiveRateLimiter {
         1.0 / state.cell_size.as_secs_f64()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration as ChronoDuration, Utc};
+
+    use super::*;
+
+    #[test]
+    fn default_rps_helpers_match_platform_defaults() {
+        assert_eq!(
+            rate_limits::default_rps_for_platform(PlatformType::GitHub),
+            rate_limits::GITHUB_DEFAULT_RPS
+        );
+        assert_eq!(
+            rate_limits::default_rps_for_platform(PlatformType::GitLab),
+            rate_limits::GITLAB_DEFAULT_RPS
+        );
+        assert_eq!(
+            rate_limits::default_rps_for_platform(PlatformType::Gitea),
+            rate_limits::GITEA_DEFAULT_RPS
+        );
+
+        assert_eq!(
+            default_rps_for_platform(PlatformType::GitHub),
+            rate_limits::GITHUB_DEFAULT_RPS
+        );
+        assert_eq!(
+            default_rps_for_platform(PlatformType::GitLab),
+            rate_limits::GITLAB_DEFAULT_RPS
+        );
+        assert_eq!(
+            default_rps_for_platform(PlatformType::Gitea),
+            rate_limits::GITEA_DEFAULT_RPS
+        );
+    }
+
+    #[test]
+    fn adaptive_rate_limiter_new_clamps_zero_to_one_rps() {
+        let limiter = AdaptiveRateLimiter::new(0);
+        let rps = limiter.current_rps();
+        assert!(
+            (rps - 1.0).abs() < 1e-9,
+            "expected ~1 rps when constructed with 0, got {rps}"
+        );
+    }
+
+    #[test]
+    fn adaptive_rate_limiter_update_applies_remaining_over_time_and_clamps() {
+        let limiter = AdaptiveRateLimiter::new(10);
+
+        // Ensure we fall well below MIN_RPS regardless of timestamp truncation.
+        let info_min = RateLimitInfo {
+            limit: 5000,
+            remaining: 1,
+            reset_at: Utc::now() + ChronoDuration::hours(24),
+            retry_after: None,
+        };
+        limiter.update(&info_min);
+        let rps_min = limiter.current_rps();
+        assert!(
+            (rps_min - 0.5).abs() < 1e-6,
+            "expected ~0.5 rps at MIN_RPS clamp, got {rps_min}"
+        );
+
+        // Ensure we exceed MAX_RPS.
+        let info_max = RateLimitInfo {
+            limit: 5000,
+            remaining: 10_000,
+            reset_at: Utc::now() + ChronoDuration::seconds(1),
+            retry_after: None,
+        };
+        limiter.update(&info_max);
+        let rps_max = limiter.current_rps();
+        assert!(
+            (rps_max - 50.0).abs() < 1e-6,
+            "expected ~50 rps at MAX_RPS clamp, got {rps_max}"
+        );
+
+        // A normal value within bounds. Use a large window so truncation noise is tiny.
+        let info_mid = RateLimitInfo {
+            limit: 5000,
+            remaining: 5000,
+            reset_at: Utc::now() + ChronoDuration::seconds(1000),
+            retry_after: None,
+        };
+        limiter.update(&info_mid);
+        let rps_mid = limiter.current_rps();
+        assert!(
+            (4.8..=5.3).contains(&rps_mid),
+            "expected ~5 rps (5000/1000), got {rps_mid}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_rate_limiter_handles_poisoned_mutex_state() {
+        let limiter = AdaptiveRateLimiter::new(1);
+
+        // Poison the mutex by panicking while holding the lock.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = limiter.state.lock().unwrap();
+            panic!("poison");
+        }));
+
+        // These methods use `unwrap_or_else(|e| e.into_inner())` to recover.
+        let _ = limiter.current_rps();
+        limiter.update(&RateLimitInfo {
+            limit: 5000,
+            remaining: 1,
+            reset_at: Utc::now() + ChronoDuration::hours(1),
+            retry_after: None,
+        });
+        limiter.wait().await;
+    }
+}

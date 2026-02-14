@@ -113,8 +113,285 @@ pub async fn delete(db: &DatabaseConnection, id: Uuid) -> Result<u64> {
     Ok(result.rows_affected)
 }
 
-#[cfg(all(test, feature = "sqlite", feature = "migrate"))]
+#[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Set};
+
+    use crate::entity::code_visibility::CodeVisibility;
+
+    use super::*;
+
+    fn model(
+        id: Uuid,
+        instance_id: Uuid,
+        owner: &str,
+        name: &str,
+        platform_id: i64,
+        description: Option<&str>,
+    ) -> Model {
+        Model {
+            id,
+            instance_id,
+            platform_id,
+            owner: owner.to_string(),
+            name: name.to_string(),
+            description: description.map(ToString::to_string),
+            default_branch: "main".to_string(),
+            topics: serde_json::json!([]),
+            primary_language: None,
+            license_spdx: None,
+            homepage: None,
+            visibility: CodeVisibility::Public,
+            is_fork: false,
+            is_mirror: false,
+            is_archived: false,
+            is_template: false,
+            is_empty: false,
+            stars: None,
+            forks: None,
+            open_issues: None,
+            watchers: None,
+            size_kb: None,
+            has_issues: true,
+            has_wiki: true,
+            has_pull_requests: true,
+            created_at: None,
+            updated_at: None,
+            pushed_at: None,
+            platform_metadata: serde_json::json!({}),
+            synced_at: Utc::now().fixed_offset(),
+            etag: None,
+        }
+    }
+
+    fn active_model(
+        instance_id: Uuid,
+        owner: &str,
+        name: &str,
+        platform_id: i64,
+        description: Option<&str>,
+    ) -> ActiveModel {
+        let now = Utc::now().fixed_offset();
+        ActiveModel {
+            id: Set(Uuid::new_v4()),
+            instance_id: Set(instance_id),
+            platform_id: Set(platform_id),
+            owner: Set(owner.to_string()),
+            name: Set(name.to_string()),
+            description: Set(description.map(ToString::to_string)),
+            default_branch: Set("main".to_string()),
+            topics: Set(serde_json::json!([])),
+            primary_language: Set(None),
+            license_spdx: Set(None),
+            homepage: Set(None),
+            visibility: Set(CodeVisibility::Public),
+            is_fork: Set(false),
+            is_mirror: Set(false),
+            is_archived: Set(false),
+            is_template: Set(false),
+            is_empty: Set(false),
+            stars: Set(None),
+            forks: Set(None),
+            open_issues: Set(None),
+            watchers: Set(None),
+            size_kb: Set(None),
+            has_issues: Set(true),
+            has_wiki: Set(true),
+            has_pull_requests: Set(true),
+            created_at: Set(Some(now)),
+            updated_at: Set(Some(now)),
+            pushed_at: Set(Some(now)),
+            platform_metadata: Set(serde_json::json!({})),
+            synced_at: Set(now),
+            etag: Set(None),
+        }
+    }
+
+    #[test]
+    fn required_active_value_accepts_set_and_unchanged_and_rejects_not_set() {
+        let set = sea_orm::ActiveValue::Set("abc".to_string());
+        assert_eq!(required_active_value("field", &set).unwrap(), "abc");
+
+        let unchanged = sea_orm::ActiveValue::Unchanged("def".to_string());
+        assert_eq!(required_active_value("field", &unchanged).unwrap(), "def");
+
+        let not_set: sea_orm::ActiveValue<String> = sea_orm::ActiveValue::NotSet;
+        let err = required_active_value("missing", &not_set).expect_err("should fail");
+        match err {
+            RepositoryError::InvalidInput { message } => {
+                assert!(message.contains("missing"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_returns_inserted_model() {
+        let instance_id = Uuid::new_v4();
+        let expected = model(
+            Uuid::new_v4(),
+            instance_id,
+            "org",
+            "repo",
+            123,
+            Some("desc"),
+        );
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 1,
+                last_insert_id: 0,
+            }])
+            .append_query_results([vec![expected.clone()]])
+            .into_connection();
+
+        let saved = insert(
+            &db,
+            active_model(instance_id, "org", "repo", 123, Some("desc")),
+        )
+        .await
+        .expect("insert should succeed");
+        assert_eq!(saved, expected);
+    }
+
+    #[tokio::test]
+    async fn update_returns_updated_model() {
+        let instance_id = Uuid::new_v4();
+        let expected = model(
+            Uuid::new_v4(),
+            instance_id,
+            "org",
+            "repo",
+            123,
+            Some("updated"),
+        );
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 1,
+                last_insert_id: 0,
+            }])
+            .append_query_results([vec![expected.clone()]])
+            .into_connection();
+
+        let saved = update(
+            &db,
+            active_model(instance_id, "org", "repo", 123, Some("updated")),
+        )
+        .await
+        .expect("update should succeed");
+        assert_eq!(saved, expected);
+    }
+
+    #[tokio::test]
+    async fn find_by_id_returns_some_when_row_exists() {
+        let instance_id = Uuid::new_v4();
+        let expected = model(Uuid::new_v4(), instance_id, "org", "repo", 1, None);
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![expected.clone()]])
+            .into_connection();
+
+        let found = find_by_id(&db, expected.id)
+            .await
+            .expect("lookup should succeed")
+            .expect("expected row");
+        assert_eq!(found, expected);
+    }
+
+    #[tokio::test]
+    async fn find_by_id_returns_none_when_missing() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([Vec::<Model>::new()])
+            .into_connection();
+
+        let found = find_by_id(&db, Uuid::new_v4())
+            .await
+            .expect("lookup should succeed");
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn upsert_inserts_when_missing_and_id_is_unset() {
+        let instance_id = Uuid::new_v4();
+        let inserted = model(Uuid::new_v4(), instance_id, "org", "repo", 7, Some("first"));
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            // find_by_natural_key -> None
+            .append_query_results([Vec::<Model>::new()])
+            // insert -> exec
+            .append_exec_results([MockExecResult {
+                rows_affected: 1,
+                last_insert_id: 0,
+            }])
+            // insert -> returning model
+            .append_query_results([vec![inserted.clone()]])
+            .into_connection();
+
+        let mut item = active_model(instance_id, "org", "repo", 7, Some("first"));
+        item.id = sea_orm::ActiveValue::NotSet;
+
+        let saved = upsert(&db, item).await.expect("upsert should insert");
+        assert_eq!(saved, inserted);
+    }
+
+    #[tokio::test]
+    async fn upsert_updates_when_existing_record_is_present() {
+        let instance_id = Uuid::new_v4();
+        let existing_id = Uuid::new_v4();
+        let existing = model(existing_id, instance_id, "org", "repo", 7, Some("old"));
+        let updated = model(existing_id, instance_id, "org", "repo", 9, Some("new"));
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            // find_by_natural_key -> Some(existing)
+            .append_query_results([vec![existing.clone()]])
+            // update -> exec
+            .append_exec_results([MockExecResult {
+                rows_affected: 1,
+                last_insert_id: 0,
+            }])
+            // update -> returning model
+            .append_query_results([vec![updated.clone()]])
+            .into_connection();
+
+        let mut item = active_model(instance_id, "org", "repo", 9, Some("new"));
+        item.id = sea_orm::ActiveValue::NotSet;
+        let saved = upsert(&db, item).await.expect("upsert should update");
+
+        assert_eq!(saved, updated);
+        assert_eq!(saved.id, existing_id);
+    }
+
+    #[tokio::test]
+    async fn find_by_platform_id_returns_expected_row() {
+        let instance_id = Uuid::new_v4();
+        let expected = model(Uuid::new_v4(), instance_id, "org", "repo", 42, None);
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![expected.clone()]])
+            .into_connection();
+
+        let found = find_by_platform_id(&db, instance_id, 42)
+            .await
+            .expect("lookup should succeed")
+            .expect("expected row");
+        assert_eq!(found, expected);
+    }
+
+    #[tokio::test]
+    async fn delete_returns_rows_affected() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 1,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+
+        let deleted = delete(&db, Uuid::new_v4()).await.expect("delete succeeds");
+        assert_eq!(deleted, 1);
+    }
+}
+
+#[cfg(all(test, feature = "sqlite", feature = "migrate"))]
+mod integration_tests {
     use chrono::Utc;
     use sea_orm::{EntityTrait, Set};
 
