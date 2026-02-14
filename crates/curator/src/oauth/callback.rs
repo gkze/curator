@@ -191,82 +191,10 @@ fn process_callback(expected_state: &str, params: CallbackParams) -> Result<Stri
 }
 
 /// HTML response shown to the user on successful authorization.
-const SUCCESS_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Authorization Successful</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        }
-        .container {
-            text-align: center;
-            background: white;
-            padding: 3rem;
-            border-radius: 1rem;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-        }
-        .checkmark {
-            font-size: 4rem;
-            margin-bottom: 1rem;
-        }
-        h1 { color: #22c55e; margin: 0 0 0.5rem 0; }
-        p { color: #666; margin: 0; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="checkmark">&#x2714;</div>
-        <h1>Authorization Successful!</h1>
-        <p>You can close this window and return to your terminal.</p>
-    </div>
-</body>
-</html>"#;
+const SUCCESS_HTML: &str = include_str!("callback_success.html");
 
 /// HTML response shown to the user on failed authorization.
-const ERROR_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Authorization Failed</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
-            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a5a 100%);
-        }
-        .container {
-            text-align: center;
-            background: white;
-            padding: 3rem;
-            border-radius: 1rem;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-        }
-        .error-icon {
-            font-size: 4rem;
-            margin-bottom: 1rem;
-        }
-        h1 { color: #ef4444; margin: 0 0 0.5rem 0; }
-        p { color: #666; margin: 0; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="error-icon">&#x2718;</div>
-        <h1>Authorization Failed</h1>
-        <p>Please check your terminal for more details.</p>
-    </div>
-</body>
-</html>"#;
+const ERROR_HTML: &str = include_str!("callback_error.html");
 
 #[cfg(test)]
 mod tests {

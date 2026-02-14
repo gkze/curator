@@ -119,7 +119,8 @@
               filter =
                 path: type:
                 (craneLib.filterCargoSources path type)
-                || (lib.hasSuffix ".yaml" path && lib.hasInfix "/specs/" path);
+                || (lib.hasSuffix ".yaml" path && lib.hasInfix "/specs/" path)
+                || (lib.hasSuffix ".html" path && lib.hasInfix "/src/" path);
             };
             commonArgs = {
               inherit src;
