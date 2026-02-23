@@ -129,6 +129,7 @@ enum TokenResponse {
 /// println!("Visit {} and enter code: {}", device_code.verification_uri, device_code.user_code);
 /// ```
 pub async fn request_device_code(scope: &str) -> Result<DeviceCodeResponse, OAuthError> {
+    crate::http::ensure_rustls_crypto_provider();
     let client = Client::new();
 
     let response = client
@@ -176,6 +177,7 @@ pub async fn request_device_code(scope: &str) -> Result<DeviceCodeResponse, OAut
 pub async fn poll_for_token(
     device_code: &DeviceCodeResponse,
 ) -> Result<AccessTokenResponse, OAuthError> {
+    crate::http::ensure_rustls_crypto_provider();
     let client = Client::new();
     let mut interval = Duration::from_secs(device_code.interval);
     let deadline = std::time::Instant::now() + Duration::from_secs(device_code.expires_in);

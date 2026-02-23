@@ -80,6 +80,7 @@ impl GitLabClient {
         let _ = reqwest::header::HeaderValue::from_str(token)
             .map_err(|e| GitLabError::Auth(format!("Invalid token: {}", e)))?;
 
+        crate::http::ensure_rustls_crypto_provider();
         let http = reqwest::Client::builder()
             .user_agent("curator")
             .build()

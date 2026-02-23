@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use quick_xml::Reader;
+use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use url::Url;
 
@@ -137,7 +138,10 @@ fn parse_sitemap(xml: &str) -> SitemapParse {
                 }
             }
             Ok(Event::Text(text)) => {
-                if in_loc && let Ok(value) = text.unescape() {
+                if in_loc
+                    && let Ok(decoded) = text.decode()
+                    && let Ok(value) = unescape(decoded.as_ref())
+                {
                     locs.push(value.into_owned());
                 }
             }

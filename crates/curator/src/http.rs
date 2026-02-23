@@ -75,6 +75,15 @@ pub fn header_get<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+pub(crate) fn ensure_rustls_crypto_provider() {
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 #[cfg(any(
     feature = "github",
     feature = "gitlab",
@@ -94,10 +103,12 @@ pub mod reqwest_transport {
 
     impl ReqwestTransport {
         pub fn new(client: reqwest::Client) -> Self {
+            ensure_rustls_crypto_provider();
             Self { client }
         }
 
         pub fn with_timeout(timeout: StdDuration) -> Result<Self, HttpError> {
+            ensure_rustls_crypto_provider();
             let client = reqwest::Client::builder()
                 .timeout(timeout)
                 .build()
@@ -401,6 +412,7 @@ mod tests {
             stream.flush().ok();
         });
 
+        ensure_rustls_crypto_provider();
         let transport = reqwest_transport::ReqwestTransport::new(reqwest::Client::new());
         let url = format!("http://{addr}/test");
         let req = HttpRequest {
@@ -425,6 +437,7 @@ mod tests {
         feature = "discovery"
     ))]
     async fn reqwest_transport_send_returns_transport_error_for_invalid_url() {
+        ensure_rustls_crypto_provider();
         let transport = reqwest_transport::ReqwestTransport::new(reqwest::Client::new());
         let req = HttpRequest {
             method: HttpMethod::Get,

@@ -151,6 +151,7 @@ mod tests {
     #[tokio::test]
     async fn http_variant_formats_as_http_request_failed() {
         // Use an invalid URL so we fail immediately without real network I/O.
+        crate::http::ensure_rustls_crypto_provider();
         let err = reqwest::Client::new()
             .get("http://")
             .send()

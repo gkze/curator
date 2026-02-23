@@ -43,8 +43,8 @@ tabled = "0.20"
 config = { version = "0.15", default-features = false, features = ["toml"] }
 directories = "6"
 open = "5.3"
-arboard = "3.4"
-toml_edit = "0.22"
+arboard = "3.6"
+toml_edit = "0.25"
 uuid = { version = "1", features = ["v4"] }
 url = "2.5"
 rpassword = "7"

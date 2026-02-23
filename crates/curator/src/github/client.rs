@@ -113,6 +113,7 @@ fn extract_page_from_url(url: &str) -> Option<u32> {
 
 /// Create an authenticated Octocrab instance from a GitHub token.
 pub fn create_client(token: &str) -> Result<Octocrab, GitHubError> {
+    crate::http::ensure_rustls_crypto_provider();
     Octocrab::builder()
         .personal_token(token.to_string())
         .build()
@@ -214,6 +215,7 @@ impl GitHubClient {
         rate_limiter: Option<AdaptiveRateLimiter>,
     ) -> Result<Self, GitHubError> {
         let client = create_client(token)?;
+        crate::http::ensure_rustls_crypto_provider();
         let transport = Arc::new(crate::http::reqwest_transport::ReqwestTransport::new(
             reqwest::Client::new(),
         ));
@@ -232,6 +234,7 @@ impl GitHubClient {
     /// Note: This constructor doesn't have access to the token, so conditional
     /// requests with ETags won't work. Use `new()` instead for full functionality.
     pub fn from_octocrab(client: Octocrab, instance_id: Uuid) -> Self {
+        crate::http::ensure_rustls_crypto_provider();
         let transport = Arc::new(crate::http::reqwest_transport::ReqwestTransport::new(
             reqwest::Client::new(),
         ));

@@ -422,6 +422,7 @@ fn extract_links(base: &Url, body: &str) -> (Vec<Url>, Vec<RepoLink>) {
 fn build_transport(options: &CrawlOptions) -> Result<Arc<dyn HttpTransport>, DiscoveryError> {
     use crate::http::reqwest_transport::ReqwestTransport;
 
+    crate::http::ensure_rustls_crypto_provider();
     let client = reqwest::Client::builder()
         .timeout(options.request_timeout)
         .build()

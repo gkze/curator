@@ -232,7 +232,7 @@ pub struct PkceVerifier {
 impl PkceVerifier {
     /// Generate a new random PKCE code verifier and its corresponding challenge.
     pub fn new() -> Self {
-        use rand::Rng;
+        use rand::RngExt;
 
         // Generate 32 random bytes (256 bits of entropy)
         let random_bytes: [u8; 32] = rand::rng().random();
@@ -277,7 +277,7 @@ fn base64_url_encode(bytes: &[u8]) -> String {
 
 /// Generate a cryptographically random state string for CSRF protection.
 pub fn generate_state() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let random_bytes: [u8; 16] = rand::rng().random();
     base64_url_encode(&random_bytes)
 }
@@ -340,6 +340,7 @@ pub async fn exchange_code(
     pkce: &PkceVerifier,
     redirect_uri: &str,
 ) -> Result<AccessTokenResponse, OAuthError> {
+    crate::http::ensure_rustls_crypto_provider();
     let client = Client::new();
     let url = format!("{}/login/oauth/access_token", auth.base_url());
 
@@ -385,6 +386,7 @@ pub async fn refresh_access_token(
     auth: &impl GiteaOAuth,
     refresh_token: &str,
 ) -> Result<AccessTokenResponse, OAuthError> {
+    crate::http::ensure_rustls_crypto_provider();
     let client = Client::new();
     let url = format!("{}/login/oauth/access_token", auth.base_url());
 

@@ -154,6 +154,7 @@ pub async fn request_device_code(
     client_id: &str,
     scope: &str,
 ) -> Result<DeviceCodeResponse, OAuthError> {
+    crate::http::ensure_rustls_crypto_provider();
     let client = Client::new();
     let url = format!("{}/oauth/authorize_device", base_url(host));
 
@@ -199,6 +200,7 @@ pub async fn poll_for_token(
     client_id: &str,
     device_code: &DeviceCodeResponse,
 ) -> Result<AccessTokenResponse, OAuthError> {
+    crate::http::ensure_rustls_crypto_provider();
     let client = Client::new();
     let url = format!("{}/oauth/token", base_url(host));
     let mut interval = Duration::from_secs(device_code.interval);
@@ -296,6 +298,7 @@ pub async fn refresh_access_token(
     client_id: &str,
     refresh_token: &str,
 ) -> Result<AccessTokenResponse, OAuthError> {
+    crate::http::ensure_rustls_crypto_provider();
     let client = Client::new();
     let url = format!("{}/oauth/token", base_url(host));
 
