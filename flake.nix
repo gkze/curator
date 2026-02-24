@@ -246,7 +246,7 @@
                 cargo-dist
                 cargo-llvm-cov
                 cargo-nextest
-                cargo-release
+                (cargo-release.overrideAttrs { doCheck = false; })
                 litecli
                 nixd
                 pkg-config
