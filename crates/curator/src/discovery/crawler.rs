@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
+use regex::Regex;
 use scraper::{Html, Selector};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -395,6 +396,7 @@ async fn fetch_page(
 fn extract_links(base: &Url, body: &str) -> (Vec<Url>, Vec<RepoLink>) {
     let mut links = Vec::new();
     let mut repo_links = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     let document = Html::parse_document(body);
     let selector = Selector::parse("a[href]").expect("selector should parse");
@@ -422,6 +424,11 @@ fn extract_links(base: &Url, body: &str) -> (Vec<Url>, Vec<RepoLink>) {
             continue;
         };
 
+        let key = normalized.to_string();
+        if !seen.insert(key) {
+            continue;
+        }
+
         if let Some(repo) = extract_repo_link(&normalized) {
             repo_links.push(repo);
         }
@@ -429,7 +436,53 @@ fn extract_links(base: &Url, body: &str) -> (Vec<Url>, Vec<RepoLink>) {
         links.push(normalized);
     }
 
+    // Also extract plain-text URLs from the body (e.g. inside <pre>/<code> blocks
+    // that are not wrapped in <a> tags). This catches curated lists like
+    // awesome-* repos that list URLs as plain text.
+    extract_text_urls(base, body, &mut seen, &mut links, &mut repo_links);
+
     (links, repo_links)
+}
+
+/// Scan the raw HTML body for bare `https://` URLs that were not already found
+/// as `<a href>` links. This is intentionally limited to `https://` to avoid
+/// false positives from other URL-like strings.
+fn extract_text_urls(
+    _base: &Url,
+    body: &str,
+    seen: &mut HashSet<String>,
+    links: &mut Vec<Url>,
+    repo_links: &mut Vec<RepoLink>,
+) {
+    // Match https:// URLs using only characters that are safe in bare URL
+    // contexts. We intentionally exclude `&`, `'`, `"`, `<`, `>`, and `{`/`}`
+    // so the regex stops before HTML entities (`&amp;`, `&quot;`), attribute
+    // boundaries, and embedded JSON.
+    let url_re =
+        Regex::new(r#"https://[A-Za-z0-9._~:/?#\[\]@!$()*+,;=%-]+"#).expect("regex is valid");
+
+    for m in url_re.find_iter(body) {
+        let raw = m.as_str().trim_end_matches(['.', ',', ')', ']', ';', ':']);
+
+        let Ok(url) = Url::parse(raw) else {
+            continue;
+        };
+
+        let Some(normalized) = normalize_url(&url) else {
+            continue;
+        };
+
+        let key = normalized.to_string();
+        if !seen.insert(key) {
+            continue;
+        }
+
+        if let Some(repo) = extract_repo_link(&normalized) {
+            repo_links.push(repo);
+        }
+
+        links.push(normalized);
+    }
 }
 
 fn build_transport(options: &CrawlOptions) -> Result<Arc<dyn HttpTransport>, DiscoveryError> {
@@ -1031,5 +1084,135 @@ mod tests {
                 && repo.name == "Repo"
                 && repo.canonical_url == "https://github.com/Owner/Repo"
         }));
+    }
+
+    // --- Text URL extraction tests ---
+
+    #[test]
+    fn test_extract_text_urls_from_pre_block() {
+        let base = Url::parse("https://example.com/page").unwrap();
+        let body = r#"<html><body>
+            <pre>
+            https://github.com/user/plugin1
+            https://github.com/user/plugin2
+            </pre>
+        </body></html>"#;
+
+        let (_, repo_links) = extract_links(&base, body);
+
+        let names: Vec<&str> = repo_links.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"plugin1"), "missing plugin1: {:?}", names);
+        assert!(names.contains(&"plugin2"), "missing plugin2: {:?}", names);
+    }
+
+    #[test]
+    fn test_extract_text_urls_deduplicates_with_href_links() {
+        let base = Url::parse("https://example.com/page").unwrap();
+        // The same URL appears as both an <a> tag and plain text
+        let body = r#"<html><body>
+            <a href="https://github.com/owner/repo">link</a>
+            <pre>https://github.com/owner/repo</pre>
+        </body></html>"#;
+
+        let (links, repo_links) = extract_links(&base, body);
+
+        // Should appear only once due to deduplication
+        let github_links: Vec<_> = links
+            .iter()
+            .filter(|u| u.as_str() == "https://github.com/owner/repo")
+            .collect();
+        assert_eq!(github_links.len(), 1, "URL should be deduplicated");
+
+        let matching: Vec<_> = repo_links
+            .iter()
+            .filter(|r| r.owner == "owner" && r.name == "repo")
+            .collect();
+        assert_eq!(matching.len(), 1, "repo link should be deduplicated");
+    }
+
+    #[test]
+    fn test_extract_text_urls_stops_at_html_entities() {
+        let base = Url::parse("https://example.com/page").unwrap();
+        // Simulates HTML attribute with entities: ...neoai.nvim&quot;,&quot;user_id&quot;...
+        let body = r#"<html><body>
+            <div data-x="https://github.com/owner/neoai.nvim&quot;,&quot;user_id&quot;:null">
+            </div>
+        </body></html>"#;
+
+        let (_, repo_links) = extract_links(&base, body);
+
+        // Should extract owner/neoai.nvim (stopping before &quot;), NOT neoai.nvim&quot;...
+        for repo in &repo_links {
+            assert!(
+                !repo.name.contains("&quot;"),
+                "name should not contain HTML entities: {}",
+                repo.name,
+            );
+            assert!(
+                !repo.name.contains("&amp;"),
+                "name should not contain &amp;: {}",
+                repo.name,
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_text_urls_trims_trailing_punctuation() {
+        let base = Url::parse("https://example.com/page").unwrap();
+        let body = r#"<html><body>
+            Check out https://github.com/owner/repo. It's great!
+            Also see https://github.com/other/project, which is nice.
+            And (https://github.com/third/lib) is useful.
+        </body></html>"#;
+
+        let (_, repo_links) = extract_links(&base, body);
+
+        let names: Vec<&str> = repo_links.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"repo"), "missing 'repo': {:?}", names);
+        assert!(names.contains(&"project"), "missing 'project': {:?}", names);
+        assert!(names.contains(&"lib"), "missing 'lib': {:?}", names);
+    }
+
+    #[test]
+    fn test_extract_text_urls_ignores_non_https() {
+        let base = Url::parse("https://example.com/page").unwrap();
+        let body = r#"<html><body>
+            <pre>
+            http://github.com/owner/insecure-repo
+            ftp://github.com/owner/ftp-repo
+            </pre>
+        </body></html>"#;
+
+        let (_, repo_links) = extract_links(&base, body);
+
+        // text URL extraction only picks up https:// URLs
+        let text_repos: Vec<_> = repo_links
+            .iter()
+            .filter(|r| r.name == "insecure-repo" || r.name == "ftp-repo")
+            .collect();
+        assert!(
+            text_repos.is_empty(),
+            "should not extract non-https text URLs: {:?}",
+            text_repos,
+        );
+    }
+
+    #[test]
+    fn test_extract_text_urls_filters_non_repo_hosts() {
+        let base = Url::parse("https://example.com/page").unwrap();
+        let body = r#"<html><body>
+            <pre>
+            https://img.shields.io/badge/license-MIT-green
+            https://camo.githubusercontent.com/abc123/image.png
+            https://github.com/real/repo
+            </pre>
+        </body></html>"#;
+
+        let (_, repo_links) = extract_links(&base, body);
+
+        // Only the real repo should appear
+        assert_eq!(repo_links.len(), 1);
+        assert_eq!(repo_links[0].owner, "real");
+        assert_eq!(repo_links[0].name, "repo");
     }
 }

@@ -31,7 +31,13 @@ gitea = [
   "dep:urlencoding",
   "dep:open",
 ]
-discovery = ["dep:reqwest", "dep:scraper", "dep:url", "dep:quick-xml"]
+discovery = [
+  "dep:reqwest",
+  "dep:scraper",
+  "dep:url",
+  "dep:quick-xml",
+  "dep:regex",
+]
 
 [dependencies]
 sea-orm = { version = "1.1", default-features = false, features = [
@@ -72,6 +78,7 @@ open = { version = "5", optional = true }
 scraper = { version = "0.25", optional = true }
 url = { version = "2.5", optional = true }
 quick-xml = { version = "0.39", optional = true }
+regex = { version = "1", optional = true }
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -778,6 +778,7 @@ dependencies = [
  "progenitor-client",
  "quick-xml",
  "rand 0.10.0",
+ "regex",
  "reqwest 0.13.2",
  "rustls",
  "scraper",

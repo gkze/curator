@@ -315,8 +315,18 @@ impl Config {
     }
 
     /// Get the default config file path.
+    ///
+    /// Prefers `$XDG_CONFIG_HOME/curator/config.toml` when the environment
+    /// variable is set (on any platform), falling back to the
+    /// platform-specific config directory from the `directories` crate.
     #[allow(dead_code)]
     pub fn default_config_path() -> Option<PathBuf> {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            let p = PathBuf::from(xdg);
+            if p.is_absolute() {
+                return Some(p.join("curator").join("config.toml"));
+            }
+        }
         ProjectDirs::from("", "", "curator").map(|dirs| dirs.config_dir().join("config.toml"))
     }
 
