@@ -1044,7 +1044,7 @@ fn take_prune_repos(repos_to_prune: Arc<Mutex<Vec<(String, String)>>>) -> Vec<(S
 /// * `client` - Platform client implementing `PlatformClient`
 /// * `options` - Sync configuration options (uses `active_within` and `prune` flags)
 /// * `db` - Optional database connection for ETag caching
-/// * `concurrency` - Number of concurrent page fetches
+/// * `concurrency` - Number of concurrent API operations (fetch + prune)
 /// * `skip_rate_checks` - Whether to skip rate limit checks
 /// * `model_tx` - Channel sender for streaming model persistence
 /// * `on_progress` - Optional progress callback
@@ -1161,8 +1161,14 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     let repos_to_prune = take_prune_repos(state.repos_to_prune);
 
     if options.prune && !repos_to_prune.is_empty() {
-        let prune_result =
-            star::prune_repos(client, repos_to_prune, options.dry_run, on_progress).await;
+        let prune_result = star::prune_repos(
+            client,
+            repos_to_prune,
+            concurrency,
+            options.dry_run,
+            on_progress,
+        )
+        .await;
 
         result.pruned = prune_result.pruned;
         result.pruned_repos = prune_result.pruned_repos;

@@ -16,7 +16,8 @@ use curator::{
 use crate::CommonSyncOptions;
 use crate::DiscoverOptions;
 use crate::commands::shared::{
-    SyncKind, SyncRunner, build_rate_limiter, display_final_rate_limit, get_token_for_instance,
+    SyncKind, SyncRunner, active_within_duration, build_rate_limiter, display_final_rate_limit,
+    get_token_for_instance,
 };
 use crate::config::Config;
 use crate::progress::ProgressReporter;
@@ -236,7 +237,7 @@ async fn sync_instance_repos(
     };
 
     let options = SyncOptions {
-        active_within: chrono::Duration::days(active_within_days as i64),
+        active_within: active_within_duration(active_within_days)?,
         star,
         dry_run: sync_opts.dry_run,
         concurrency,

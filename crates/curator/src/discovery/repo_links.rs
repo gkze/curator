@@ -92,6 +92,7 @@ fn is_reserved_segment(segment: &str) -> bool {
             | "apps"
             | "collections"
             | "dashboard"
+            | "enterprise"
             | "events"
             | "explore"
             | "features"
@@ -102,12 +103,16 @@ fn is_reserved_segment(segment: &str) -> bool {
             | "marketplace"
             | "notifications"
             | "orgs"
+            | "partners"
             | "pricing"
             | "pulls"
+            | "readme"
             | "search"
             | "security"
             | "settings"
             | "site"
+            | "solutions"
+            | "sponsors"
             | "signup"
             | "topics"
             | "users"
@@ -215,6 +220,19 @@ mod tests {
     #[test]
     fn test_extract_repo_skips_reserved_paths() {
         let url = Url::parse("https://github.com/about").unwrap();
+        assert!(extract_repo_link(&url).is_none());
+    }
+
+    #[test]
+    fn test_extract_repo_skips_solutions_paths() {
+        let url =
+            Url::parse("https://github.com/solutions/use-case/aka.ms/ghcp-appmod/blog").unwrap();
+        assert!(extract_repo_link(&url).is_none());
+    }
+
+    #[test]
+    fn test_extract_repo_skips_partners_paths() {
+        let url = Url::parse("https://github.com/partners/resources").unwrap();
         assert!(extract_repo_link(&url).is_none());
     }
 

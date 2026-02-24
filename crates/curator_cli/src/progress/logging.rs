@@ -138,6 +138,22 @@ impl LoggingReporter {
                 );
             }
 
+            SyncProgress::PruningRepos { count, dry_run } => {
+                tracing::info!(count, dry_run, "Pruning inactive repositories");
+            }
+
+            SyncProgress::PrunedRepo { owner, name } => {
+                tracing::debug!(repo = %format!("{}/{}", owner, name), "Pruned");
+            }
+
+            SyncProgress::PruneError { owner, name, error } => {
+                tracing::warn!(repo = %format!("{}/{}", owner, name), error = %error, "Failed to prune");
+            }
+
+            SyncProgress::PruningComplete { pruned, errors } => {
+                tracing::info!(pruned, errors, "Pruning complete");
+            }
+
             SyncProgress::CacheHit {
                 namespace,
                 cached_count,

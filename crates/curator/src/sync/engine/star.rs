@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::platform::{PlatformClient, PlatformError};
 
@@ -143,6 +144,7 @@ pub(super) struct PruneResult {
 pub(super) async fn prune_repos<C: PlatformClient + Clone + 'static>(
     client: &C,
     repos: Vec<(String, String)>,
+    concurrency: usize,
     dry_run: bool,
     on_progress: Option<&ProgressCallback>,
 ) -> PruneResult {
@@ -164,8 +166,8 @@ pub(super) async fn prune_repos<C: PlatformClient + Clone + 'static>(
         },
     );
 
-    for (owner, name) in repos {
-        if dry_run {
+    if dry_run {
+        for (owner, name) in repos {
             result.pruned += 1;
             result.pruned_repos.push((owner.clone(), name.clone()));
             emit(
@@ -175,9 +177,36 @@ pub(super) async fn prune_repos<C: PlatformClient + Clone + 'static>(
                     name: name.clone(),
                 },
             );
-        } else {
-            match client.unstar_repo(&owner, &name).await {
-                Ok(true) => {
+        }
+    } else {
+        let concurrency = std::cmp::max(1, std::cmp::min(concurrency, repos.len()));
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let mut join_set = JoinSet::new();
+
+        for (owner, name) in repos {
+            let client = client.clone();
+            let semaphore = Arc::clone(&semaphore);
+
+            join_set.spawn(async move {
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        return (
+                            owner,
+                            name,
+                            Err(PlatformError::internal("Semaphore closed unexpectedly")),
+                        );
+                    }
+                };
+
+                let unstar_result = client.unstar_repo(&owner, &name).await;
+                (owner, name, unstar_result)
+            });
+        }
+
+        while let Some(task_result) = join_set.join_next().await {
+            match task_result {
+                Ok((owner, name, Ok(true))) => {
                     result.pruned += 1;
                     result.pruned_repos.push((owner.clone(), name.clone()));
                     emit(
@@ -188,8 +217,8 @@ pub(super) async fn prune_repos<C: PlatformClient + Clone + 'static>(
                         },
                     );
                 }
-                Ok(false) => {}
-                Err(e) if e.is_not_found() => {
+                Ok((_, _, Ok(false))) => {}
+                Ok((owner, name, Err(e))) if e.is_not_found() => {
                     // Project no longer exists — treat as pruned so the DB
                     // entry gets cleaned up instead of retrying forever.
                     result.pruned += 1;
@@ -202,7 +231,7 @@ pub(super) async fn prune_repos<C: PlatformClient + Clone + 'static>(
                         },
                     );
                 }
-                Err(e) => {
+                Ok((owner, name, Err(e))) => {
                     let err_msg = e.to_string();
                     result
                         .errors
@@ -210,11 +239,14 @@ pub(super) async fn prune_repos<C: PlatformClient + Clone + 'static>(
                     emit(
                         on_progress,
                         SyncProgress::PruneError {
-                            owner: owner.clone(),
-                            name: name.clone(),
+                            owner,
+                            name,
                             error: err_msg,
                         },
                     );
+                }
+                Err(e) => {
+                    result.errors.push(format!("Task panic: {}", e));
                 }
             }
         }
@@ -482,6 +514,7 @@ mod tests {
         let result = prune_repos(
             &client,
             vec![("org".to_string(), "gone".to_string())],
+            2,
             false,
             None,
         )
@@ -509,6 +542,7 @@ mod tests {
                 ("org".to_string(), "no".to_string()),
                 ("org".to_string(), "err".to_string()),
             ],
+            3,
             false,
             None,
         )
@@ -533,6 +567,7 @@ mod tests {
                 ("org".to_string(), "one".to_string()),
                 ("org".to_string(), "two".to_string()),
             ],
+            2,
             true,
             None,
         )
@@ -554,6 +589,28 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .len();
         assert_eq!(unstar_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn test_prune_repos_with_zero_concurrency_completes() {
+        let client = TestClient::default();
+        client.set_unstar_result("org", "repo", Ok(true));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prune_repos(
+                &client,
+                vec![("org".to_string(), "repo".to_string())],
+                0,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("prune_repos should not hang with zero concurrency");
+
+        assert_eq!(result.pruned, 1);
+        assert!(result.errors.is_empty());
     }
 
     #[tokio::test]

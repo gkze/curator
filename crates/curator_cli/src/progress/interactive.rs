@@ -33,6 +33,10 @@ struct ProgressState {
     save_total: usize,
     /// Whether filtering is complete (save total is final).
     filter_complete: bool,
+    /// Single bar for pruning inactive starred repositories.
+    prune_bar: Option<ProgressBar>,
+    /// Total repositories to prune (accumulated for multiple prune batches).
+    prune_total: usize,
 }
 
 /// Interactive progress reporter using indicatif.
@@ -437,6 +441,50 @@ impl InteractiveReporter {
                 }
             }
 
+            SyncProgress::PruningRepos { count, dry_run } => {
+                state.prune_total += count;
+
+                if state.prune_bar.is_none() {
+                    let pb = self.multi.add(ProgressBar::new(state.prune_total as u64));
+                    pb.set_style(Self::bar_style());
+                    pb.set_prefix(format!("{:12}", "Pruning"));
+                    let action = if dry_run {
+                        "Checking..."
+                    } else {
+                        "Unstarring..."
+                    };
+                    pb.set_message(action);
+                    state.prune_bar = Some(pb);
+                } else if let Some(ref pb) = state.prune_bar {
+                    pb.set_length(state.prune_total as u64);
+                }
+            }
+
+            SyncProgress::PrunedRepo { owner, name } => {
+                if let Some(ref pb) = state.prune_bar {
+                    pb.inc(1);
+                    pb.set_message(format!("- {}/{}", owner, name));
+                }
+            }
+
+            SyncProgress::PruneError { owner, name, error } => {
+                if let Some(ref pb) = state.prune_bar {
+                    pb.inc(1);
+                    pb.set_message(format!("✗ {}/{}: {}", owner, name, error));
+                }
+            }
+
+            SyncProgress::PruningComplete { pruned, errors } => {
+                if let Some(ref pb) = state.prune_bar {
+                    let msg = if errors > 0 {
+                        format!("✓ {} pruned, {} errors", pruned, errors)
+                    } else {
+                        format!("✓ {} pruned", pruned)
+                    };
+                    pb.finish_with_message(msg);
+                }
+            }
+
             SyncProgress::Warning { message } => {
                 drop(state);
                 self.multi.println(format!("⚠ {}", message)).ok();
@@ -518,6 +566,11 @@ impl InteractiveReporter {
             pb.finish();
         }
         if let Some(ref pb) = state.save_bar
+            && !pb.is_finished()
+        {
+            pb.finish();
+        }
+        if let Some(ref pb) = state.prune_bar
             && !pb.is_finished()
         {
             pb.finish();
@@ -948,6 +1001,36 @@ mod tests {
     }
 
     #[test]
+    fn pruning_events_create_and_finish_prune_bar() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::PruningRepos {
+            count: 2,
+            dry_run: false,
+        });
+        reporter.handle(SyncProgress::PrunedRepo {
+            owner: "rust-lang".to_string(),
+            name: "rust".to_string(),
+        });
+        reporter.handle(SyncProgress::PruningComplete {
+            pruned: 1,
+            errors: 0,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let prune_bar = state
+            .prune_bar
+            .as_ref()
+            .expect("prune bar should exist after pruning starts");
+
+        assert_eq!(state.prune_total, 2);
+        assert_eq!(prune_bar.length(), Some(2));
+        assert_eq!(prune_bar.position(), 2);
+        assert!(prune_bar.is_finished());
+        assert_eq!(prune_bar.message().to_string(), "✓ 1 pruned");
+    }
+
+    #[test]
     fn create_bar_helpers_cover_spinner_and_known_total_paths() {
         let reporter = InteractiveReporter::hidden();
 
@@ -987,6 +1070,10 @@ mod tests {
             count: 1,
             final_batch: false,
         });
+        reporter.handle(SyncProgress::PruningRepos {
+            count: 1,
+            dry_run: false,
+        });
 
         reporter.finish();
 
@@ -1012,6 +1099,13 @@ mod tests {
                 .save_bar
                 .as_ref()
                 .expect("save bar should exist")
+                .is_finished()
+        );
+        assert!(
+            state
+                .prune_bar
+                .as_ref()
+                .expect("prune bar should exist")
                 .is_finished()
         );
     }

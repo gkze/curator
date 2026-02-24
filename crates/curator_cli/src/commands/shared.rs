@@ -55,6 +55,22 @@ pub(crate) fn build_rate_limiter(
     }
 }
 
+/// Convert active-within days into a checked chrono duration.
+pub(crate) fn active_within_duration(days: u64) -> Result<chrono::Duration, std::io::Error> {
+    let days_i64 = i64::try_from(days).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "active_within_days value {} exceeds supported maximum {}",
+                days,
+                i64::MAX
+            ),
+        )
+    })?;
+
+    Ok(chrono::Duration::days(days_i64))
+}
+
 /// Display final rate limit status with a timeout to avoid hangs.
 pub(crate) async fn display_final_rate_limit<C: PlatformClient>(
     client: &C,
@@ -1000,6 +1016,20 @@ mod tests {
     fn build_rate_limiter_respects_disable_flag() {
         assert!(build_rate_limiter(PlatformType::GitHub, true).is_none());
         assert!(build_rate_limiter(PlatformType::GitHub, false).is_some());
+    }
+
+    #[test]
+    fn active_within_duration_accepts_values_within_i64_range() {
+        let duration = active_within_duration(30).expect("duration should be valid");
+        assert_eq!(duration, chrono::Duration::days(30));
+    }
+
+    #[test]
+    fn active_within_duration_rejects_values_larger_than_i64() {
+        let err =
+            active_within_duration(i64::MAX as u64 + 1).expect_err("expected conversion error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("exceeds supported maximum"));
     }
 
     #[test]

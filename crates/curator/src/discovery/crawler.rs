@@ -66,7 +66,7 @@ impl Default for CrawlOptions {
             include_subdomains: false,
             use_sitemaps: true,
             request_timeout: StdDuration::from_secs(15),
-            max_body_bytes: 2 * 1024 * 1024,
+            max_body_bytes: 4 * 1024 * 1024,
             user_agent: None,
         }
     }
@@ -186,6 +186,9 @@ async fn crawl_site(
     on_progress: Option<&DiscoveryProgressCallback>,
 ) -> CrawlOutput {
     let root_host = normalize_host(start_url.host_str().unwrap_or_default());
+    let restrict_same_host_to_repo_candidates = options.same_host
+        && is_well_known_forge_host(&root_host)
+        && extract_repo_link(start_url).is_some();
     let mut queue: VecDeque<(Url, usize)> = VecDeque::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut errors = Vec::new();
@@ -193,7 +196,12 @@ async fn crawl_site(
 
     for url in seed_urls {
         if let Some(normalized) = normalize_url(url)
-            && should_visit(&normalized, &root_host, options)
+            && should_enqueue(
+                &normalized,
+                &root_host,
+                options,
+                restrict_same_host_to_repo_candidates,
+            )
         {
             queue.push_back((normalized, 0));
         }
@@ -264,7 +272,12 @@ async fn crawl_site(
                         if visited.len() >= options.max_pages {
                             break;
                         }
-                        if should_visit(&link, &root_host, options) {
+                        if should_enqueue(
+                            &link,
+                            &root_host,
+                            options,
+                            restrict_same_host_to_repo_candidates,
+                        ) {
                             queue.push_back((link, depth + 1));
                         }
                     }
@@ -467,6 +480,38 @@ fn should_visit(url: &Url, root_host: &str, options: &CrawlOptions) -> bool {
     options.include_subdomains && host.ends_with(&format!(".{root_host}"))
 }
 
+fn should_enqueue(
+    url: &Url,
+    root_host: &str,
+    options: &CrawlOptions,
+    restrict_same_host_to_repo_candidates: bool,
+) -> bool {
+    if !should_visit(url, root_host, options) {
+        return false;
+    }
+
+    if !restrict_same_host_to_repo_candidates {
+        return true;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+
+    if normalize_host(host) != root_host {
+        return true;
+    }
+
+    extract_repo_link(url).is_some()
+}
+
+fn is_well_known_forge_host(host: &str) -> bool {
+    matches!(
+        host,
+        "github.com" | "gitlab.com" | "codeberg.org" | "gitea.com" | "git.sr.ht"
+    )
+}
+
 fn looks_like_html(body: &str) -> bool {
     let trimmed = body.trim_start();
     trimmed.starts_with("<!DOCTYPE html")
@@ -568,6 +613,42 @@ mod tests {
 
         let external = Url::parse("https://other.example.org/page").unwrap();
         assert!(should_visit(&external, "example.com", &options));
+    }
+
+    #[test]
+    fn test_should_enqueue_filters_non_repo_paths_when_restricted() {
+        let options = CrawlOptions {
+            same_host: true,
+            include_subdomains: false,
+            ..CrawlOptions::default()
+        };
+
+        let repo_link = Url::parse("https://github.com/rust-lang/rust").unwrap();
+        let marketplace = Url::parse("https://github.com/marketplace").unwrap();
+        let partners = Url::parse("https://github.com/partners/resources").unwrap();
+
+        assert!(should_enqueue(&repo_link, "github.com", &options, true));
+        assert!(!should_enqueue(&marketplace, "github.com", &options, true));
+        assert!(!should_enqueue(&partners, "github.com", &options, true));
+    }
+
+    #[test]
+    fn test_should_enqueue_does_not_filter_when_restriction_disabled() {
+        let options = CrawlOptions {
+            same_host: true,
+            include_subdomains: false,
+            ..CrawlOptions::default()
+        };
+
+        let docs_page = Url::parse("https://example.test/docs/install").unwrap();
+        assert!(should_enqueue(&docs_page, "example.test", &options, false));
+    }
+
+    #[test]
+    fn test_is_well_known_forge_host() {
+        assert!(is_well_known_forge_host("github.com"));
+        assert!(is_well_known_forge_host("gitlab.com"));
+        assert!(!is_well_known_forge_host("example.com"));
     }
 
     #[tokio::test]
@@ -790,6 +871,126 @@ mod tests {
         assert_eq!(output.pages_visited, 2);
         assert_eq!(output.pages_fetched, 2);
         assert_eq!(count_requests(&transport, &start), 1);
+    }
+
+    #[tokio::test]
+    async fn test_crawl_site_filters_known_github_non_repo_links_when_start_is_repo() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+
+        let start = Url::parse("https://github.com/sindresorhus/awesome").unwrap();
+        let repo = Url::parse("https://github.com/rust-lang/rust").unwrap();
+        let marketplace = Url::parse("https://github.com/marketplace").unwrap();
+        let partners = Url::parse("https://github.com/partners/resources").unwrap();
+
+        transport.push_response(
+            HttpMethod::Get,
+            start.to_string(),
+            make_response(
+                200,
+                Some("text/html; charset=utf-8"),
+                r#"<html><body><a href="/rust-lang/rust">repo</a><a href="/marketplace">marketplace</a><a href="/partners/resources">partners</a></body></html>"#,
+                None,
+                true,
+            ),
+        );
+        transport.push_response(
+            HttpMethod::Get,
+            repo.to_string(),
+            make_response(
+                200,
+                Some("text/html; charset=utf-8"),
+                "<html></html>",
+                None,
+                true,
+            ),
+        );
+
+        let options = CrawlOptions {
+            max_depth: 1,
+            max_pages: 10,
+            concurrency: 2,
+            same_host: true,
+            include_subdomains: false,
+            use_sitemaps: false,
+            request_timeout: StdDuration::from_secs(5),
+            max_body_bytes: 1024 * 1024,
+            user_agent: None,
+        };
+
+        let output = crawl_site(
+            transport_arc,
+            &start,
+            std::slice::from_ref(&start),
+            &options,
+            "test-agent",
+            None,
+        )
+        .await;
+
+        assert_eq!(output.pages_visited, 2);
+        assert_eq!(output.pages_fetched, 2);
+        assert_eq!(count_requests(&transport, &marketplace), 0);
+        assert_eq!(count_requests(&transport, &partners), 0);
+        assert!(output.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_crawl_site_does_not_filter_same_host_on_non_forge_hosts() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+
+        let start = Url::parse("https://example.test/docs").unwrap();
+        let linked = Url::parse("https://example.test/docs/install").unwrap();
+
+        transport.push_response(
+            HttpMethod::Get,
+            start.to_string(),
+            make_response(
+                200,
+                Some("text/html; charset=utf-8"),
+                r#"<html><body><a href="/docs/install">install</a></body></html>"#,
+                None,
+                true,
+            ),
+        );
+        transport.push_response(
+            HttpMethod::Get,
+            linked.to_string(),
+            make_response(
+                200,
+                Some("text/html; charset=utf-8"),
+                "<html></html>",
+                None,
+                true,
+            ),
+        );
+
+        let options = CrawlOptions {
+            max_depth: 1,
+            max_pages: 10,
+            concurrency: 2,
+            same_host: true,
+            include_subdomains: false,
+            use_sitemaps: false,
+            request_timeout: StdDuration::from_secs(5),
+            max_body_bytes: 1024 * 1024,
+            user_agent: None,
+        };
+
+        let output = crawl_site(
+            transport_arc,
+            &start,
+            std::slice::from_ref(&start),
+            &options,
+            "test-agent",
+            None,
+        )
+        .await;
+
+        assert_eq!(output.pages_visited, 2);
+        assert_eq!(output.pages_fetched, 2);
+        assert_eq!(count_requests(&transport, &linked), 1);
     }
 
     #[test]
