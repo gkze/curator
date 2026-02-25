@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-nix
-      - name: Run all checks (build, clippy, fmt, test, audit)
+      - name: Run all checks (build, clippy, fmt, test, audit, dep lints)
         run: nix flake check
 
   # Build the Nix package

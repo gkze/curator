@@ -58,6 +58,9 @@
             apple-sdk_15
           ];
 
+        dependencyLintCargoArgs = "--workspace --all-targets --all-features --locked";
+        macheteArgs = "--with-metadata --skip-target-dir";
+
         # swagger2openapi: Convert Swagger 2.0 specs to OpenAPI 3.0
         mkSwagger2openapi =
           pkgs:
@@ -245,7 +248,9 @@
                 cargo-hack
                 cargo-dist
                 cargo-llvm-cov
+                cargo-machete
                 cargo-nextest
+                cargo-udeps
                 (cargo-release.overrideAttrs { doCheck = false; })
                 litecli
                 nixd
@@ -358,6 +363,38 @@
               // {
                 inherit (c) cargoArtifacts;
                 nativeBuildInputs = c.commonArgs.nativeBuildInputs ++ [ pkgs.cargo-nextest ];
+              }
+            );
+
+          curator-machete =
+            pkgs:
+            let
+              c = mkCraneLib pkgs;
+            in
+            c.craneLib.mkCargoDerivation (
+              c.commonArgs
+              // {
+                cargoArtifacts = null;
+                doInstallCargoArtifacts = false;
+                pnameSuffix = "-machete";
+                buildPhaseCargoCommand = "cargo machete ${macheteArgs}";
+                nativeBuildInputs = c.commonArgs.nativeBuildInputs ++ [ pkgs.cargo-machete ];
+              }
+            );
+
+          curator-udeps =
+            pkgs:
+            let
+              c = mkCraneLib pkgs;
+            in
+            c.craneLib.mkCargoDerivation (
+              c.commonArgs
+              // {
+                inherit (c) cargoArtifacts;
+                pnameSuffix = "-udeps";
+                RUSTC_BOOTSTRAP = "1";
+                buildPhaseCargoCommand = "cargo udeps ${dependencyLintCargoArgs}";
+                nativeBuildInputs = c.commonArgs.nativeBuildInputs ++ [ pkgs.cargo-udeps ];
               }
             );
         };

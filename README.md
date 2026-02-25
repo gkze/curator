@@ -151,7 +151,23 @@ curator login gitlab
 curator login codeberg
 ```
 
-OAuth login is supported for well-known instances (github.com, gitlab.com, codeberg.org).
+OAuth login is supported for well-known instances with a bundled client ID.
+If a well-known instance does not have a bundled client ID, `curator login` falls back to PAT/token auth unless you configure one with `curator instance update <instance> -c <client-id>`.
+
+#### Well-known auth matrix
+
+| Instance | Host | Platform | Bundled OAuth client ID | Default `curator login` path | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `archlinux-gitlab` | `gitlab.archlinux.org` | GitLab | No | PAT/token | Arch SSO/account provisioning may be required |
+| `codeberg` | `codeberg.org` | Gitea/Forgejo | Yes | PKCE OAuth, then token fallback | Uses Codeberg OAuth app |
+| `freedesktop-gitlab` | `gitlab.freedesktop.org` | GitLab | No | PAT/token | Add client ID to enable device OAuth |
+| `gitlab` | `gitlab.com` | GitLab | Yes | Device OAuth, then token fallback | Built-in client ID |
+| `github` | `github.com` | GitHub | Yes | Device OAuth, then token fallback | GitHub.com only; GHES generally uses PAT today |
+| `gnome-gitlab` | `gitlab.gnome.org` | GitLab | No | PAT/token | Add client ID to enable device OAuth |
+| `haskell-gitlab` | `gitlab.haskell.org` | GitLab | No | PAT/token | Add client ID to enable device OAuth |
+| `kde-gitlab` | `invent.kde.org` | GitLab | No | PAT/token | OAuth requires admin-provided client ID; user app creation may be disabled |
+| `kitware-gitlab` | `gitlab.kitware.com` | GitLab | Yes | Device OAuth, then token fallback | Built-in client ID |
+
 For GitHub Enterprise or self-hosted GitLab/Gitea, configure a PAT via `CURATOR_*_TOKEN`.
 
 ### Database Setup
