@@ -67,13 +67,26 @@ pub async fn handle_login(
         PlatformType::GitLab => login_gitlab(&instance, config, is_tty).await?,
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => login_gitea(&instance, config, is_tty).await?,
-        #[allow(unreachable_patterns)]
-        _ => {
-            return Err(format!(
-                "Login not supported for platform type '{}'. Enable the appropriate feature.",
-                instance.platform_type
-            )
-            .into());
+        #[cfg(not(feature = "github"))]
+        PlatformType::GitHub => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "login",
+            ));
+        }
+        #[cfg(not(feature = "gitlab"))]
+        PlatformType::GitLab => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "login",
+            ));
+        }
+        #[cfg(not(feature = "gitea"))]
+        PlatformType::Gitea => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "login",
+            ));
         }
     }
 
@@ -557,14 +570,9 @@ mod tests {
     };
     use std::ffi::OsString;
     use std::fs;
-    use std::sync::OnceLock;
-    use tokio::sync::Mutex;
     use toml_edit::DocumentMut;
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::test_support::env_lock;
 
     fn assert_config_value(path: &std::path::Path, section: &str, key: &str, expected: &str) {
         let config_contents =

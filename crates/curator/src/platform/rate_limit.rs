@@ -1,5 +1,8 @@
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 
 use crate::entity::platform_type::PlatformType;
 
@@ -38,17 +41,17 @@ const MIN_RPS: f64 = 0.5;
 /// Maximum requests per second ceiling.
 const MAX_RPS: f64 = 50.0;
 
-/// Internal GCRA state with a mutable cell size for adaptive pacing.
-struct GcraState {
-    /// Theoretical arrival time — when the next request is allowed.
-    tat: Instant,
-    /// Time between requests (1/rps). This is the mutable part.
-    cell_size: Duration,
-    /// Maximum burst tolerance — how far ahead of schedule we allow.
-    burst_tolerance: Duration,
+/// Internal adaptive limiter state.
+struct AdaptiveState {
+    /// Governor-backed direct limiter.
+    limiter: Arc<DefaultDirectRateLimiter>,
+    /// Current target requests-per-second.
+    current_rps: f64,
+    /// Server-mandated cooldown (from Retry-After), if any.
+    retry_until: Option<Instant>,
 }
 
-/// An adaptive rate limiter using a custom GCRA (Generic Cell Rate Algorithm).
+/// An adaptive rate limiter using the `governor` crate.
 ///
 /// Unlike a fixed-rate limiter, this adjusts its pacing based on actual API
 /// rate limit state reported via [`AdaptiveRateLimiter::update`]. After each
@@ -57,14 +60,10 @@ struct GcraState {
 ///
 /// # Algorithm
 ///
-/// GCRA tracks a single timestamp (TAT — theoretical arrival time). Each
-/// request advances the TAT by `cell_size` (= 1/rps). If `now < TAT`,
-/// the caller sleeps until TAT. A `burst_tolerance` allows some requests
-/// to proceed immediately even if TAT is slightly in the future.
-///
-/// When `update()` is called with new rate limit info, only `cell_size`
-/// changes — the TAT is preserved, so pacing adjusts smoothly without
-/// resetting state or risking accidental bursts.
+/// Requests are paced by a `governor::RateLimiter` configured with a quota that
+/// is recalculated from `remaining / seconds_until_reset`. On updates, we swap
+/// in a freshly configured limiter for subsequent requests. `Retry-After` is
+/// handled by tracking a cooldown timestamp that is honored before limiter checks.
 ///
 /// # Example
 ///
@@ -84,10 +83,22 @@ struct GcraState {
 /// ```
 #[derive(Clone)]
 pub struct AdaptiveRateLimiter {
-    state: Arc<Mutex<GcraState>>,
+    state: Arc<Mutex<AdaptiveState>>,
 }
 
 impl AdaptiveRateLimiter {
+    fn quota_for_rps(rps: f64) -> Quota {
+        let replenish_period = Duration::from_secs_f64((1.0 / rps).max(0.001));
+        let burst = NonZeroU32::new(3).expect("non-zero burst");
+        Quota::with_period(replenish_period)
+            .unwrap_or_else(|| Quota::per_second(NonZeroU32::new(1).expect("non-zero quota")))
+            .allow_burst(burst)
+    }
+
+    fn limiter_for_rps(rps: f64) -> Arc<DefaultDirectRateLimiter> {
+        Arc::new(RateLimiter::direct(Self::quota_for_rps(rps)))
+    }
+
     /// Create a new adaptive rate limiter starting at the given requests per second.
     ///
     /// The initial RPS is used until the first `update()` call provides actual
@@ -97,72 +108,63 @@ impl AdaptiveRateLimiter {
     ///
     /// * `initial_rps` - Starting requests per second (must be > 0, defaults to 1 if 0)
     pub fn new(initial_rps: u32) -> Self {
-        let rps = initial_rps.max(1) as f64;
-        let cell_size = Duration::from_secs_f64(1.0 / rps);
-        // Allow a small burst: up to 3 requests can proceed without waiting
-        let burst_tolerance = cell_size.saturating_mul(3);
+        let rps = (initial_rps.max(1) as f64).clamp(MIN_RPS, MAX_RPS);
 
         Self {
-            state: Arc::new(Mutex::new(GcraState {
-                tat: Instant::now(),
-                cell_size,
-                burst_tolerance,
+            state: Arc::new(Mutex::new(AdaptiveState {
+                limiter: Self::limiter_for_rps(rps),
+                current_rps: rps,
+                retry_until: None,
             })),
         }
     }
 
     /// Wait until a request is allowed by the rate limiter.
     ///
-    /// This method will sleep (asynchronously) if the current time is before
-    /// the theoretical arrival time, respecting burst tolerance.
+    /// This method first honors any active `Retry-After` cooldown, then waits
+    /// on the governor limiter quota.
     pub async fn wait(&self) {
-        let sleep_duration = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let now = Instant::now();
-            let cell_size = state.cell_size;
-            let burst_tolerance = state.burst_tolerance;
-
-            if now >= state.tat {
-                // We're at or past the TAT — request is allowed immediately.
-                // Advance TAT by one cell.
-                state.tat = now + cell_size;
-                None
-            } else {
-                let wait = state.tat - now;
-                if wait <= burst_tolerance {
-                    // Within burst tolerance — allow but advance TAT.
-                    state.tat += cell_size;
-                    None
-                } else {
-                    // Must wait. Advance TAT for our future slot.
-                    state.tat += cell_size;
-                    Some(wait - burst_tolerance)
-                }
-            }
+        let (limiter, retry_until) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (Arc::clone(&state.limiter), state.retry_until)
         };
 
-        if let Some(duration) = sleep_duration {
-            tokio::time::sleep(duration).await;
+        if let Some(until) = retry_until {
+            let now = Instant::now();
+            if until > now {
+                tokio::time::sleep(until - now).await;
+            }
+
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state
+                .retry_until
+                .is_some_and(|current_until| current_until <= Instant::now())
+            {
+                state.retry_until = None;
+            }
         }
+
+        limiter.until_ready().await;
     }
 
     /// Update the rate limiter with fresh rate limit information from an API response.
     ///
-    /// Calculates optimal pacing as `remaining / seconds_until_reset` and adjusts
-    /// the cell size accordingly. The TAT (theoretical arrival time) is preserved,
-    /// so the transition is smooth — only future request spacing changes.
+    /// Calculates optimal pacing as `remaining / seconds_until_reset` and swaps in
+    /// a new governor quota for future requests.
     ///
     /// If the response includes a `retry_after` duration (from a 429 response),
-    /// the TAT is pushed forward to honor the server's requested wait time.
+    /// the cooldown timestamp is extended to honor the server's requested wait.
     pub fn update(&self, info: &RateLimitInfo) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Handle Retry-After: push TAT forward
+        // Handle Retry-After cooldown
         if let Some(retry_after) = info.retry_after {
-            let earliest = Instant::now() + retry_after;
-            if earliest > state.tat {
-                state.tat = earliest;
-            }
+            let until = Instant::now() + retry_after;
+            state.retry_until = Some(
+                state
+                    .retry_until
+                    .map_or(until, |current| current.max(until)),
+            );
         }
 
         // Calculate new RPS from remaining budget
@@ -171,9 +173,10 @@ impl AdaptiveRateLimiter {
         let remaining = info.remaining as f64;
 
         let target_rps = (remaining / seconds_until_reset).clamp(MIN_RPS, MAX_RPS);
-        state.cell_size = Duration::from_secs_f64(1.0 / target_rps);
-        // Recalculate burst tolerance proportionally
-        state.burst_tolerance = state.cell_size.saturating_mul(3);
+        if (state.current_rps - target_rps).abs() > f64::EPSILON {
+            state.current_rps = target_rps;
+            state.limiter = Self::limiter_for_rps(target_rps);
+        }
     }
 
     /// Get the current effective requests per second.
@@ -181,7 +184,7 @@ impl AdaptiveRateLimiter {
     /// Useful for diagnostics and logging.
     pub fn current_rps(&self) -> f64 {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        1.0 / state.cell_size.as_secs_f64()
+        state.current_rps
     }
 }
 

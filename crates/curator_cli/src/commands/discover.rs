@@ -10,14 +10,14 @@ use url::Url;
 use curator::discovery::{CrawlOptions, DiscoveryProgress, RepoLink, discover_repo_links};
 use curator::{
     Instance, InstanceModel, PlatformType, db,
-    sync::{PlatformOptions, SyncOptions, SyncStrategy},
+    sync::{PlatformOptions, SyncOptions},
 };
 
 use crate::CommonSyncOptions;
 use crate::DiscoverOptions;
 use crate::commands::shared::{
     SyncKind, SyncRunner, active_within_duration, build_rate_limiter, display_final_rate_limit,
-    get_token_for_instance,
+    get_token_for_instance, resolve_common_sync_options,
 };
 use crate::config::Config;
 use crate::progress::ProgressReporter;
@@ -218,75 +218,93 @@ async fn sync_instance_repos(
     db_conn: Arc<DatabaseConnection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let token = get_token_for_instance(instance, config).await?;
-
-    let active_within_days = sync_opts
-        .active_within_days
-        .unwrap_or(config.sync.active_within_days);
-    let concurrency = sync_opts.concurrency.unwrap_or(config.sync.concurrency);
-    let star = if sync_opts.no_star {
-        false
-    } else {
-        config.sync.star
-    };
-    let no_rate_limit = sync_opts.no_rate_limit || config.sync.no_rate_limit;
-
-    let strategy = if sync_opts.incremental {
-        SyncStrategy::Incremental
-    } else {
-        SyncStrategy::Full
-    };
+    let resolved = resolve_common_sync_options(&sync_opts, config);
 
     let options = SyncOptions {
-        active_within: active_within_duration(active_within_days)?,
-        star,
+        active_within: active_within_duration(resolved.active_within_days)?,
+        star: resolved.star,
         dry_run: sync_opts.dry_run,
-        concurrency,
+        concurrency: resolved.concurrency,
         platform_options: PlatformOptions::default(),
         prune: false,
-        strategy,
+        strategy: resolved.strategy,
     };
 
     let runner = SyncRunner::new(
         Arc::clone(&db_conn),
         options.clone(),
-        no_rate_limit,
-        active_within_days,
+        resolved.no_rate_limit,
+        resolved.active_within_days,
     );
 
     let is_tty = Term::stdout().is_term();
 
-    let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
+    let rate_limiter = build_rate_limiter(instance.platform_type, resolved.no_rate_limit);
 
     match instance.platform_type {
         #[cfg(feature = "github")]
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
             let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
-            run_discovery_sync_for_client(&runner, &client, instance, repos, is_tty, no_rate_limit)
-                .await?;
+            run_discovery_sync_for_client(
+                &runner,
+                &client,
+                instance,
+                repos,
+                is_tty,
+                resolved.no_rate_limit,
+            )
+            .await?;
         }
         #[cfg(feature = "gitlab")]
         PlatformType::GitLab => {
             use curator::gitlab::GitLabClient;
             let client =
                 GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
-            run_discovery_sync_for_client(&runner, &client, instance, repos, is_tty, no_rate_limit)
-                .await?;
+            run_discovery_sync_for_client(
+                &runner,
+                &client,
+                instance,
+                repos,
+                is_tty,
+                resolved.no_rate_limit,
+            )
+            .await?;
         }
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
             let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
-            run_discovery_sync_for_client(&runner, &client, instance, repos, is_tty, no_rate_limit)
-                .await?;
-        }
-        #[allow(unreachable_patterns)]
-        _ => {
-            return Err(format!(
-                "Platform type '{}' not supported for discovery sync.",
-                instance.platform_type
+            run_discovery_sync_for_client(
+                &runner,
+                &client,
+                instance,
+                repos,
+                is_tty,
+                resolved.no_rate_limit,
             )
-            .into());
+            .await?;
+        }
+        #[cfg(not(feature = "github"))]
+        PlatformType::GitHub => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "discovery sync",
+            ));
+        }
+        #[cfg(not(feature = "gitlab"))]
+        PlatformType::GitLab => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "discovery sync",
+            ));
+        }
+        #[cfg(not(feature = "gitea"))]
+        PlatformType::Gitea => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "discovery sync",
+            ));
         }
     }
 

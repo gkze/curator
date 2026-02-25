@@ -18,8 +18,24 @@ all-databases = ["postgres", "sqlite"]
 # Migration support (combine with database backend(s))
 migrate = ["dep:sea-orm-migration"]
 # Platform clients
-github = ["dep:octocrab", "dep:backon", "dep:reqwest", "dep:oauth2"]
-gitlab = ["dep:progenitor-client", "dep:reqwest", "dep:backon", "dep:oauth2"]
+github = [
+  "dep:octocrab",
+  "dep:backon",
+  "dep:reqwest",
+  "dep:oauth2",
+  "dep:reqwest-middleware",
+  "dep:reqwest-retry",
+]
+gitlab = [
+  "dep:progenitor-client",
+  "dep:reqwest",
+  "dep:backon",
+  "dep:oauth2",
+  "dep:serde_urlencoded",
+  "dep:url",
+  "dep:reqwest-middleware",
+  "dep:reqwest-retry",
+]
 gitea = [
   "dep:reqwest",
   "dep:backon",
@@ -30,6 +46,8 @@ gitea = [
   "dep:rand",
   "dep:urlencoding",
   "dep:open",
+  "dep:reqwest-middleware",
+  "dep:reqwest-retry",
 ]
 discovery = [
   "dep:reqwest",
@@ -37,6 +55,8 @@ discovery = [
   "dep:url",
   "dep:quick-xml",
   "dep:regex",
+  "dep:reqwest-middleware",
+  "dep:reqwest-retry",
 ]
 
 [dependencies]
@@ -59,11 +79,14 @@ reqwest = { version = "0.13", default-features = false, features = [
   "rustls-no-provider",
   "gzip",
 ], optional = true }
+reqwest-middleware = { version = "0.5", optional = true }
+reqwest-retry = { version = "0.9", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 backon = { version = "1.6", optional = true }
 oauth2 = { version = "5.0", default-features = false, features = [
   "reqwest",
 ], optional = true }
+serde_urlencoded = { version = "0.7", optional = true }
 axum = { version = "0.8", default-features = false, features = [
   "tokio",
   "http1",
@@ -86,6 +109,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = "0.1"
+futures = "0.3"
+governor = "0.10"
+moka = { version = "0.12", features = ["sync"] }
 dotenvy = "0.15"
 thiserror = "2"
 

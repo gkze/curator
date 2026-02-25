@@ -12,7 +12,6 @@ use uuid::Uuid;
 
 use super::convert::to_platform_repo;
 use super::error::{GitHubError, is_rate_limit_error_from_github, short_error_message};
-use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, AdaptiveRateLimiter, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient,
@@ -1644,10 +1643,6 @@ impl PlatformClient for GitHubClient {
         );
 
         Ok(total_sent.load(Ordering::Relaxed))
-    }
-
-    fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-        repo.to_active_model(self.instance_id)
     }
 }
 

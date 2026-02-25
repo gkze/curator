@@ -179,56 +179,17 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
         self.options.dry_run
     }
 
-    /// Execute an async operation with automatic persist task management.
+    /// Execute an async operation and always await persistence task completion.
     ///
-    /// This helper handles the common pattern of:
-    /// 1. Creating a channel for streaming models
-    /// 2. Spawning a persist task (if not dry_run)
-    /// 3. Executing the provided async operation with the sender
-    /// 4. Awaiting the persist task and returning the result
-    ///
-    /// Use this for fallible operations that return `Result`.
-    async fn with_persist_task<F, Fut, T, E>(
+    /// This helper ensures the persist task is joined even when the sync
+    /// operation returns an error, so persistence-side failures are not dropped.
+    async fn run_with_persist_task<F, Fut, T, E>(
         &self,
         f: F,
-    ) -> std::result::Result<(T, PersistTaskResult), E>
+    ) -> (std::result::Result<T, E>, PersistTaskResult)
     where
         F: FnOnce(mpsc::Sender<CodeRepositoryActiveModel>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, E>>,
-    {
-        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
-
-        let persist_handle = if !self.options.dry_run {
-            let db = self
-                .database
-                .clone()
-                .expect("database required for non-dry-run sync");
-            let (handle, _counter) =
-                spawn_persist_task(db, rx, self.shutdown_flag.clone(), self.progress.clone());
-            Some(handle)
-        } else {
-            drop(rx);
-            None
-        };
-
-        let result = f(tx).await?;
-
-        let persist_result = if let Some(handle) = persist_handle {
-            await_persist_task(handle).await
-        } else {
-            PersistTaskResult::default()
-        };
-
-        Ok((result, persist_result))
-    }
-
-    /// Execute an async operation with automatic persist task management (infallible version).
-    ///
-    /// Similar to [`with_persist_task`] but for operations that don't return `Result`.
-    async fn with_persist_task_infallible<F, Fut, T>(&self, f: F) -> (T, PersistTaskResult)
-    where
-        F: FnOnce(mpsc::Sender<CodeRepositoryActiveModel>) -> Fut,
-        Fut: std::future::Future<Output = T>,
     {
         let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(MODEL_CHANNEL_BUFFER_SIZE);
 
@@ -254,6 +215,60 @@ impl<C: PlatformClient + Clone + 'static> SyncContext<C> {
         };
 
         (result, persist_result)
+    }
+
+    /// Execute an async operation with automatic persist task management.
+    ///
+    /// This helper handles the common pattern of:
+    /// 1. Creating a channel for streaming models
+    /// 2. Spawning a persist task (if not dry_run)
+    /// 3. Executing the provided async operation with the sender
+    /// 4. Awaiting the persist task and returning the result
+    ///
+    /// Use this for fallible operations that return `Result`.
+    async fn with_persist_task<F, Fut, T, E>(
+        &self,
+        f: F,
+    ) -> std::result::Result<(T, PersistTaskResult), E>
+    where
+        F: FnOnce(mpsc::Sender<CodeRepositoryActiveModel>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    {
+        let (result, persist_result) = self.run_with_persist_task(f).await;
+
+        match result {
+            Ok(value) => Ok((value, persist_result)),
+            Err(err) => {
+                if persist_result.has_errors() {
+                    tracing::warn!(
+                        failed = persist_result.failed_count(),
+                        panic = persist_result.panic_info.is_some(),
+                        "sync failed after persistence task reported errors"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Execute an async operation with automatic persist task management (infallible version).
+    ///
+    /// Similar to [`with_persist_task`] but for operations that don't return `Result`.
+    async fn with_persist_task_infallible<F, Fut, T>(&self, f: F) -> (T, PersistTaskResult)
+    where
+        F: FnOnce(mpsc::Sender<CodeRepositoryActiveModel>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (result, persist_result) = self
+            .run_with_persist_task(
+                |tx| async move { Ok::<T, std::convert::Infallible>(f(tx).await) },
+            )
+            .await;
+
+        (
+            result.expect("infallible operation should never return error"),
+            persist_result,
+        )
     }
 
     /// Sync a single namespace (organization/group).
@@ -565,10 +580,6 @@ mod tests {
             _on_progress: Option<&crate::platform::ProgressCallback>,
         ) -> std::result::Result<usize, PlatformError> {
             Err(PlatformError::internal("unused in tests"))
-        }
-
-        fn to_active_model(&self, _repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-            CodeRepositoryActiveModel::default()
         }
     }
 

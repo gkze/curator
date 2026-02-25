@@ -19,7 +19,7 @@ pub(super) fn build_models<C: PlatformClient>(
 ) -> Vec<CodeRepositoryActiveModel> {
     repos
         .iter()
-        .map(|repo| client.to_active_model(repo))
+        .map(|repo| repo.to_active_model(client.instance_id()))
         .collect()
 }
 
@@ -58,7 +58,7 @@ pub(super) async fn process_streaming_repos<C: PlatformClient>(
             }
 
             if !options.dry_run && !channel_closed {
-                let model = client.to_active_model(repo);
+                let model = repo.to_active_model(client.instance_id());
                 if model_tx.send(model).await.is_err() {
                     channel_closed = true;
                     emit(
@@ -197,10 +197,6 @@ mod tests {
             _on_progress: Option<&ProgressCallback>,
         ) -> PlatformResult<usize> {
             panic!("unused in tests")
-        }
-
-        fn to_active_model(&self, _repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-            CodeRepositoryActiveModel::default()
         }
     }
 

@@ -6,7 +6,7 @@
 use sea_orm::DatabaseConnection;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 
 use crate::api_cache;
 use crate::entity::api_cache::EndpointType;
@@ -455,101 +455,91 @@ impl GitHubClient {
                 std::collections::HashMap::new()
             };
 
-            let semaphore = Arc::new(Semaphore::new(concurrency));
-            let mut handles = Vec::new();
             let client = self.clone();
             let channel_closed = Arc::new(AtomicBool::new(false));
 
-            for page in 2..=last_page {
-                let task_semaphore = Arc::clone(&semaphore);
-                let task_client = client.clone();
-                let task_tx = tx.clone();
-                let task_total_sent = Arc::clone(&total_sent);
-                let task_channel_closed = Arc::clone(&channel_closed);
-                let route = (config.route_fn)(page);
-                let cache_key = (config.cache_key_fn)(page);
-                let cached_etag = etags_map.get(&cache_key).cloned().flatten();
-                let convert_fn = convert.clone();
-                let skip_rate_checks = config.skip_rate_checks;
+            let page_results =
+                crate::platform::collect_pages_unordered(2..=last_page, concurrency, |page| {
+                    let task_client = client.clone();
+                    let task_tx = tx.clone();
+                    let task_total_sent = Arc::clone(&total_sent);
+                    let task_channel_closed = Arc::clone(&channel_closed);
+                    let route = (config.route_fn)(page);
+                    let cache_key = (config.cache_key_fn)(page);
+                    let cached_etag = etags_map.get(&cache_key).cloned().flatten();
+                    let convert_fn = convert.clone();
+                    let skip_rate_checks = config.skip_rate_checks;
 
-                let handle = tokio::spawn(async move {
-                    let _permit = match task_semaphore.acquire().await {
-                        Ok(permit) => permit,
-                        Err(_) => return (page, 0, None, false, true),
-                    };
+                    async move {
+                        if !skip_rate_checks && check_rate_limit(task_client.inner()).await.is_err()
+                        {
+                            return (page, 0, None, false, false);
+                        }
 
-                    if !skip_rate_checks && check_rate_limit(task_client.inner()).await.is_err() {
-                        return (page, 0, None, false, false);
-                    }
+                        let result: Result<FetchResult<Vec<T>>, GitHubError> = task_client
+                            .get_conditional(&route, cached_etag.as_deref())
+                            .await;
 
-                    let result: Result<FetchResult<Vec<T>>, GitHubError> = task_client
-                        .get_conditional(&route, cached_etag.as_deref())
-                        .await;
+                        match result {
+                            Ok(FetchResult::NotModified) => (page, 0, None, false, false),
+                            Ok(FetchResult::Fetched { data, etag, .. }) => {
+                                let count = data.len();
+                                let mut sent = 0usize;
 
-                    match result {
-                        Ok(FetchResult::NotModified) => (page, 0, None, false, false),
-                        Ok(FetchResult::Fetched { data, etag, .. }) => {
-                            let count = data.len();
-                            let mut sent = 0usize;
-
-                            if !task_channel_closed.load(Ordering::Relaxed) {
-                                for item in &data {
-                                    if task_tx.send(convert_fn(item)).await.is_ok() {
-                                        task_total_sent.fetch_add(1, Ordering::Relaxed);
-                                        sent += 1;
-                                    } else {
-                                        task_channel_closed.store(true, Ordering::Relaxed);
-                                        break;
+                                if !task_channel_closed.load(Ordering::Relaxed) {
+                                    for item in &data {
+                                        if task_tx.send(convert_fn(item)).await.is_ok() {
+                                            task_total_sent.fetch_add(1, Ordering::Relaxed);
+                                            sent += 1;
+                                        } else {
+                                            task_channel_closed.store(true, Ordering::Relaxed);
+                                            break;
+                                        }
                                     }
                                 }
+
+                                (page, count, etag, true, sent < count)
                             }
-
-                            (page, count, etag, true, sent < count)
+                            Err(_) => (page, 0, None, false, false),
                         }
-                        Err(_) => (page, 0, None, false, false),
                     }
-                });
+                })
+                .await;
 
-                handles.push(handle);
-            }
+            for (page, count, new_etag, was_fetched, _channel_err) in page_results {
+                if was_fetched {
+                    stats.pages_fetched += 1;
 
-            // Collect results and update stats
-            for handle in handles {
-                if let Ok((page, count, new_etag, was_fetched, _channel_err)) = handle.await {
-                    if was_fetched {
-                        stats.pages_fetched += 1;
-
-                        // Store new ETag
-                        if let Some(db) = db {
-                            let cache_key = (config.cache_key_fn)(page);
-                            if let Err(e) = api_cache::upsert_with_pagination(
-                                db,
-                                self.instance_id(),
-                                config.endpoint_type,
-                                &cache_key,
-                                new_etag,
-                                None,
-                            )
-                            .await
-                            {
-                                tracing::debug!("api cache upsert failed: {e}");
-                            }
+                    // Store new ETag
+                    if let Some(db) = db {
+                        let cache_key = (config.cache_key_fn)(page);
+                        if let Err(e) = api_cache::upsert_with_pagination(
+                            db,
+                            self.instance_id(),
+                            config.endpoint_type,
+                            &cache_key,
+                            new_etag,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::debug!("api cache upsert failed: {e}");
                         }
-                    } else if count == 0 {
-                        stats.cache_hits += 1;
                     }
-
-                    emit(
-                        on_progress,
-                        SyncProgress::FetchedPage {
-                            namespace: config.namespace.to_string(),
-                            page,
-                            count,
-                            total_so_far: total_sent.load(Ordering::Relaxed),
-                            expected_pages: known_total_pages,
-                        },
-                    );
+                } else if count == 0 {
+                    stats.cache_hits += 1;
                 }
+
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
+                        namespace: config.namespace.to_string(),
+                        page,
+                        count,
+                        total_so_far: total_sent.load(Ordering::Relaxed),
+                        expected_pages: known_total_pages,
+                    },
+                );
             }
         }
 

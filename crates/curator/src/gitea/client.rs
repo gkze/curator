@@ -11,7 +11,6 @@ use uuid::Uuid;
 use super::convert::to_platform_repo;
 use super::error::{GiteaError, is_rate_limit_error, short_error_message};
 use super::types::{GiteaAuthUser, GiteaOrg, GiteaRepo};
-use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, AdaptiveRateLimiter, OrgInfo, PlatformClient, PlatformError, PlatformRepo, RateLimitInfo,
@@ -149,6 +148,22 @@ impl GiteaClient {
         self.instance_id
     }
 
+    fn default_headers(&self) -> HttpHeaders {
+        vec![
+            ("Accept".to_string(), "application/json".to_string()),
+            ("User-Agent".to_string(), "curator".to_string()),
+            ("Authorization".to_string(), format!("token {}", self.token)),
+        ]
+    }
+
+    fn conditional_headers(&self, cached_etag: Option<&str>) -> HttpHeaders {
+        let mut headers = self.default_headers();
+        if let Some(etag) = cached_etag {
+            headers.push(("If-None-Match".to_string(), etag.to_string()));
+        }
+        headers
+    }
+
     /// Make an authenticated GET request.
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, GiteaError> {
         self.wait_for_rate_limit().await;
@@ -157,11 +172,7 @@ impl GiteaClient {
         let request = HttpRequest {
             method: HttpMethod::Get,
             url,
-            headers: vec![
-                ("Accept".to_string(), "application/json".to_string()),
-                ("User-Agent".to_string(), "curator".to_string()),
-                ("Authorization".to_string(), format!("token {}", self.token)),
-            ],
+            headers: self.default_headers(),
             body: Vec::new(),
         };
 
@@ -198,19 +209,10 @@ impl GiteaClient {
         self.wait_for_rate_limit().await;
         let url = format!("{}/api/v1{}", self.host, path);
 
-        let mut headers = vec![
-            ("Accept".to_string(), "application/json".to_string()),
-            ("User-Agent".to_string(), "curator".to_string()),
-            ("Authorization".to_string(), format!("token {}", self.token)),
-        ];
-        if let Some(etag) = cached_etag {
-            headers.push(("If-None-Match".to_string(), etag.to_string()));
-        }
-
         let request = HttpRequest {
             method: HttpMethod::Get,
             url,
-            headers,
+            headers: self.conditional_headers(cached_etag),
             body: Vec::new(),
         };
 
@@ -251,11 +253,7 @@ impl GiteaClient {
         let request = HttpRequest {
             method: HttpMethod::Put,
             url,
-            headers: vec![
-                ("Accept".to_string(), "application/json".to_string()),
-                ("User-Agent".to_string(), "curator".to_string()),
-                ("Authorization".to_string(), format!("token {}", self.token)),
-            ],
+            headers: self.default_headers(),
             body: Vec::new(),
         };
 
@@ -286,11 +284,7 @@ impl GiteaClient {
         let request = HttpRequest {
             method: HttpMethod::Delete,
             url,
-            headers: vec![
-                ("Accept".to_string(), "application/json".to_string()),
-                ("User-Agent".to_string(), "curator".to_string()),
-                ("Authorization".to_string(), format!("token {}", self.token)),
-            ],
+            headers: self.default_headers(),
             body: Vec::new(),
         };
 
@@ -391,11 +385,7 @@ impl GiteaClient {
         let request = HttpRequest {
             method: HttpMethod::Get,
             url,
-            headers: vec![
-                ("Accept".to_string(), "application/json".to_string()),
-                ("User-Agent".to_string(), "curator".to_string()),
-                ("Authorization".to_string(), format!("token {}", self.token)),
-            ],
+            headers: self.default_headers(),
             body: Vec::new(),
         };
 
@@ -1077,10 +1067,6 @@ impl PlatformClient for GiteaClient {
         );
 
         Ok(sent)
-    }
-
-    fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-        repo.to_active_model(self.instance_id)
     }
 }
 

@@ -21,6 +21,7 @@ mod cache_fallback;
 mod conditional;
 mod convert;
 mod errors;
+mod pagination_stream;
 mod rate_limit;
 mod types;
 
@@ -31,6 +32,7 @@ pub use cache_fallback::{
 pub use conditional::{CacheStats, FetchResult, PaginationInfo};
 pub use convert::strip_null_values;
 pub use errors::{PlatformError, Result, short_error_message};
+pub use pagination_stream::collect_pages_unordered;
 pub use rate_limit::{AdaptiveRateLimiter, rate_limits};
 pub use types::{OrgInfo, PlatformClient, PlatformRepo, ProgressCallback, RateLimitInfo, UserInfo};
 

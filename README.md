@@ -69,8 +69,8 @@ nix profile add github:gkze/curator
 Curator uses a layered configuration system. Settings are resolved in this order (highest priority first):
 
 1. CLI flags
-1. Environment variables (including `.env` in the current directory)
-1. Config file (`~/.config/curator/config.toml` or `./curator.toml`)
+1. Environment variables (`CURATOR_*`, including values loaded from `.env` in the current directory)
+1. Config files (`./curator.toml`, then `~/.config/curator/config.toml`)
 1. Built-in defaults
 
 ### Config File

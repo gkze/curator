@@ -3,6 +3,7 @@
 //! Configuration is loaded with the following precedence (highest to lowest):
 //! 1. CLI flags
 //! 2. Environment variables (prefixed with `CURATOR_`, e.g., `CURATOR_DATABASE_URL`)
+//!    including values from `.env` (loaded by `main` before `Config::try_load()`)
 //! 3. Config file (~/.config/curator/config.toml or ./curator.toml)
 //! 4. Built-in defaults
 //!
@@ -39,8 +40,7 @@ use std::path::{Path, PathBuf};
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use std::{fs, io};
 
-use config::{Config as ConfigBuilder, Environment, File, FileFormat};
-use console::Term;
+use config::{Config as ConfigStore, ConfigBuilder, Environment, File, FileFormat};
 use directories::ProjectDirs;
 use serde::Deserialize;
 use url::Url;
@@ -163,16 +163,8 @@ impl Default for SyncConfig {
 }
 
 impl Config {
-    /// Load configuration using the config crate's layered approach.
-    ///
-    /// Sources are loaded in order (later sources override earlier):
-    /// 1. Built-in defaults
-    /// 2. XDG config file (~/.config/curator/config.toml)
-    /// 3. Local config file (./curator.toml)
-    /// 4. Environment variables with CURATOR_ prefix
-    /// 5. Legacy environment variables (for backwards compatibility)
-    pub fn load() -> Self {
-        let mut builder = ConfigBuilder::builder();
+    fn build_config() -> ConfigBuilder<config::builder::DefaultState> {
+        let mut builder = ConfigStore::builder();
 
         // Add XDG config file if it exists
         if let Some(proj_dirs) = ProjectDirs::from("", "", "curator") {
@@ -200,32 +192,19 @@ impl Config {
 
         // Add CURATOR_ prefixed environment variables
         // e.g., CURATOR_DATABASE_URL -> database.url
-        builder = builder.add_source(
+        builder.add_source(
             Environment::with_prefix("CURATOR")
                 .separator("_")
                 .try_parsing(true),
-        );
+        )
+    }
 
-        // Build the config and deserialize
-        match builder.build() {
-            Ok(settings) => match settings.try_deserialize::<Config>() {
-                Ok(config) => config,
-                Err(e) => {
-                    if Term::stderr().is_term() {
-                        eprintln!("Warning: Failed to parse curator config; using defaults: {e}");
-                    }
-                    tracing::warn!("Failed to deserialize config: {}", e);
-                    Config::default()
-                }
-            },
-            Err(e) => {
-                if Term::stderr().is_term() {
-                    eprintln!("Warning: Failed to load curator config; using defaults: {e}");
-                }
-                tracing::warn!("Failed to build config: {}", e);
-                Config::default()
-            }
-        }
+    /// Try to load and deserialize configuration.
+    ///
+    /// Returns an error when config files are invalid or deserialization fails.
+    pub fn try_load() -> std::result::Result<Self, config::ConfigError> {
+        let settings = Self::build_config().build()?;
+        settings.try_deserialize::<Config>()
     }
 
     /// Get the database URL, falling back to the default state directory path.
@@ -522,7 +501,7 @@ mod tests {
             star = false
         "#;
 
-        let settings = ConfigBuilder::builder()
+        let settings = ConfigStore::builder()
             .add_source(config::File::from_str(toml_content, FileFormat::Toml))
             .build()
             .unwrap();
@@ -542,7 +521,7 @@ mod tests {
     #[test]
     fn test_config_builder_with_defaults() {
         // Test that defaults are applied when no config is provided
-        let settings = ConfigBuilder::builder().build().unwrap();
+        let settings = ConfigStore::builder().build().unwrap();
 
         let config: Config = settings.try_deserialize().unwrap_or_default();
 
@@ -559,7 +538,7 @@ mod tests {
             active_within_days = 30
         "#;
 
-        let settings = ConfigBuilder::builder()
+        let settings = ConfigStore::builder()
             .add_source(config::File::from_str(toml_content, FileFormat::Toml))
             .build()
             .unwrap();
@@ -594,7 +573,7 @@ mod tests {
             star = false
         "#;
 
-        let settings = ConfigBuilder::builder()
+        let settings = ConfigStore::builder()
             .add_source(config::File::from_str(toml_content, FileFormat::Toml))
             .build()
             .unwrap();
@@ -624,7 +603,7 @@ mod tests {
             no_rate_limit = true
         "#;
 
-        let settings = ConfigBuilder::builder()
+        let settings = ConfigStore::builder()
             .add_source(config::File::from_str(toml_content, FileFormat::Toml))
             .build()
             .unwrap();
@@ -649,7 +628,7 @@ mod tests {
             include_subgroups = false
         "#;
 
-        let settings = ConfigBuilder::builder()
+        let settings = ConfigStore::builder()
             .add_source(config::File::from_str(toml_content, FileFormat::Toml))
             .build()
             .unwrap();
@@ -702,7 +681,7 @@ mod tests {
             url = "postgres://localhost/curator"
         "#;
 
-        let settings = ConfigBuilder::builder()
+        let settings = ConfigStore::builder()
             .add_source(config::File::from_str(toml_content, FileFormat::Toml))
             .build()
             .unwrap();
@@ -749,7 +728,7 @@ mod tests {
             host = "https://gitlab.mycompany.com"
         "#;
 
-        let settings = ConfigBuilder::builder()
+        let settings = ConfigStore::builder()
             .add_source(config::File::from_str(toml_content, FileFormat::Toml))
             .build()
             .unwrap();
@@ -797,7 +776,7 @@ mod tests {
             .prefix_separator("_");
 
         // Just verify it can be created without error
-        let _builder = ConfigBuilder::builder().add_source(env_source);
+        let _builder = ConfigStore::builder().add_source(env_source);
     }
 
     #[test]
@@ -814,7 +793,7 @@ mod tests {
             active_within_days = 30
         "#;
 
-        let settings = ConfigBuilder::builder()
+        let settings = ConfigStore::builder()
             .add_source(config::File::from_str(base_toml, FileFormat::Toml))
             .add_source(config::File::from_str(override_toml, FileFormat::Toml))
             .build()
@@ -835,7 +814,7 @@ mod tests {
             active_within_days = 60
         "#;
 
-        let result = ConfigBuilder::builder()
+        let result = ConfigStore::builder()
             .add_source(config::File::from_str(invalid_toml, FileFormat::Toml))
             .build();
 
@@ -851,7 +830,7 @@ mod tests {
             unknown_field = "should be ignored"
         "#;
 
-        let settings = ConfigBuilder::builder()
+        let settings = ConfigStore::builder()
             .add_source(config::File::from_str(toml_content, FileFormat::Toml))
             .build()
             .unwrap();

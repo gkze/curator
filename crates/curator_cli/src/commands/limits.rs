@@ -1,12 +1,14 @@
 use clap::ValueEnum;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::DatabaseConnection;
 #[cfg(feature = "github")]
 use uuid::Uuid;
 
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-use curator::{Instance, InstanceColumn, PlatformType};
+use curator::PlatformType;
 
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+use crate::commands::shared::find_instance_by_name;
 #[cfg(feature = "github")]
 use crate::commands::shared::get_token_for_instance;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
@@ -31,16 +33,7 @@ pub(crate) async fn handle_limits(
     db: &DatabaseConnection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Look up the instance
-    let instance = Instance::find()
-        .filter(InstanceColumn::Name.eq(instance_name))
-        .one(db)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "Instance '{}' not found. Add it first with: curator instance add {}",
-                instance_name, instance_name
-            )
-        })?;
+    let instance = find_instance_by_name(db, instance_name).await?;
 
     #[cfg(not(feature = "github"))]
     let _ = config;
@@ -54,7 +47,7 @@ pub(crate) async fn handle_limits(
             let client = GitHubClient::new(&token, Uuid::nil(), None)?;
             let rate_limits = curator::github::get_rate_limits(client.inner()).await?;
             let items = github_rate_limits_to_display(&rate_limits.resources);
-            RateLimitDisplay::print_many(items, output);
+            RateLimitDisplay::print_many(items, output)?;
         }
         #[cfg(feature = "gitlab")]
         PlatformType::GitLab => {
@@ -66,7 +59,7 @@ pub(crate) async fn handle_limits(
                 docs_url: "https://docs.gitlab.com/ee/administration/settings/rate_limits.html"
                     .to_string(),
             };
-            info.print(output);
+            info.print(output)?;
         }
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
@@ -82,15 +75,28 @@ pub(crate) async fn handle_limits(
                 note: "Check X-RateLimit-* headers in API responses".to_string(),
                 docs_url: "https://docs.gitea.com/usage/api-usage".to_string(),
             };
-            info.print(output);
+            info.print(output)?;
         }
-        #[allow(unreachable_patterns)]
-        _ => {
-            return Err(format!(
-                "Platform type '{}' not supported for limits display.",
-                instance.platform_type
-            )
-            .into());
+        #[cfg(not(feature = "github"))]
+        PlatformType::GitHub => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "limits display",
+            ));
+        }
+        #[cfg(not(feature = "gitlab"))]
+        PlatformType::GitLab => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "limits display",
+            ));
+        }
+        #[cfg(not(feature = "gitea"))]
+        PlatformType::Gitea => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "limits display",
+            ));
         }
     }
 
@@ -149,7 +155,10 @@ impl RateLimitDisplay {
         }
     }
 
-    pub(crate) fn print_many(mut items: Vec<Self>, format: OutputFormat) {
+    pub(crate) fn print_many(
+        mut items: Vec<Self>,
+        format: OutputFormat,
+    ) -> Result<(), serde_json::Error> {
         // Sort by resource name for consistent output
         items.sort_by(|a, b| a.resource.cmp(&b.resource));
 
@@ -160,9 +169,11 @@ impl RateLimitDisplay {
                 println!("{}", table);
             }
             OutputFormat::Json => {
-                println!("{}", serde_json::to_string_pretty(&items).unwrap());
+                println!("{}", serde_json::to_string_pretty(&items)?);
             }
         }
+
+        Ok(())
     }
 }
 
@@ -248,7 +259,7 @@ pub(crate) struct RateLimitInfoMessage {
 
 #[cfg(any(feature = "gitlab", feature = "gitea"))]
 impl RateLimitInfoMessage {
-    pub(crate) fn print(self, format: OutputFormat) {
+    pub(crate) fn print(self, format: OutputFormat) -> Result<(), serde_json::Error> {
         match format {
             OutputFormat::Table => {
                 let mut table = tabled::Table::new(vec![self]);
@@ -256,9 +267,11 @@ impl RateLimitInfoMessage {
                 println!("{}", table);
             }
             OutputFormat::Json => {
-                println!("{}", serde_json::to_string_pretty(&self).unwrap());
+                println!("{}", serde_json::to_string_pretty(&self)?);
             }
         }
+
+        Ok(())
     }
 }
 
@@ -376,8 +389,10 @@ mod tests {
         }];
 
         // Smoke tests: this should not panic in either output mode.
-        RateLimitDisplay::print_many(items.clone(), OutputFormat::Json);
-        RateLimitDisplay::print_many(items, OutputFormat::Table);
+        RateLimitDisplay::print_many(items.clone(), OutputFormat::Json)
+            .expect("json rendering should succeed");
+        RateLimitDisplay::print_many(items, OutputFormat::Table)
+            .expect("table rendering should succeed");
     }
 
     #[cfg(any(feature = "gitlab", feature = "gitea"))]
@@ -392,7 +407,10 @@ mod tests {
         };
 
         // Smoke tests: this should not panic in either output mode.
-        info.clone().print(OutputFormat::Json);
-        info.print(OutputFormat::Table);
+        info.clone()
+            .print(OutputFormat::Json)
+            .expect("json rendering should succeed");
+        info.print(OutputFormat::Table)
+            .expect("table rendering should succeed");
     }
 }

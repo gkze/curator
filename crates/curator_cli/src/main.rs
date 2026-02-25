@@ -4,6 +4,8 @@ mod commands;
 mod config;
 mod progress;
 mod shutdown;
+#[cfg(test)]
+mod test_support;
 
 use std::path::PathBuf;
 
@@ -53,9 +55,11 @@ repositories, can star active repos, and prune inactive ones."
 
 CONFIGURATION
     Curator reads configuration from:
-      1. ~/.config/curator/config.toml (or $XDG_CONFIG_HOME/curator/config.toml)
+      1. CLI flags
       2. Environment variables (CURATOR_* prefix, e.g., CURATOR_GITHUB_TOKEN)
-      3. .env file in current directory
+         .env in the current directory is loaded into environment variables when present
+      3. Config files (./curator.toml, then ~/.config/curator/config.toml)
+      4. Built-in defaults
 
 ENVIRONMENT VARIABLES
     CURATOR_DATABASE_URL      Database connection string (default: sqlite://~/.local/state/curator/curator.db?mode=rwc)
@@ -266,9 +270,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    // Load configuration (config file -> env vars -> defaults)
-    let config = config::Config::load();
-
     let cli = Cli::parse();
 
     // Handle commands that don't require database access first
@@ -283,6 +284,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {}
     }
+
+    // Load configuration (defaults -> config files -> environment variables).
+    // `.env` was loaded above, so it participates as environment values.
+    let config = config::Config::try_load().map_err(|e| {
+        std::io::Error::other(format!(
+            "Failed to load curator config: {e}. Fix config syntax or run with a clean environment."
+        ))
+    })?;
 
     let database_url = config
         .database_url()

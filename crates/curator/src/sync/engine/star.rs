@@ -272,8 +272,6 @@ mod tests {
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
-    use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
-    use crate::entity::code_visibility::CodeVisibility;
     use crate::entity::platform_type::PlatformType;
     use crate::platform::{
         OrgInfo, PlatformRepo, RateLimitInfo, Result as PlatformResult, UserInfo,
@@ -436,10 +434,6 @@ mod tests {
             _skip_rate_checks: bool,
             _on_progress: Option<&ProgressCallback>,
         ) -> PlatformResult<usize> {
-            panic!("unused in tests")
-        }
-
-        fn to_active_model(&self, _repo: &PlatformRepo) -> CodeRepositoryActiveModel {
             panic!("unused in tests")
         }
     }
@@ -687,33 +681,5 @@ mod tests {
                 .await;
         })
         .await;
-
-        // Sync method that panics.
-        let repo = PlatformRepo {
-            platform_id: 1,
-            owner: "org".to_string(),
-            name: "repo".to_string(),
-            description: None,
-            default_branch: "main".to_string(),
-            visibility: CodeVisibility::Public,
-            is_fork: false,
-            is_archived: false,
-            stars: None,
-            forks: None,
-            language: None,
-            topics: vec![],
-            created_at: None,
-            updated_at: None,
-            pushed_at: None,
-            license: None,
-            homepage: None,
-            size_kb: None,
-            metadata: serde_json::json!({}),
-        };
-        let res = std::panic::catch_unwind(|| {
-            let client = TestClient::default();
-            let _ = client.to_active_model(&repo);
-        });
-        assert!(res.is_err());
     }
 }

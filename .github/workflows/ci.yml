@@ -4,14 +4,8 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
 
 jobs:
   # Run all Crane-based checks
@@ -131,6 +125,12 @@ jobs:
         run: |-
           FEATURES="${{ matrix.features }}"
           CHANGED="${{ steps.changes.outputs.crates }}"
+          PACKAGES="-p curator"
+
+          # curator_cli requires at least one database backend feature.
+          if [[ "$FEATURES" == *"sqlite"* || "$FEATURES" == *"postgres"* ]]; then
+            PACKAGES="$PACKAGES -p curator_cli"
+          fi
 
           # Prevent tests from accidentally making real network calls.
           PROXY_URL="http://127.0.0.1:9"
@@ -149,7 +149,7 @@ jobs:
               NO_PROXY="$NO_PROXY_LIST" \
               no_proxy="$NO_PROXY_LIST" \
               CARGO_NET_OFFLINE=true \
-              cargo nextest run -p curator --no-default-features \
+              cargo nextest run $PACKAGES --no-default-features \
                 --features "$FEATURES" -E "$FILTER"
           else
             # On push to main or no crate changes, run full test suite
@@ -161,6 +161,6 @@ jobs:
               NO_PROXY="$NO_PROXY_LIST" \
               no_proxy="$NO_PROXY_LIST" \
               CARGO_NET_OFFLINE=true \
-              cargo nextest run -p curator --no-default-features \
+              cargo nextest run $PACKAGES --no-default-features \
                 --features "$FEATURES"
           fi

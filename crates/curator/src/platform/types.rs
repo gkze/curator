@@ -4,7 +4,6 @@ use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::code_visibility::CodeVisibility;
 use crate::entity::platform_type::PlatformType;
 use crate::sync::SyncProgress;
@@ -248,9 +247,4 @@ pub trait PlatformClient: Send + Sync {
         skip_rate_checks: bool,
         on_progress: Option<&ProgressCallback>,
     ) -> Result<usize>;
-
-    /// Convert a platform repository to a curator active model.
-    ///
-    /// The implementation should use `self.instance_id()` to set the instance_id field.
-    fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel;
 }

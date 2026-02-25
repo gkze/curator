@@ -9,10 +9,10 @@ use clap::Subcommand;
 use console::Term;
 #[cfg(feature = "github")]
 use console::style;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::DatabaseConnection;
 
 use curator::{
-    Instance, InstanceColumn, InstanceModel, PlatformType, db,
+    InstanceModel, PlatformType, db,
     sync::{PlatformOptions, SyncOptions, SyncStrategy},
 };
 
@@ -20,7 +20,8 @@ use crate::CommonSyncOptions;
 use crate::StarredSyncOptions;
 use crate::commands::shared::{
     SyncKind, SyncRunner, active_within_duration, build_rate_limiter, display_final_rate_limit,
-    get_token_for_instance,
+    find_instance_by_name, get_token_for_instance, resolve_common_sync_options,
+    resolve_starred_sync_options,
 };
 use crate::config::Config;
 
@@ -165,45 +166,21 @@ async fn get_instance(
     db: &DatabaseConnection,
     name: &str,
 ) -> Result<InstanceModel, Box<dyn std::error::Error>> {
-    Instance::find()
-        .filter(InstanceColumn::Name.eq(name))
-        .one(db)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "Instance '{}' not found. Add it first with: curator instance add {}",
-                name, name
-            )
-            .into()
-        })
+    find_instance_by_name(db, name).await
 }
 
 fn merge_common_sync_options(
     sync_opts: &CommonSyncOptions,
     config: &Config,
 ) -> (u64, usize, bool, bool, SyncStrategy) {
-    let active_within_days = sync_opts
-        .active_within_days
-        .unwrap_or(config.sync.active_within_days);
-    let concurrency = sync_opts.concurrency.unwrap_or(config.sync.concurrency);
-    let star = if sync_opts.no_star {
-        false
-    } else {
-        config.sync.star
-    };
-    let no_rate_limit = sync_opts.no_rate_limit || config.sync.no_rate_limit;
-    let strategy = if sync_opts.incremental {
-        SyncStrategy::Incremental
-    } else {
-        SyncStrategy::Full
-    };
+    let resolved = resolve_common_sync_options(sync_opts, config);
 
     (
-        active_within_days,
-        concurrency,
-        star,
-        no_rate_limit,
-        strategy,
+        resolved.active_within_days,
+        resolved.concurrency,
+        resolved.star,
+        resolved.no_rate_limit,
+        resolved.strategy,
     )
 }
 
@@ -211,14 +188,14 @@ fn merge_starred_sync_options(
     sync_opts: &StarredSyncOptions,
     config: &Config,
 ) -> (u64, usize, bool, bool) {
-    let active_within_days = sync_opts
-        .active_within_days
-        .unwrap_or(config.sync.active_within_days);
-    let concurrency = sync_opts.concurrency.unwrap_or(config.sync.concurrency);
-    let prune = !sync_opts.no_prune;
-    let no_rate_limit = sync_opts.no_rate_limit || config.sync.no_rate_limit;
+    let resolved = resolve_starred_sync_options(sync_opts, config);
 
-    (active_within_days, concurrency, prune, no_rate_limit)
+    (
+        resolved.active_within_days,
+        resolved.concurrency,
+        resolved.prune,
+        resolved.no_rate_limit,
+    )
 }
 
 /// Sync organizations/groups.
@@ -287,13 +264,26 @@ async fn sync_org(
             let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
             run_namespace_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
         }
-        #[allow(unreachable_patterns)]
-        _ => {
-            return Err(format!(
-                "Platform type '{}' not supported for sync.",
-                instance.platform_type
-            )
-            .into());
+        #[cfg(not(feature = "github"))]
+        PlatformType::GitHub => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "sync",
+            ));
+        }
+        #[cfg(not(feature = "gitlab"))]
+        PlatformType::GitLab => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "sync",
+            ));
+        }
+        #[cfg(not(feature = "gitea"))]
+        PlatformType::Gitea => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "sync",
+            ));
         }
     }
 
@@ -362,13 +352,26 @@ async fn sync_user(
             let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
             run_user_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
         }
-        #[allow(unreachable_patterns)]
-        _ => {
-            return Err(format!(
-                "Platform type '{}' not supported for sync.",
-                instance.platform_type
-            )
-            .into());
+        #[cfg(not(feature = "github"))]
+        PlatformType::GitHub => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "sync",
+            ));
+        }
+        #[cfg(not(feature = "gitlab"))]
+        PlatformType::GitLab => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "sync",
+            ));
+        }
+        #[cfg(not(feature = "gitea"))]
+        PlatformType::Gitea => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "sync",
+            ));
         }
     }
 
@@ -436,13 +439,26 @@ async fn sync_stars(
             let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
             run_starred_sync_for_client(&runner, &client, prune, is_tty, no_rate_limit).await?;
         }
-        #[allow(unreachable_patterns)]
-        _ => {
-            return Err(format!(
-                "Platform type '{}' not supported for sync.",
-                instance.platform_type
-            )
-            .into());
+        #[cfg(not(feature = "github"))]
+        PlatformType::GitHub => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "sync",
+            ));
+        }
+        #[cfg(not(feature = "gitlab"))]
+        PlatformType::GitLab => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "sync",
+            ));
+        }
+        #[cfg(not(feature = "gitea"))]
+        PlatformType::Gitea => {
+            return Err(crate::commands::shared::unsupported_platform_error(
+                instance.platform_type,
+                "sync",
+            ));
         }
     }
 

@@ -75,6 +75,12 @@ pub fn header_get<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+#[cfg(any(
+    feature = "github",
+    feature = "gitlab",
+    feature = "gitea",
+    feature = "discovery"
+))]
 pub(crate) fn ensure_rustls_crypto_provider() {
     use std::sync::Once;
 
@@ -95,16 +101,28 @@ pub mod reqwest_transport {
 
     use std::time::Duration as StdDuration;
 
+    use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+    use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+
     /// A real HTTP transport backed by reqwest.
     #[derive(Clone)]
     pub struct ReqwestTransport {
-        client: reqwest::Client,
+        client: ClientWithMiddleware,
     }
 
     impl ReqwestTransport {
+        fn with_retry_middleware(client: reqwest::Client) -> ClientWithMiddleware {
+            let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+            ClientBuilder::new(client)
+                .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+                .build()
+        }
+
         pub fn new(client: reqwest::Client) -> Self {
             ensure_rustls_crypto_provider();
-            Self { client }
+            Self {
+                client: Self::with_retry_middleware(client),
+            }
         }
 
         pub fn with_timeout(timeout: StdDuration) -> Result<Self, HttpError> {
@@ -113,7 +131,9 @@ pub mod reqwest_transport {
                 .timeout(timeout)
                 .build()
                 .map_err(|e| HttpError::Transport(e.to_string()))?;
-            Ok(Self { client })
+            Ok(Self {
+                client: Self::with_retry_middleware(client),
+            })
         }
     }
 
@@ -144,10 +164,17 @@ pub mod reqwest_transport {
             let status = resp.status().as_u16();
             let mut headers: HttpHeaders = Vec::new();
             for (name, value) in resp.headers().iter() {
-                headers.push((
-                    name.as_str().to_string(),
-                    value.to_str().unwrap_or_default().to_string(),
-                ));
+                let header_value = match value.to_str() {
+                    Ok(decoded) => decoded.to_string(),
+                    Err(_) => {
+                        tracing::warn!(
+                            header = name.as_str(),
+                            "response header contained non-UTF-8 bytes; using lossy decode"
+                        );
+                        String::from_utf8_lossy(value.as_bytes()).into_owned()
+                    }
+                };
+                headers.push((name.as_str().to_string(), header_value));
             }
 
             let body = resp
@@ -250,6 +277,12 @@ impl HttpTransport for MockTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(
+        feature = "github",
+        feature = "gitlab",
+        feature = "gitea",
+        feature = "discovery"
+    ))]
     use std::time::Duration;
 
     #[test]

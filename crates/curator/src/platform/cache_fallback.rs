@@ -83,6 +83,8 @@ where
 
         if !cached_repos.is_empty() {
             let cached_count = cached_repos.len();
+            let mut successful_sends = 0usize;
+            let mut dropped_sends = 0usize;
 
             emit(
                 on_progress,
@@ -96,10 +98,25 @@ where
                 let repo = PlatformRepo::from_model(model);
                 if repo_tx.send(repo).await.is_ok() {
                     total_sent.fetch_add(1, Ordering::Relaxed);
+                    successful_sends += 1;
+                } else {
+                    dropped_sends += 1;
                 }
             }
 
-            return Ok(cached_count);
+            if dropped_sends > 0 {
+                emit(
+                    on_progress,
+                    SyncProgress::Warning {
+                        message: format!(
+                            "cache fallback for '{}' dropped {} repos because receiver closed",
+                            namespace, dropped_sends
+                        ),
+                    },
+                );
+            }
+
+            return Ok(successful_sends);
         }
     }
     Ok(0)
@@ -251,7 +268,7 @@ mod tests {
         .await
         .expect("streaming fallback should not fail");
 
-        assert_eq!(streamed, 2);
+        assert_eq!(streamed, 0);
         assert_eq!(total_sent.load(Ordering::Relaxed), 0);
     }
 

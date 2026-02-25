@@ -918,7 +918,7 @@ fn spawn_starred_processor_task<C: PlatformClient + Clone + 'static>(
 
             if is_active {
                 if !dry_run && !processor_channel_closed.load(Ordering::Relaxed) {
-                    let model = processor_client.to_active_model(&repo);
+                    let model = repo.to_active_model(processor_client.instance_id());
                     if processor_model_tx.send(model).await.is_err() {
                         processor_channel_closed.store(true, Ordering::Relaxed);
                     } else {
@@ -1371,10 +1371,6 @@ mod tests {
         ) -> PlatformResult<usize> {
             panic!("unused in tests")
         }
-
-        fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-            repo.to_active_model(self.instance_id())
-        }
     }
 
     #[async_trait]
@@ -1500,10 +1496,6 @@ mod tests {
                 }
             }
             Ok(count)
-        }
-
-        fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-            repo.to_active_model(self.instance_id())
         }
     }
 

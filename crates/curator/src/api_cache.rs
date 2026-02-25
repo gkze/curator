@@ -4,9 +4,12 @@
 //! enabling conditional requests that avoid refetching unchanged data.
 
 use chrono::Utc;
+use moka::sync::Cache as MokaCache;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Set, sea_query::OnConflict,
 };
+use std::sync::OnceLock;
+use std::time::Duration as StdDuration;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -31,6 +34,47 @@ pub enum CacheError {
 /// Result type alias for cache operations.
 pub type Result<T> = std::result::Result<T, CacheError>;
 
+const IN_MEMORY_CACHE_MAX_ENTRIES: u64 = 10_000;
+const IN_MEMORY_CACHE_TTL: StdDuration = StdDuration::from_secs(300);
+
+type InMemoryStringCache<T> = MokaCache<String, T>;
+
+fn etag_cache() -> &'static InMemoryStringCache<Option<String>> {
+    static ETAG_CACHE: OnceLock<InMemoryStringCache<Option<String>>> = OnceLock::new();
+    ETAG_CACHE.get_or_init(|| {
+        InMemoryStringCache::builder()
+            .max_capacity(IN_MEMORY_CACHE_MAX_ENTRIES)
+            .time_to_live(IN_MEMORY_CACHE_TTL)
+            .build()
+    })
+}
+
+fn total_pages_cache() -> &'static InMemoryStringCache<Option<i32>> {
+    static TOTAL_PAGES_CACHE: OnceLock<InMemoryStringCache<Option<i32>>> = OnceLock::new();
+    TOTAL_PAGES_CACHE.get_or_init(|| {
+        InMemoryStringCache::builder()
+            .max_capacity(IN_MEMORY_CACHE_MAX_ENTRIES)
+            .time_to_live(IN_MEMORY_CACHE_TTL)
+            .build()
+    })
+}
+
+fn etag_memory_key(instance_id: Uuid, endpoint_type: EndpointType, cache_key: &str) -> String {
+    format!("{instance_id}:{endpoint_type:?}:{cache_key}")
+}
+
+fn total_pages_memory_key(
+    instance_id: Uuid,
+    endpoint_type: EndpointType,
+    namespace: &str,
+) -> String {
+    format!("{instance_id}:{endpoint_type:?}:{namespace}")
+}
+
+fn namespace_from_page_one_cache_key(cache_key: &str) -> Option<&str> {
+    cache_key.strip_suffix("/page/1")
+}
+
 /// Get a cached ETag for a specific endpoint.
 ///
 /// Returns `None` if no cache entry exists.
@@ -40,6 +84,11 @@ pub async fn get_etag(
     endpoint_type: EndpointType,
     cache_key: &str,
 ) -> Result<Option<String>> {
+    let memory_key = etag_memory_key(instance_id, endpoint_type, cache_key);
+    if let Some(cached) = etag_cache().get(&memory_key) {
+        return Ok(cached);
+    }
+
     let entry = ApiCache::find()
         .filter(Column::InstanceId.eq(instance_id))
         .filter(Column::EndpointType.eq(endpoint_type))
@@ -47,7 +96,9 @@ pub async fn get_etag(
         .one(db)
         .await?;
 
-    Ok(entry.and_then(|e| e.etag))
+    let etag = entry.and_then(|e| e.etag);
+    etag_cache().insert(memory_key, etag.clone());
+    Ok(etag)
 }
 
 /// Get a cache entry by its lookup key.
@@ -63,6 +114,19 @@ pub async fn get(
         .filter(Column::CacheKey.eq(cache_key))
         .one(db)
         .await?;
+
+    if let Some(ref model) = entry {
+        etag_cache().insert(
+            etag_memory_key(instance_id, endpoint_type, cache_key),
+            model.etag.clone(),
+        );
+        if let Some(namespace) = namespace_from_page_one_cache_key(cache_key) {
+            total_pages_cache().insert(
+                total_pages_memory_key(instance_id, endpoint_type, namespace),
+                model.total_pages,
+            );
+        }
+    }
 
     Ok(entry)
 }
@@ -99,7 +163,7 @@ pub async fn upsert_with_pagination(
         instance_id: Set(instance_id),
         endpoint_type: Set(endpoint_type),
         cache_key: Set(cache_key.to_string()),
-        etag: Set(etag),
+        etag: Set(etag.clone()),
         total_pages: Set(total_pages),
         cached_at: Set(now),
     };
@@ -112,6 +176,17 @@ pub async fn upsert_with_pagination(
         )
         .exec(db)
         .await?;
+
+    etag_cache().insert(
+        etag_memory_key(instance_id, endpoint_type, cache_key),
+        etag.clone(),
+    );
+    if let Some(namespace) = namespace_from_page_one_cache_key(cache_key) {
+        total_pages_cache().insert(
+            total_pages_memory_key(instance_id, endpoint_type, namespace),
+            total_pages,
+        );
+    }
 
     Ok(())
 }
@@ -164,10 +239,17 @@ pub async fn get_total_pages(
     endpoint_type: EndpointType,
     namespace: &str,
 ) -> Result<Option<i32>> {
+    let memory_key = total_pages_memory_key(instance_id, endpoint_type, namespace);
+    if let Some(cached) = total_pages_cache().get(&memory_key) {
+        return Ok(cached);
+    }
+
     // Page 1 cache key stores the total pages
     let page1_key = format!("{}/page/1", namespace);
     let entry = get(db, instance_id, endpoint_type, &page1_key).await?;
-    Ok(entry.and_then(|e| e.total_pages))
+    let total_pages = entry.and_then(|e| e.total_pages);
+    total_pages_cache().insert(memory_key, total_pages);
+    Ok(total_pages)
 }
 
 /// Get the total pages for starred repos from page 1's cache entry.
@@ -178,11 +260,8 @@ pub async fn get_starred_total_pages(
     instance_id: Uuid,
     username: &str,
 ) -> Result<Option<i32>> {
-    use crate::entity::api_cache::Model as ApiCacheModel;
-
-    let page1_key = ApiCacheModel::starred_key(username, 1);
-    let entry = get(db, instance_id, EndpointType::Starred, &page1_key).await?;
-    Ok(entry.and_then(|e| e.total_pages))
+    let namespace = format!("{username}/starred");
+    get_total_pages(db, instance_id, EndpointType::Starred, &namespace).await
 }
 
 /// Delete a specific cache entry.
@@ -199,6 +278,15 @@ pub async fn delete(
         .exec(db)
         .await?;
 
+    etag_cache().invalidate(&etag_memory_key(instance_id, endpoint_type, cache_key));
+    if let Some(namespace) = namespace_from_page_one_cache_key(cache_key) {
+        total_pages_cache().invalidate(&total_pages_memory_key(
+            instance_id,
+            endpoint_type,
+            namespace,
+        ));
+    }
+
     Ok(result.rows_affected > 0)
 }
 
@@ -208,6 +296,9 @@ pub async fn delete_by_instance(db: &DatabaseConnection, instance_id: Uuid) -> R
         .filter(Column::InstanceId.eq(instance_id))
         .exec(db)
         .await?;
+
+    etag_cache().invalidate_all();
+    total_pages_cache().invalidate_all();
 
     Ok(result.rows_affected)
 }
@@ -224,6 +315,9 @@ pub async fn delete_by_endpoint_type(
         .exec(db)
         .await?;
 
+    etag_cache().invalidate_all();
+    total_pages_cache().invalidate_all();
+
     Ok(result.rows_affected)
 }
 
@@ -233,6 +327,9 @@ pub async fn delete_stale(db: &DatabaseConnection, cutoff: chrono::DateTime<Utc>
         .filter(Column::CachedAt.lt(cutoff.fixed_offset()))
         .exec(db)
         .await?;
+
+    etag_cache().invalidate_all();
+    total_pages_cache().invalidate_all();
 
     Ok(result.rows_affected)
 }

@@ -18,7 +18,6 @@ use super::error::{GitLabError, is_rate_limit_error, short_error_message};
 use super::types::{GitLabGroup, GitLabProject, GitLabUser};
 use crate::api_cache;
 use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
-use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::entity::platform_type::PlatformType;
 use crate::platform::{
     self, AdaptiveRateLimiter, CacheStats, FetchResult, OrgInfo, PaginationInfo, PlatformClient,
@@ -130,19 +129,16 @@ impl GitLabClient {
     }
 
     fn url_encode_component(input: &str) -> String {
-        let mut out = String::new();
-        for &b in input.as_bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                    out.push(b as char);
-                }
-                _ => {
-                    use std::fmt::Write;
-                    let _ = write!(&mut out, "%{:02X}", b);
-                }
-            }
+        let mut url = url::Url::parse("https://curator.local")
+            .expect("static URL used for path encoding must parse");
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .expect("static URL used for path encoding must support path segments");
+            segments.clear();
+            segments.push(input);
         }
-        out
+        url.path().trim_start_matches('/').to_string()
     }
 
     /// Update the rate limiter with rate limit info from response headers, if available.
@@ -370,7 +366,7 @@ impl GitLabClient {
         db: Option<&DatabaseConnection>,
     ) -> Result<(Vec<GitLabProject>, CacheStats), GitLabError> {
         let include_sub = if include_subgroups { "true" } else { "false" };
-        let encoded_group = group.replace('/', "%2F");
+        let encoded_group = Self::url_encode_component(group);
         let host = self.host.clone();
 
         self.paginated_fetch(
@@ -449,8 +445,9 @@ impl GitLabClient {
     async fn resolve_user_id(&self, username: &str) -> Result<u64, GitLabError> {
         self.wait_for_rate_limit().await;
 
-        let encoded_username = Self::url_encode_component(username);
-        let url = format!("{}/api/v4/users?username={}", self.host, encoded_username);
+        let query = serde_urlencoded::to_string([("username", username)])
+            .map_err(|e| GitLabError::Api(format!("Failed to encode users query params: {}", e)))?;
+        let url = format!("{}/api/v4/users?{}", self.host, query);
 
         let request = HttpRequest {
             method: HttpMethod::Get,
@@ -577,7 +574,7 @@ impl GitLabClient {
     pub async fn get_group_info(&self, group: &str) -> Result<OrgInfo, GitLabError> {
         self.wait_for_rate_limit().await;
 
-        let encoded_group = group.replace('/', "%2F");
+        let encoded_group = Self::url_encode_component(group);
         let url = format!("{}/api/v4/groups/{}", self.host, encoded_group);
         let request = HttpRequest {
             method: HttpMethod::Get,
@@ -652,7 +649,7 @@ impl GitLabClient {
     async fn get_project_by_path(&self, full_path: &str) -> Result<GitLabProject, GitLabError> {
         self.wait_for_rate_limit().await;
 
-        let encoded = full_path.replace('/', "%2F");
+        let encoded = Self::url_encode_component(full_path);
         let url = format!("{}/api/v4/projects/{}", self.host, encoded);
         let request = HttpRequest {
             method: HttpMethod::Get,
@@ -1228,7 +1225,6 @@ impl PlatformClient for GitLabClient {
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<usize> {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::Semaphore;
 
         emit(
             on_progress,
@@ -1363,110 +1359,101 @@ impl PlatformClient for GitLabClient {
         // ── Remaining pages (concurrent) ────────────────────────────
         let total_pages = known_total_pages.unwrap_or(1);
         if total_pages > 1 {
-            let semaphore = Arc::new(Semaphore::new(concurrency));
-            let mut handles = Vec::new();
-
             let user_id = user.id;
+            let instance_id = self.instance_id;
 
-            for page in 2..=total_pages {
-                let client = self.clone();
-                let task_repo_tx = repo_tx.clone();
-                let task_total_sent = Arc::clone(&total_sent);
-                let task_semaphore = Arc::clone(&semaphore);
-                let task_host = host.clone();
+            let page_results =
+                crate::platform::collect_pages_unordered(2..=total_pages, concurrency, |page| {
+                    let client = self.clone();
+                    let task_repo_tx = repo_tx.clone();
+                    let task_total_sent = Arc::clone(&total_sent);
+                    let task_host = host.clone();
+                    let task_username = username.clone();
 
-                // Pre-fetch ETag outside the spawn so we can borrow db
-                let task_cached_etag = if let Some(db) = db {
-                    let ck = ApiCacheModel::starred_key(&username, page);
-                    api_cache::get_etag(db, self.instance_id, EndpointType::Starred, &ck)
-                        .await
-                        .ok()
-                        .flatten()
-                } else {
-                    None
-                };
-
-                let handle = tokio::spawn(async move {
-                    let _permit = task_semaphore.acquire().await.ok()?;
-
-                    let url = format!(
-                        "{}/api/v4/users/{}/starred_projects?per_page=100&page={}",
-                        task_host, user_id, page,
-                    );
-
-                    let result: Result<FetchResult<Vec<GitLabProject>>, GitLabError> = client
-                        .get_conditional(&url, task_cached_etag.as_deref())
-                        .await;
-
-                    match result {
-                        Ok(FetchResult::NotModified) => {
-                            // Cache hit — no items to stream
-                            Some((page, Vec::<GitLabProject>::new(), true, None))
-                        }
-                        Ok(FetchResult::Fetched {
-                            data: items, etag, ..
-                        }) => {
-                            for project in &items {
-                                let platform_repo = to_platform_repo(project);
-                                if task_repo_tx.send(platform_repo).await.is_ok() {
-                                    task_total_sent.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            Some((page, items, false, etag))
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to fetch starred repos page {}: {}",
-                                page,
-                                short_error_message(&e),
-                            );
+                    async move {
+                        let task_cached_etag = if let Some(db) = db {
+                            let ck = ApiCacheModel::starred_key(&task_username, page);
+                            api_cache::get_etag(db, instance_id, EndpointType::Starred, &ck)
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
                             None
+                        };
+
+                        let url = format!(
+                            "{}/api/v4/users/{}/starred_projects?per_page=100&page={}",
+                            task_host, user_id, page,
+                        );
+
+                        let result: Result<FetchResult<Vec<GitLabProject>>, GitLabError> = client
+                            .get_conditional(&url, task_cached_etag.as_deref())
+                            .await;
+
+                        match result {
+                            Ok(FetchResult::NotModified) => {
+                                Some((page, Vec::<GitLabProject>::new(), true, None))
+                            }
+                            Ok(FetchResult::Fetched {
+                                data: items, etag, ..
+                            }) => {
+                                for project in &items {
+                                    let platform_repo = to_platform_repo(project);
+                                    if task_repo_tx.send(platform_repo).await.is_ok() {
+                                        task_total_sent.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Some((page, items, false, etag))
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to fetch starred repos page {}: {}",
+                                    page,
+                                    short_error_message(&e),
+                                );
+                                None
+                            }
                         }
                     }
-                });
+                })
+                .await;
 
-                handles.push(handle);
-            }
-
-            // Collect results from all spawned tasks
-            for handle in handles {
-                if let Ok(Some((page_num, items, was_cache_hit, etag))) = handle.await {
-                    if !was_cache_hit {
-                        all_cache_hits = false;
-                    }
-
-                    // Store ETag for fetched pages
-                    if let Some(db) = db
-                        && !was_cache_hit
-                    {
-                        let ck = ApiCacheModel::starred_key(&username, page_num);
-                        if let Err(e) = api_cache::upsert_with_pagination(
-                            db,
-                            self.instance_id,
-                            EndpointType::Starred,
-                            &ck,
-                            etag,
-                            None, // total_pages already stored on page 1
-                        )
-                        .await
-                        {
-                            tracing::debug!("api cache upsert failed: {e}");
-                        }
-                    }
-
-                    emit(
-                        on_progress,
-                        SyncProgress::FetchedPage {
-                            namespace: "starred".to_string(),
-                            page: page_num,
-                            count: items.len(),
-                            total_so_far: total_sent.load(Ordering::Relaxed),
-                            expected_pages: known_total_pages,
-                        },
-                    );
-
-                    all_projects.extend(items);
+            for (page_num, items, was_cache_hit, etag) in page_results.into_iter().flatten() {
+                if !was_cache_hit {
+                    all_cache_hits = false;
                 }
+
+                // Store ETag for fetched pages
+                if let Some(db) = db
+                    && !was_cache_hit
+                {
+                    let ck = ApiCacheModel::starred_key(&username, page_num);
+                    if let Err(e) = api_cache::upsert_with_pagination(
+                        db,
+                        self.instance_id,
+                        EndpointType::Starred,
+                        &ck,
+                        etag,
+                        None, // total_pages already stored on page 1
+                    )
+                    .await
+                    {
+                        tracing::debug!("api cache upsert failed: {e}");
+                    }
+                }
+
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
+                        namespace: "starred".to_string(),
+                        page: page_num,
+                        count: items.len(),
+                        total_so_far: total_sent.load(Ordering::Relaxed),
+                        expected_pages: known_total_pages,
+                    },
+                );
+
+                all_projects.extend(items);
             }
         }
 
@@ -1499,10 +1486,6 @@ impl PlatformClient for GitLabClient {
         );
 
         Ok(sent)
-    }
-
-    fn to_active_model(&self, repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-        repo.to_active_model(self.instance_id)
     }
 }
 
@@ -2183,6 +2166,46 @@ mod tests {
             GitLabError::Api(message) => assert!(message.contains("User not found: missing-user")),
             other => panic!("unexpected error variant: {other:?}"),
         }
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, url);
+    }
+
+    #[test]
+    fn test_url_encode_component_uses_path_segment_encoding() {
+        assert_eq!(
+            GitLabClient::url_encode_component("group/sub team"),
+            "group%2Fsub%20team"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_id_encodes_query_parameters() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+
+        let username = "alice dev/team";
+        let encoded = serde_urlencoded::to_string([("username", username)])
+            .expect("query params should encode");
+        let url = format!("{TEST_BASE_URL}/api/v4/users?{encoded}");
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            r#"[{"id": 42}]"#,
+        );
+
+        let user_id = client
+            .resolve_user_id(username)
+            .await
+            .expect("expected user id lookup to succeed");
+
+        assert_eq!(user_id, 42);
 
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);

@@ -539,7 +539,9 @@ impl InteractiveReporter {
                 }
             }
 
-            _ => {}
+            other => {
+                tracing::debug!(event = ?other, "Unhandled sync progress event");
+            }
         }
     }
 

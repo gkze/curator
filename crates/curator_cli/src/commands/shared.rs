@@ -23,15 +23,20 @@ use curator::entity::instance::Model as InstanceModel;
 use curator::platform::PlatformClient;
 use curator::rate_limits;
 use curator::repository;
-#[cfg(feature = "discovery")]
 use curator::sync::{
     NamespaceSyncResultStreaming, ProgressCallback, SyncContext, SyncOptions, SyncResult,
 };
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+use curator::{Instance, InstanceColumn};
 use sea_orm::DatabaseConnection;
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::config::Config;
 use crate::progress::ProgressReporter;
 use crate::shutdown::{SHUTDOWN_FLAG, is_shutdown_requested};
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+use crate::{CommonSyncOptions, StarredSyncOptions};
 
 /// Buffer time (in seconds) before token expiry to trigger refresh.
 /// We refresh 5 minutes early to avoid race conditions.
@@ -69,6 +74,109 @@ pub(crate) fn active_within_duration(days: u64) -> Result<chrono::Duration, std:
     })?;
 
     Ok(chrono::Duration::days(days_i64))
+}
+
+/// Resolved sync settings after merging CLI flags and configuration defaults.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedCommonSyncOptions {
+    pub active_within_days: u64,
+    pub concurrency: usize,
+    pub star: bool,
+    pub no_rate_limit: bool,
+    pub strategy: curator::sync::SyncStrategy,
+}
+
+/// Resolve common sync options with precedence CLI flags > config defaults.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+pub(crate) fn resolve_common_sync_options(
+    sync_opts: &CommonSyncOptions,
+    config: &Config,
+) -> ResolvedCommonSyncOptions {
+    let strategy = if sync_opts.incremental {
+        curator::sync::SyncStrategy::Incremental
+    } else {
+        curator::sync::SyncStrategy::Full
+    };
+
+    ResolvedCommonSyncOptions {
+        active_within_days: sync_opts
+            .active_within_days
+            .unwrap_or(config.sync.active_within_days),
+        concurrency: sync_opts.concurrency.unwrap_or(config.sync.concurrency),
+        star: if sync_opts.no_star {
+            false
+        } else {
+            config.sync.star
+        },
+        no_rate_limit: sync_opts.no_rate_limit || config.sync.no_rate_limit,
+        strategy,
+    }
+}
+
+/// Resolved starred sync settings after merging CLI flags and config defaults.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedStarredSyncOptions {
+    pub active_within_days: u64,
+    pub concurrency: usize,
+    pub prune: bool,
+    pub no_rate_limit: bool,
+}
+
+/// Resolve starred sync options with precedence CLI flags > config defaults.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+pub(crate) fn resolve_starred_sync_options(
+    sync_opts: &StarredSyncOptions,
+    config: &Config,
+) -> ResolvedStarredSyncOptions {
+    ResolvedStarredSyncOptions {
+        active_within_days: sync_opts
+            .active_within_days
+            .unwrap_or(config.sync.active_within_days),
+        concurrency: sync_opts.concurrency.unwrap_or(config.sync.concurrency),
+        prune: !sync_opts.no_prune,
+        no_rate_limit: sync_opts.no_rate_limit || config.sync.no_rate_limit,
+    }
+}
+
+/// Build a consistent "instance not found" error used across commands.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+pub(crate) fn instance_not_found_error(name: &str) -> Box<dyn std::error::Error> {
+    format!(
+        "Instance '{}' not found. Add it first with: curator instance add {}",
+        name, name
+    )
+    .into()
+}
+
+/// Look up an instance by name.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+pub(crate) async fn find_instance_by_name(
+    db: &DatabaseConnection,
+    name: &str,
+) -> Result<InstanceModel, Box<dyn std::error::Error>> {
+    Instance::find()
+        .filter(InstanceColumn::Name.eq(name))
+        .one(db)
+        .await?
+        .ok_or_else(|| instance_not_found_error(name))
+}
+
+/// Build a consistent unsupported-platform error for CLI commands.
+#[cfg(all(
+    any(feature = "github", feature = "gitlab", feature = "gitea"),
+    not(all(feature = "github", feature = "gitlab", feature = "gitea"))
+))]
+pub(crate) fn unsupported_platform_error(
+    platform_type: PlatformType,
+    operation: &str,
+) -> Box<dyn std::error::Error> {
+    format!(
+        "Platform type '{}' not supported for {}. Enable the appropriate feature.",
+        platform_type, operation
+    )
+    .into()
 }
 
 /// Display final rate limit status with a timeout to avoid hangs.
@@ -695,12 +803,12 @@ pub async fn get_token_for_instance(
                 })
             }
         }
-        #[allow(unreachable_patterns)]
-        _ => Err(format!(
-            "Platform type '{}' not supported. Enable the appropriate feature.",
-            instance.platform_type
-        )
-        .into()),
+        #[cfg(not(feature = "github"))]
+        PlatformType::GitHub => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
+        #[cfg(not(feature = "gitlab"))]
+        PlatformType::GitLab => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
+        #[cfg(not(feature = "gitea"))]
+        PlatformType::Gitea => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
     }
     .or_else(|e| {
         // Fallback: try ~/.netrc for the instance host
@@ -835,15 +943,15 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use chrono::Utc;
-    use curator::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
     use curator::platform::{OrgInfo, PlatformError, PlatformRepo, RateLimitInfo, UserInfo};
     use curator::sync::{NamespaceSyncResultStreaming, SyncResult};
     use sea_orm::Database;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
     use tokio::sync::mpsc;
     use uuid::Uuid;
+
+    use crate::test_support::env_lock;
 
     #[derive(Clone)]
     enum RateLimitBehavior {
@@ -976,15 +1084,6 @@ mod tests {
         ) -> curator::platform::Result<usize> {
             unimplemented!()
         }
-
-        fn to_active_model(&self, _repo: &PlatformRepo) -> CodeRepositoryActiveModel {
-            unimplemented!()
-        }
-    }
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn sample_sync_result() -> SyncResult {
@@ -1172,7 +1271,7 @@ mod tests {
 
     #[test]
     fn read_netrc_token_reads_machine_and_default_entries() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().blocking_lock();
         let dir = std::env::temp_dir().join(format!("curator-netrc-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         let netrc = dir.join(".netrc");
@@ -1205,7 +1304,7 @@ mod tests {
 
     #[test]
     fn read_netrc_token_prefers_machine_when_default_appears_first() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().blocking_lock();
         let dir = std::env::temp_dir().join(format!("curator-netrc-order-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         let netrc = dir.join(".netrc");
@@ -1238,7 +1337,7 @@ mod tests {
 
     #[test]
     fn read_netrc_token_keeps_first_default_password_when_multiple_exist() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().blocking_lock();
         let dir = std::env::temp_dir().join(format!("curator-netrc-default-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         let netrc = dir.join(".netrc");
@@ -1269,7 +1368,7 @@ mod tests {
 
     #[test]
     fn read_netrc_token_handles_trailing_machine_keyword_without_host() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().blocking_lock();
         let dir =
             std::env::temp_dir().join(format!("curator-netrc-default-scope-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
@@ -1301,7 +1400,7 @@ mod tests {
 
     #[test]
     fn read_netrc_token_ignores_default_keyword_inside_machine_entry() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().blocking_lock();
         let dir = std::env::temp_dir().join(format!(
             "curator-netrc-default-inside-machine-{}",
             Uuid::new_v4()
@@ -1335,7 +1434,7 @@ mod tests {
 
     #[test]
     fn read_netrc_token_returns_none_for_machine_password_without_value() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().blocking_lock();
         let dir =
             std::env::temp_dir().join(format!("curator-netrc-missing-password-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
@@ -1364,7 +1463,7 @@ mod tests {
 
     #[test]
     fn read_netrc_token_returns_none_when_home_is_unset() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().blocking_lock();
         let original_home = std::env::var("HOME").ok();
         unsafe {
             std::env::remove_var("HOME");
@@ -1386,7 +1485,7 @@ mod tests {
 
     #[test]
     fn read_netrc_token_returns_none_when_netrc_file_is_missing() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().blocking_lock();
         let dir =
             std::env::temp_dir().join(format!("curator-netrc-missing-file-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
@@ -1412,7 +1511,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_token_for_instance_returns_platform_error_without_fallbacks() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let dir = std::env::temp_dir().join(format!("curator-netrc-missing-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         std::fs::write(dir.join(".netrc"), "").expect("netrc should be written");
@@ -1459,7 +1558,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_token_for_instance_uses_netrc_fallback() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let dir = std::env::temp_dir().join(format!("curator-netrc-fallback-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         let netrc = dir.join(".netrc");
@@ -1495,7 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_token_for_instance_returns_platform_error_when_netrc_machine_does_not_match() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let dir = std::env::temp_dir().join(format!("curator-netrc-mismatch-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         let netrc = dir.join(".netrc");
@@ -1543,7 +1642,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_token_for_instance_uses_default_netrc_fallback_when_machine_missing() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let dir =
             std::env::temp_dir().join(format!("curator-netrc-default-fallback-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
@@ -1590,7 +1689,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_token_for_instance_ignores_platform_env_without_config_load() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let dir =
             std::env::temp_dir().join(format!("curator-netrc-env-precedence-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
@@ -1636,7 +1735,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_token_for_instance_prefers_config_over_netrc_fallback() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let dir = std::env::temp_dir().join(format!("curator-netrc-precedence-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         let netrc = dir.join(".netrc");
@@ -1702,7 +1801,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_token_for_instance_returns_gitea_error_without_config_or_netrc() {
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock().lock().await;
         let dir =
             std::env::temp_dir().join(format!("curator-netrc-gitea-missing-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
