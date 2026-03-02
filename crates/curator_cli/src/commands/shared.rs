@@ -1509,6 +1509,7 @@ mod tests {
         assert!(token.is_none());
     }
 
+    #[cfg(feature = "github")]
     #[tokio::test]
     async fn get_token_for_instance_returns_platform_error_without_fallbacks() {
         let _guard = env_lock().lock().await;
@@ -1543,6 +1544,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "github")]
     #[tokio::test]
     async fn get_token_for_instance_prefers_configured_token() {
         let mut config = Config::default();
@@ -1556,6 +1558,7 @@ mod tests {
         assert_eq!(token, "token-from-config");
     }
 
+    #[cfg(feature = "github")]
     #[tokio::test]
     async fn get_token_for_instance_uses_netrc_fallback() {
         let _guard = env_lock().lock().await;
@@ -1592,6 +1595,7 @@ mod tests {
         assert_eq!(token, "ghp_from_netrc");
     }
 
+    #[cfg(feature = "github")]
     #[tokio::test]
     async fn get_token_for_instance_returns_platform_error_when_netrc_machine_does_not_match() {
         let _guard = env_lock().lock().await;
@@ -1640,6 +1644,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "github")]
     #[tokio::test]
     async fn get_token_for_instance_uses_default_netrc_fallback_when_machine_missing() {
         let _guard = env_lock().lock().await;
@@ -1687,6 +1692,7 @@ mod tests {
         assert_eq!(token, "ghp_default_fallback");
     }
 
+    #[cfg(feature = "github")]
     #[tokio::test]
     async fn get_token_for_instance_ignores_platform_env_without_config_load() {
         let _guard = env_lock().lock().await;
@@ -1733,6 +1739,7 @@ mod tests {
         assert_eq!(token, "ghp_from_netrc");
     }
 
+    #[cfg(feature = "github")]
     #[tokio::test]
     async fn get_token_for_instance_prefers_config_over_netrc_fallback() {
         let _guard = env_lock().lock().await;
@@ -1769,8 +1776,9 @@ mod tests {
         assert_eq!(token, "token-from-config");
     }
 
+    #[cfg(feature = "gitlab")]
     #[tokio::test]
-    async fn get_token_for_instance_reads_gitlab_and_gitea_tokens_from_config() {
+    async fn get_token_for_instance_reads_gitlab_token_from_config() {
         let mut config = Config::default();
 
         config.gitlab.token = Some("gitlab-config-token".to_string());
@@ -1779,6 +1787,12 @@ mod tests {
             .await
             .expect("gitlab token should resolve from config");
         assert_eq!(gitlab_token, "gitlab-config-token");
+    }
+
+    #[cfg(feature = "gitea")]
+    #[tokio::test]
+    async fn get_token_for_instance_reads_gitea_and_codeberg_tokens_from_config() {
+        let mut config = Config::default();
 
         config.gitea.token = Some("gitea-config-token".to_string());
         let gitea_instance = sample_instance(
@@ -1799,6 +1813,7 @@ mod tests {
         assert_eq!(codeberg_token, "codeberg-config-token");
     }
 
+    #[cfg(feature = "gitea")]
     #[tokio::test]
     async fn get_token_for_instance_returns_gitea_error_without_config_or_netrc() {
         let _guard = env_lock().lock().await;

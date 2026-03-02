@@ -840,6 +840,8 @@ mod tests {
         );
 
         let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
             .build()
             .expect("octocrab client should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(
@@ -893,6 +895,8 @@ mod tests {
         );
 
         let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
             .build()
             .expect("octocrab client should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(
@@ -953,6 +957,8 @@ mod tests {
         );
 
         let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
             .build()
             .expect("octocrab client should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(
@@ -997,6 +1003,8 @@ mod tests {
         );
 
         let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
             .build()
             .expect("octocrab client should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(
@@ -1050,6 +1058,8 @@ mod tests {
         );
 
         let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
             .build()
             .expect("octocrab client should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(
@@ -1131,6 +1141,8 @@ mod tests {
         .expect("cache seed should succeed");
 
         let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
             .build()
             .expect("octocrab client should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(

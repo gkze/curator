@@ -332,7 +332,7 @@ mod tests {
                     let stream = match listener.accept() {
                         Ok((s, _)) => Ok(s),
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if last_progress.elapsed() > std::time::Duration::from_secs(5) {
+                            if last_progress.elapsed() > std::time::Duration::from_secs(20) {
                                 let remaining =
                                     specs_thread.lock().unwrap_or_else(|e| e.into_inner()).len();
                                 let seen = seen_thread

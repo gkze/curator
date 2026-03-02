@@ -2268,6 +2268,8 @@ mod tests {
         );
 
         let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
             .build()
             .expect("octocrab client should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(
@@ -2348,6 +2350,8 @@ mod tests {
         );
 
         let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
             .build()
             .expect("octocrab client should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(
@@ -2417,6 +2421,8 @@ mod tests {
         );
 
         let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
             .build()
             .expect("octocrab client should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(
@@ -2602,7 +2608,11 @@ mod tests {
             serde_json::to_string(&repo_json(2, "other")).expect("repo JSON should serialize"),
         );
 
-        let octocrab = Octocrab::builder().build().expect("octocrab should build");
+        let octocrab = Octocrab::builder()
+            .base_uri(TEST_BASE_URL)
+            .expect("base uri should parse")
+            .build()
+            .expect("octocrab should build");
         let client = GitHubClient::from_octocrab_with_transport_and_base_url(
             octocrab,
             instance_id,

@@ -51,6 +51,7 @@ rpassword = "7"
 
 [dev-dependencies]
 async-trait = "0.1"
+curator = { path = "../curator", features = ["migrate", "sqlite"] }
 
 [lints]
 workspace = true

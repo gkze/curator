@@ -117,6 +117,10 @@ prettyplease = "0.2"
 
 [dev-dependencies]
 sea-orm = { version = "1.1", features = ["mock"] }
+sea-orm-migration = { version = "1.1", default-features = false, features = [
+  "runtime-tokio-rustls",
+  "sqlx-sqlite",
+] }
 
 [package.metadata.cargo-machete]
 # cargo-machete does not currently recognize build.rs usage reliably.
