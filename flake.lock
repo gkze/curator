@@ -128,6 +128,18 @@
         "type": "github"
       }
     },
+    "gitlab-swagger-spec": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-5WARQNt9pplehBl9/CtUrib9mU8gru9dYB0Mg1BXWQQ=",
+        "type": "file",
+        "url": "https://gitlab.com/gitlab-org/gitlab/-/raw/18-9-stable-ee/doc/api/openapi/openapi_v2.yaml"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://gitlab.com/gitlab-org/gitlab/-/raw/18-9-stable-ee/doc/api/openapi/openapi_v2.yaml"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1771848320,
@@ -144,6 +156,22 @@
         "type": "github"
       }
     },
+    "oas-kit": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1625660018,
+        "narHash": "sha256-7uYfeq8TeeeshA86gFXGTK+EyTMw46ZXGVlMgugusB0=",
+        "owner": "Mermade",
+        "repo": "oas-kit",
+        "rev": "b1bba3fc5007e96a991bf2a015cf0534ac36b88b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Mermade",
+        "repo": "oas-kit",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "crane": "crane",
@@ -151,7 +179,9 @@
         "flake-compat": "flake-compat",
         "flakelight": "flakelight",
         "git-hooks": "git-hooks",
+        "gitlab-swagger-spec": "gitlab-swagger-spec",
         "nixpkgs": "nixpkgs",
+        "oas-kit": "oas-kit",
         "rust-overlay": "rust-overlay",
         "treefmt-nix": "treefmt-nix"
       }

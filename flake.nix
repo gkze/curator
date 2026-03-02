@@ -4,26 +4,34 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/1.tar.gz";
-    flakelight = {
-      url = "github:nix-community/flakelight";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    crane.url = "github:ipetkov/crane";
     devshell = {
       url = "github:numtide/devshell";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    treefmt-nix = {
-      url = "github:numtide/treefmt-nix";
+    flakelight = {
+      url = "github:nix-community/flakelight";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     git-hooks = {
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    crane.url = "github:ipetkov/crane";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
+    };
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    oas-kit = {
+      url = "github:Mermade/oas-kit";
+      flake = false;
+    };
+    gitlab-swagger-spec = {
+      url = "https://gitlab.com/gitlab-org/gitlab/-/raw/18-9-stable-ee/doc/api/openapi/openapi_v2.yaml";
+      flake = false;
     };
   };
 
@@ -68,12 +76,7 @@
             pname = "swagger2openapi";
             version = "7.0.8";
 
-            src = pkgs.fetchFromGitHub {
-              owner = "Mermade";
-              repo = "oas-kit";
-              rev = "b1bba3fc5007e96a991bf2a015cf0534ac36b88b";
-              hash = "sha256-7uYfeq8TeeeshA86gFXGTK+EyTMw46ZXGVlMgugusB0=";
-            };
+            src = inputs.oas-kit;
 
             sourceRoot = "source/packages/swagger2openapi";
 
@@ -85,16 +88,12 @@
             dontNpmBuild = true;
           };
 
-        # GitLab OpenAPI 3.0 spec: fetched from GitLab's auto-generated Swagger 2.0
-        # spec, converted to OpenAPI 3.0, and patched with missing endpoints.
+        # GitLab OpenAPI 3.0 spec: converted from the Swagger 2.0 spec (fetched
+        # via the gitlab-swagger-spec flake input) and patched with missing endpoints.
         mkGitlabOpenapiSpec =
           pkgs:
           let
             swagger2openapi = mkSwagger2openapi pkgs;
-            gitlabSwaggerSpec = pkgs.fetchurl {
-              url = "https://gitlab.com/gitlab-org/gitlab/-/raw/0b27f4409b76afcffa55363f213b4266fd7693e4/doc/api/openapi/openapi_v2.yaml";
-              hash = "sha256:0wp0gz84l20l18955rw1cgsijagm48x7jz4ysj059zzh1xvzj28y";
-            };
           in
           pkgs.runCommand "gitlab-openapi3-spec"
             {
@@ -105,7 +104,7 @@
             }
             ''
               # Convert Swagger 2.0 → OpenAPI 3.0
-              swagger2openapi ${gitlabSwaggerSpec} -o converted.yaml -y
+              swagger2openapi ${inputs.gitlab-swagger-spec} -o converted.yaml -y
 
               # Patch in missing endpoints (e.g., GET /api/v4/user)
               yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' \
