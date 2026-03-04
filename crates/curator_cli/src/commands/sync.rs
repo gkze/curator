@@ -9,10 +9,10 @@ use clap::Subcommand;
 use console::Term;
 #[cfg(feature = "github")]
 use console::style;
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, EntityTrait, QueryOrder};
 
 use curator::{
-    InstanceModel, PlatformType, db,
+    Instance, InstanceColumn, InstanceModel, PlatformType, db,
     sync::{PlatformOptions, SyncOptions, SyncStrategy},
 };
 
@@ -114,7 +114,12 @@ pub enum SyncAction {
     /// Sync your starred repositories (and optionally prune inactive ones)
     Stars {
         /// Instance name (e.g., "github", "gitlab", "codeberg")
-        instance: String,
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        instance: Option<String>,
+
+        /// Sync starred repositories for all configured instances
+        #[arg(short = 'a', long, conflicts_with = "instance")]
+        all: bool,
 
         #[command(flatten)]
         sync_opts: StarredSyncOptions,
@@ -153,9 +158,10 @@ pub async fn handle_sync(
         }
         SyncAction::Stars {
             instance,
+            all,
             sync_opts,
         } => {
-            sync_stars(&instance, sync_opts, config, database_url).await?;
+            sync_stars(instance.as_deref(), all, sync_opts, config, database_url).await?;
         }
     }
     Ok(())
@@ -167,6 +173,16 @@ async fn get_instance(
     name: &str,
 ) -> Result<InstanceModel, Box<dyn std::error::Error>> {
     find_instance_by_name(db, name).await
+}
+
+/// List all configured instances, sorted by name.
+async fn get_instances(
+    db: &DatabaseConnection,
+) -> Result<Vec<InstanceModel>, Box<dyn std::error::Error>> {
+    Ok(Instance::find()
+        .order_by_asc(InstanceColumn::Name)
+        .all(db)
+        .await?)
 }
 
 fn merge_common_sync_options(
@@ -380,19 +396,90 @@ async fn sync_user(
 
 /// Sync starred repositories.
 async fn sync_stars(
-    instance_name: &str,
+    instance_name: Option<&str>,
+    all_instances: bool,
     sync_opts: StarredSyncOptions,
     config: &Config,
     database_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db_conn = db::connect_and_migrate(database_url).await?;
-    let instance = get_instance(&db_conn, instance_name).await?;
-    let token = get_token_for_instance(&instance, config).await?;
+    let db = Arc::new(db::connect_and_migrate(database_url).await?);
+
+    if all_instances {
+        sync_stars_all(&db, &sync_opts, config).await
+    } else {
+        let instance_name = instance_name
+            .ok_or_else(|| "Instance name is required unless --all is used.".to_string())?;
+        let instance = get_instance(db.as_ref(), instance_name).await?;
+        sync_stars_for_instance(&db, &instance, &sync_opts, config).await
+    }
+}
+
+async fn sync_stars_all(
+    db: &Arc<DatabaseConnection>,
+    sync_opts: &StarredSyncOptions,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let instances = get_instances(db.as_ref()).await?;
+
+    if instances.is_empty() {
+        return Err(
+            "No instances configured. Add one first with: curator instance add github".into(),
+        );
+    }
+
+    let is_tty = Term::stdout().is_term();
+    let mut failures = Vec::new();
+
+    for instance in instances {
+        if is_tty {
+            println!(
+                "\n=== Syncing starred repositories for '{}' ({}) ===",
+                instance.name, instance.host
+            );
+        } else {
+            tracing::info!(
+                instance = %instance.name,
+                host = %instance.host,
+                "Syncing starred repositories for instance"
+            );
+        }
+
+        if let Err(err) = sync_stars_for_instance(db, &instance, sync_opts, config).await {
+            if is_tty {
+                eprintln!("Failed to sync '{}': {}", instance.name, err);
+            } else {
+                tracing::error!(
+                    instance = %instance.name,
+                    error = %err,
+                    "Failed to sync starred repositories for instance"
+                );
+            }
+            failures.push(format!("{} ({}) - {}", instance.name, instance.host, err));
+        }
+    }
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Failed syncing stars for {} instance(s): {}",
+        failures.len(),
+        failures.join("; ")
+    )
+    .into())
+}
+
+async fn sync_stars_for_instance(
+    db: &Arc<DatabaseConnection>,
+    instance: &InstanceModel,
+    sync_opts: &StarredSyncOptions,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token = get_token_for_instance(instance, config).await?;
 
     let (active_within_days, concurrency, prune, no_rate_limit) =
-        merge_starred_sync_options(&sync_opts, config);
-
-    let db = Arc::new(db_conn);
+        merge_starred_sync_options(sync_opts, config);
 
     let options = SyncOptions {
         active_within: active_within_duration(active_within_days)?,
@@ -404,15 +491,9 @@ async fn sync_stars(
         strategy: SyncStrategy::Full, // Starred sync always does full fetch
     };
 
-    let runner = SyncRunner::new(
-        Arc::clone(&db),
-        options.clone(),
-        no_rate_limit,
-        active_within_days,
-    );
+    let runner = SyncRunner::new(Arc::clone(db), options, no_rate_limit, active_within_days);
 
     let is_tty = Term::stdout().is_term();
-
     let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
 
     match instance.platform_type {
@@ -503,6 +584,8 @@ mod tests {
         ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, Set, Statement,
     };
     use uuid::Uuid;
+
+    use crate::test_support::env_lock;
 
     fn sample_common_sync_options() -> CommonSyncOptions {
         CommonSyncOptions {
@@ -768,6 +851,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_instances_returns_all_configured_instances_sorted_by_name() {
+        let db = setup_db("list-instances-sorted").await;
+
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM instances".to_string(),
+        ))
+        .await
+        .expect("instances table should be cleared for deterministic ordering");
+
+        for name in ["zeta", "alpha", "beta"] {
+            curator::entity::instance::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                name: Set(name.to_string()),
+                platform_type: Set(PlatformType::GitHub),
+                host: Set(format!("{name}.example.com")),
+                oauth_client_id: Set(None),
+                oauth_flow: Set("auto".to_string()),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(&db)
+            .await
+            .expect("insert should succeed");
+        }
+
+        let names: Vec<String> = get_instances(&db)
+            .await
+            .expect("instances should load")
+            .into_iter()
+            .map(|instance| instance.name)
+            .collect();
+
+        assert_eq!(names, vec!["alpha", "beta", "zeta"]);
+    }
+
+    #[tokio::test]
     async fn get_instance_requires_exact_name_match() {
         let db = setup_db("exact-name-match").await;
         let stored_name = "custom-github-enterprise";
@@ -888,7 +1007,8 @@ mod tests {
             sync_opts: common,
         };
         let stars = SyncAction::Stars {
-            instance: "github".to_string(),
+            instance: Some("github".to_string()),
+            all: false,
             sync_opts: starred,
         };
 
@@ -957,7 +1077,8 @@ mod tests {
 
         let err = handle_sync(
             SyncAction::Stars {
-                instance: "missing".to_string(),
+                instance: Some("missing".to_string()),
+                all: false,
                 sync_opts: sample_starred_sync_options(),
             },
             &Config::default(),
@@ -969,6 +1090,141 @@ mod tests {
         assert!(
             err.to_string().contains("Instance 'missing' not found"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_sync_stars_requires_instance_when_all_is_false() {
+        let database_url = sqlite_test_url("handle-sync-stars-requires-instance");
+        let _db = curator::db::connect_and_migrate(&database_url)
+            .await
+            .expect("test database should initialize");
+
+        let err = handle_sync(
+            SyncAction::Stars {
+                instance: None,
+                all: false,
+                sync_opts: sample_starred_sync_options(),
+            },
+            &Config::default(),
+            &database_url,
+        )
+        .await
+        .expect_err("missing instance should fail when --all is not used");
+
+        assert!(
+            err.to_string()
+                .contains("Instance name is required unless --all is used."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_sync_stars_all_requires_at_least_one_configured_instance() {
+        let database_url = sqlite_test_url("handle-sync-stars-all-no-instances");
+        let db = curator::db::connect_and_migrate(&database_url)
+            .await
+            .expect("test database should initialize");
+
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM instances".to_string(),
+        ))
+        .await
+        .expect("instances table should be empty");
+
+        let err = handle_sync(
+            SyncAction::Stars {
+                instance: None,
+                all: true,
+                sync_opts: sample_starred_sync_options(),
+            },
+            &Config::default(),
+            &database_url,
+        )
+        .await
+        .expect_err("syncing all should fail when no instances exist");
+
+        assert!(
+            err.to_string().contains("No instances configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_sync_stars_all_reports_all_instance_failures() {
+        let _guard = env_lock().lock().await;
+        let original_home = std::env::var("HOME").ok();
+        let temp_home = std::env::temp_dir().join(format!("curator-sync-home-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_home).expect("temp home should be created");
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+        }
+
+        let database_url = sqlite_test_url("handle-sync-stars-all-multi-failures");
+        let db = curator::db::connect_and_migrate(&database_url)
+            .await
+            .expect("test database should initialize");
+
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM instances".to_string(),
+        ))
+        .await
+        .expect("instances table should be empty");
+
+        for (name, platform_type, host) in [
+            ("alpha-gh", PlatformType::GitHub, "alpha.example.com"),
+            ("beta-gl", PlatformType::GitLab, "beta.example.com"),
+        ] {
+            curator::entity::instance::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                name: Set(name.to_string()),
+                platform_type: Set(platform_type),
+                host: Set(host.to_string()),
+                oauth_client_id: Set(None),
+                oauth_flow: Set("auto".to_string()),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(&db)
+            .await
+            .expect("insert should succeed");
+        }
+
+        let result = handle_sync(
+            SyncAction::Stars {
+                instance: None,
+                all: true,
+                sync_opts: sample_starred_sync_options(),
+            },
+            &Config::default(),
+            &database_url,
+        )
+        .await;
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        let err = result.expect_err("syncing all should return aggregated instance failures");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("Failed syncing stars for 2 instance(s)"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("alpha-gh (alpha.example.com)"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("beta-gl (beta.example.com)"),
+            "unexpected error: {message}"
         );
     }
 

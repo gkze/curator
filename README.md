@@ -227,10 +227,13 @@ curator sync user github octocat
 curator sync org github rust-lang --dry-run
 
 # Filter by recent activity
-curator sync org github rust-lang --active-within-days 30
+curator sync org github rust-lang --days 30
 
-# Sync and prune starred repositories
+# Sync and prune starred repositories for one instance
 curator sync stars github
+
+# Sync starred repositories for all configured instances
+curator sync stars --all
 
 # Check rate limit status
 curator limits github
@@ -287,7 +290,8 @@ curator sync stars my-gitea
 | ----- | ------------------------ | -------------------------------------------- |
 | `-n` | `--dry-run` | Preview without making changes |
 | `-S` | `--no-star` | Skip starring repositories |
-| `-a` | `--active-within-days N` | Only sync repos active within N days |
+| `-d` | `--days N` | Only sync repos active within N days |
+| `-a` | `--all` | Sync starred repos for all configured instances (stars only) |
 | `-c` | `--concurrency N` | Parallel API requests (default: 20) |
 | `-R` | `--no-rate-limit` | Disable proactive rate limiting |
 | `-s` | `--no-subgroups` | Exclude subgroups (GitLab only) |

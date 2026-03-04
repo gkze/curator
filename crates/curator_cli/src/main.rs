@@ -41,6 +41,9 @@ repositories, can star active repos, and prune inactive ones."
     Sync starred repos and prune inactive ones:
         $ curator sync stars github
 
+    Sync starred repos for all configured instances:
+        $ curator sync stars --all
+
     Sync from multiple GitLab groups:
         $ curator sync org gitlab gitlab-org my-company/team
 
@@ -163,7 +166,7 @@ enum MigrateAction {
 #[derive(Debug, Clone, clap::Args)]
 struct CommonSyncOptions {
     /// Only include repos active within this many days (default from config or 60)
-    #[arg(short = 'a', long)]
+    #[arg(short = 'd', long = "days")]
     active_within_days: Option<u64>,
 
     /// Don't star repositories (overrides config; starring is on by default)
@@ -196,7 +199,7 @@ struct CommonSyncOptions {
 #[derive(Debug, Clone, clap::Args)]
 struct StarredSyncOptions {
     /// Only include repos active within this many days (default from config or 60)
-    #[arg(short = 'a', long)]
+    #[arg(short = 'd', long = "days")]
     active_within_days: Option<u64>,
 
     /// Don't prune (unstar) inactive repositories
@@ -224,7 +227,7 @@ struct StarredSyncOptions {
 #[derive(Debug, Clone, clap::Args)]
 struct DiscoverOptions {
     /// Maximum crawl depth (default: 2)
-    #[arg(short = 'd', long, default_value_t = 2)]
+    #[arg(short = 'D', long, default_value_t = 2)]
     max_depth: usize,
 
     /// Maximum pages to fetch (default: 1000)
@@ -410,6 +413,155 @@ mod tests {
     #[test]
     fn rejects_invocation_without_subcommand() {
         let parsed = Cli::try_parse_from(["curator"]);
+        assert!(parsed.is_err());
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn parses_sync_stars_all_without_instance() {
+        let cli = Cli::try_parse_from(["curator", "sync", "stars", "--all"])
+            .expect("sync stars --all should parse");
+
+        match cli.command {
+            Commands::Sync { action } => match action {
+                commands::sync::SyncAction::Stars { instance, all, .. } => {
+                    assert!(all);
+                    assert!(instance.is_none());
+                }
+                _ => panic!("expected sync stars action"),
+            },
+            _ => panic!("expected sync command"),
+        }
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn parses_sync_stars_single_instance_without_all() {
+        let cli = Cli::try_parse_from(["curator", "sync", "stars", "github"])
+            .expect("sync stars <instance> should parse");
+
+        match cli.command {
+            Commands::Sync { action } => match action {
+                commands::sync::SyncAction::Stars { instance, all, .. } => {
+                    assert!(!all);
+                    assert_eq!(instance.as_deref(), Some("github"));
+                }
+                _ => panic!("expected sync stars action"),
+            },
+            _ => panic!("expected sync command"),
+        }
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn rejects_sync_stars_without_instance_or_all() {
+        let parsed = Cli::try_parse_from(["curator", "sync", "stars"]);
+        assert!(parsed.is_err());
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn rejects_sync_stars_with_instance_and_all_together() {
+        let parsed = Cli::try_parse_from(["curator", "sync", "stars", "github", "--all"]);
+        assert!(parsed.is_err());
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn parses_sync_org_days_flag() {
+        let cli = Cli::try_parse_from([
+            "curator",
+            "sync",
+            "org",
+            "github",
+            "rust-lang",
+            "--days",
+            "30",
+        ])
+        .expect("sync org --days should parse");
+
+        match cli.command {
+            Commands::Sync { action } => match action {
+                commands::sync::SyncAction::Org { sync_opts, .. } => {
+                    assert_eq!(sync_opts.active_within_days, Some(30));
+                }
+                _ => panic!("expected sync org action"),
+            },
+            _ => panic!("expected sync command"),
+        }
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn parses_sync_user_days_flag() {
+        let cli = Cli::try_parse_from([
+            "curator", "sync", "user", "github", "octocat", "--days", "7",
+        ])
+        .expect("sync user --days should parse");
+
+        match cli.command {
+            Commands::Sync { action } => match action {
+                commands::sync::SyncAction::User { sync_opts, .. } => {
+                    assert_eq!(sync_opts.active_within_days, Some(7));
+                }
+                _ => panic!("expected sync user action"),
+            },
+            _ => panic!("expected sync command"),
+        }
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn parses_sync_stars_days_short_flag() {
+        let cli = Cli::try_parse_from(["curator", "sync", "stars", "github", "-d", "14"])
+            .expect("sync stars -d should parse");
+
+        match cli.command {
+            Commands::Sync { action } => match action {
+                commands::sync::SyncAction::Stars { sync_opts, .. } => {
+                    assert_eq!(sync_opts.active_within_days, Some(14));
+                }
+                _ => panic!("expected sync stars action"),
+            },
+            _ => panic!("expected sync command"),
+        }
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn parses_sync_stars_all_with_days_flag() {
+        let cli = Cli::try_parse_from(["curator", "sync", "stars", "--all", "-d", "30"])
+            .expect("sync stars --all -d should parse");
+
+        match cli.command {
+            Commands::Sync { action } => match action {
+                commands::sync::SyncAction::Stars {
+                    instance,
+                    all,
+                    sync_opts,
+                } => {
+                    assert!(all);
+                    assert!(instance.is_none());
+                    assert_eq!(sync_opts.active_within_days, Some(30));
+                }
+                _ => panic!("expected sync stars action"),
+            },
+            _ => panic!("expected sync command"),
+        }
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn rejects_old_active_within_days_flag() {
+        let parsed = Cli::try_parse_from([
+            "curator",
+            "sync",
+            "org",
+            "github",
+            "rust-lang",
+            "--active-within-days",
+            "30",
+        ]);
         assert!(parsed.is_err());
     }
 }
