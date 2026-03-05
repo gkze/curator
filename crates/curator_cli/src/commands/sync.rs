@@ -10,6 +10,8 @@ use console::Term;
 #[cfg(feature = "github")]
 use console::style;
 use sea_orm::{DatabaseConnection, EntityTrait, QueryOrder};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use curator::{
     Instance, InstanceColumn, InstanceModel, PlatformType, db,
@@ -212,6 +214,39 @@ fn merge_starred_sync_options(
         resolved.prune,
         resolved.no_rate_limit,
     )
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedStarredSyncSettings {
+    active_within_days: u64,
+    concurrency: usize,
+    prune: bool,
+    no_rate_limit: bool,
+    dry_run: bool,
+}
+
+fn resolve_starred_sync_settings(
+    sync_opts: &StarredSyncOptions,
+    config: &Config,
+) -> ResolvedStarredSyncSettings {
+    let (active_within_days, concurrency, prune, no_rate_limit) =
+        merge_starred_sync_options(sync_opts, config);
+
+    ResolvedStarredSyncSettings {
+        active_within_days,
+        concurrency,
+        prune,
+        no_rate_limit,
+        dry_run: sync_opts.dry_run,
+    }
+}
+
+fn stars_all_parallelism(requested_concurrency: usize, instance_count: usize) -> usize {
+    if instance_count == 0 {
+        return 0;
+    }
+
+    requested_concurrency.max(1).min(instance_count)
 }
 
 /// Sync organizations/groups.
@@ -428,7 +463,9 @@ async fn sync_stars_all(
     }
 
     let is_tty = Term::stdout().is_term();
+    let settings = resolve_starred_sync_settings(sync_opts, config);
     let mut failures = Vec::new();
+    let mut jobs: Vec<(InstanceModel, String)> = Vec::new();
 
     for instance in instances {
         if is_tty {
@@ -444,17 +481,73 @@ async fn sync_stars_all(
             );
         }
 
-        if let Err(err) = sync_stars_for_instance(db, &instance, sync_opts, config).await {
-            if is_tty {
-                eprintln!("Failed to sync '{}': {}", instance.name, err);
-            } else {
-                tracing::error!(
-                    instance = %instance.name,
-                    error = %err,
-                    "Failed to sync starred repositories for instance"
-                );
+        match get_token_for_instance(&instance, config).await {
+            Ok(token) => jobs.push((instance, token)),
+            Err(err) => {
+                if is_tty {
+                    eprintln!("Failed to sync '{}': {}", instance.name, err);
+                } else {
+                    tracing::error!(
+                        instance = %instance.name,
+                        error = %err,
+                        "Failed to sync starred repositories for instance"
+                    );
+                }
+                failures.push(format!("{} ({}) - {}", instance.name, instance.host, err));
             }
-            failures.push(format!("{} ({}) - {}", instance.name, instance.host, err));
+        }
+    }
+
+    let instance_parallelism = stars_all_parallelism(settings.concurrency, jobs.len());
+
+    if instance_parallelism > 0 {
+        let semaphore = Arc::new(Semaphore::new(instance_parallelism));
+        let mut join_set = JoinSet::new();
+
+        for (instance, token) in jobs {
+            let db = Arc::clone(db);
+            let semaphore = Arc::clone(&semaphore);
+
+            join_set.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.ok();
+
+                let name = instance.name.clone();
+                let host = instance.host.clone();
+                let result = sync_stars_for_instance_with_token(&db, &instance, &token, settings)
+                    .await
+                    .map_err(|e| e.to_string());
+
+                (name, host, result)
+            });
+        }
+
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok((name, _host, Ok(()))) => {
+                    tracing::debug!(instance = %name, "starred sync complete");
+                }
+                Ok((name, host, Err(err))) => {
+                    if is_tty {
+                        eprintln!("Failed to sync '{}': {}", name, err);
+                    } else {
+                        tracing::error!(
+                            instance = %name,
+                            error = %err,
+                            "Failed to sync starred repositories for instance"
+                        );
+                    }
+                    failures.push(format!("{} ({}) - {}", name, host, err));
+                }
+                Err(err) => {
+                    let message = format!("Internal task error: {}", err);
+                    if is_tty {
+                        eprintln!("{}", message);
+                    } else {
+                        tracing::error!(error = %err, "Starred sync task failed");
+                    }
+                    failures.push(message);
+                }
+            }
         }
     }
 
@@ -477,48 +570,81 @@ async fn sync_stars_for_instance(
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let token = get_token_for_instance(instance, config).await?;
+    let settings = resolve_starred_sync_settings(sync_opts, config);
 
-    let (active_within_days, concurrency, prune, no_rate_limit) =
-        merge_starred_sync_options(sync_opts, config);
+    sync_stars_for_instance_with_token(db, instance, &token, settings).await
+}
 
+async fn sync_stars_for_instance_with_token(
+    db: &Arc<DatabaseConnection>,
+    instance: &InstanceModel,
+    token: &str,
+    settings: ResolvedStarredSyncSettings,
+) -> Result<(), Box<dyn std::error::Error>> {
     let options = SyncOptions {
-        active_within: active_within_duration(active_within_days)?,
+        active_within: active_within_duration(settings.active_within_days)?,
         star: false, // Stars sync doesn't star, it just fetches what's starred
-        dry_run: sync_opts.dry_run,
-        concurrency,
+        dry_run: settings.dry_run,
+        concurrency: settings.concurrency,
         platform_options: PlatformOptions::default(),
-        prune,
+        prune: settings.prune,
         strategy: SyncStrategy::Full, // Starred sync always does full fetch
     };
 
-    let runner = SyncRunner::new(Arc::clone(db), options, no_rate_limit, active_within_days);
+    let runner = SyncRunner::new(
+        Arc::clone(db),
+        options,
+        settings.no_rate_limit,
+        settings.active_within_days,
+    );
 
     let is_tty = Term::stdout().is_term();
-    let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
+    let rate_limiter = build_rate_limiter(instance.platform_type, settings.no_rate_limit);
 
     match instance.platform_type {
         #[cfg(feature = "github")]
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
 
-            let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
+            let client = GitHubClient::new(token, instance.id, rate_limiter)?;
             display_rate_limit(&client, is_tty).await;
-            run_starred_sync_for_client(&runner, &client, prune, is_tty, no_rate_limit).await?;
+            run_starred_sync_for_client(
+                &runner,
+                &client,
+                settings.prune,
+                is_tty,
+                settings.no_rate_limit,
+            )
+            .await?;
         }
         #[cfg(feature = "gitlab")]
         PlatformType::GitLab => {
             use curator::gitlab::GitLabClient;
 
             let client =
-                GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
-            run_starred_sync_for_client(&runner, &client, prune, is_tty, no_rate_limit).await?;
+                GitLabClient::new(&instance.host, token, instance.id, rate_limiter).await?;
+            run_starred_sync_for_client(
+                &runner,
+                &client,
+                settings.prune,
+                is_tty,
+                settings.no_rate_limit,
+            )
+            .await?;
         }
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
             use curator::gitea::GiteaClient;
 
-            let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
-            run_starred_sync_for_client(&runner, &client, prune, is_tty, no_rate_limit).await?;
+            let client = GiteaClient::new(&instance.base_url(), token, instance.id, rate_limiter)?;
+            run_starred_sync_for_client(
+                &runner,
+                &client,
+                settings.prune,
+                is_tty,
+                settings.no_rate_limit,
+            )
+            .await?;
         }
         #[cfg(not(feature = "github"))]
         PlatformType::GitHub => {
@@ -798,6 +924,14 @@ mod tests {
         let (_, _, prune, no_rate_limit) = merge_starred_sync_options(&opts, &config);
         assert!(prune);
         assert!(no_rate_limit);
+    }
+
+    #[test]
+    fn stars_all_parallelism_clamps_to_instance_count_and_minimum_one() {
+        assert_eq!(stars_all_parallelism(20, 3), 3);
+        assert_eq!(stars_all_parallelism(2, 5), 2);
+        assert_eq!(stars_all_parallelism(0, 4), 1);
+        assert_eq!(stars_all_parallelism(10, 0), 0);
     }
 
     #[tokio::test]

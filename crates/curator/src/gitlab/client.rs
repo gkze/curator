@@ -331,8 +331,8 @@ impl GitLabClient {
                     known_total_pages = Some(tp);
                 }
 
-                if let Some(db) = db {
-                    if let Err(e) = api_cache::upsert_with_pagination(
+                if let Some(db) = db
+                    && let Err(e) = api_cache::upsert_with_pagination(
                         db,
                         self.instance_id,
                         endpoint_type,
@@ -341,9 +341,8 @@ impl GitLabClient {
                         known_total_pages.map(|t| t as i32),
                     )
                     .await
-                    {
-                        tracing::debug!("api cache upsert failed: {e}");
-                    }
+                {
+                    tracing::debug!("api cache upsert failed: {e}");
                 }
 
                 all.extend(items);
@@ -389,8 +388,8 @@ impl GitLabClient {
                         FetchResult::Fetched { data, etag, .. } => {
                             stats.record_fetch();
 
-                            if let Some(db) = db {
-                                if let Err(e) = api_cache::upsert_with_pagination(
+                            if let Some(db) = db
+                                && let Err(e) = api_cache::upsert_with_pagination(
                                     db,
                                     self.instance_id,
                                     endpoint_type,
@@ -399,9 +398,8 @@ impl GitLabClient {
                                     None,
                                 )
                                 .await
-                                {
-                                    tracing::debug!("api cache upsert failed: {e}");
-                                }
+                            {
+                                tracing::debug!("api cache upsert failed: {e}");
                             }
 
                             all.extend(data);
