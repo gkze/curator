@@ -60,6 +60,25 @@ jobs:
             cargo llvm-cov -p curator --no-default-features \
             --features github --summary-only --ignore-run-fail --fail-under-lines 25 \
             | tee coverage/summary.txt
+      - name: Build coverage badge payload
+        run: |-
+          COVERAGE=$(awk '/^TOTAL/ { for (i=NF; i>=1; i--) if ($i ~ /%$/) { gsub("%", "", $i); print $i; exit } }' coverage/summary.txt)
+          if [ -z "$COVERAGE" ]; then
+            echo "Failed to parse coverage percentage from coverage/summary.txt"
+            exit 1
+          fi
+
+          COLOR=$(awk -v c="$COVERAGE" 'BEGIN {
+            if (c >= 90) print "brightgreen";
+            else if (c >= 80) print "green";
+            else if (c >= 70) print "yellowgreen";
+            else if (c >= 60) print "yellow";
+            else if (c >= 50) print "orange";
+            else print "red";
+          }')
+
+          printf '{"schemaVersion":1,"label":"coverage","message":"%.2f%%","color":"%s"}\n' \
+            "$COVERAGE" "$COLOR" > coverage/badge.json
       - name: Generate lcov report
         run: |-
           PROXY_URL="http://127.0.0.1:9"
@@ -79,6 +98,54 @@ jobs:
         with:
           name: coverage-curator-github
           path: coverage/
+
+  coverage-badge:
+    name: Publish coverage badge
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: coverage
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-curator-github
+          path: coverage
+      - name: Publish badge JSON to gh-pages
+        run: |-
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch origin gh-pages
+            git worktree add --detach gh-pages FETCH_HEAD
+          else
+            git worktree add --detach gh-pages
+            (
+              cd gh-pages
+              git checkout --orphan gh-pages
+              git rm -rf . >/dev/null 2>&1 || true
+            )
+          fi
+
+          mkdir -p gh-pages/badges
+          cp coverage/badge.json gh-pages/badges/coverage.json
+
+          (
+            cd gh-pages
+            git add badges/coverage.json
+            if git diff --cached --quiet; then
+              echo "Coverage badge unchanged"
+              exit 0
+            fi
+            git commit -m "chore(ci): update coverage badge [skip ci]"
+            git push origin HEAD:gh-pages
+          )
 
   # Test feature combinations (uses devShell for flexibility)
   # Uses cargo-nextest for faster parallel test execution

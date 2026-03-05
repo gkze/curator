@@ -1,6 +1,7 @@
 # Curator
 
 [![CI](https://github.com/gkze/curator/actions/workflows/ci.yml/badge.svg)](https://github.com/gkze/curator/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/gkze/curator/gh-pages/badges/coverage.json)](https://github.com/gkze/curator/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.92.0-orange.svg)](https://www.rust-lang.org/)
 
