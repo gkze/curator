@@ -442,7 +442,9 @@ pub async fn sync_namespace<C: PlatformClient + Clone + 'static>(
     db: Option<&DatabaseConnection>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
-    let repos = client.list_org_repos(namespace, db, on_progress).await?;
+    let repos = client
+        .list_org_repos_with_concurrency(namespace, db, options.concurrency, on_progress)
+        .await?;
     let repos = maybe_filter_incremental_for_owner(client, namespace, options, db, repos).await?;
 
     sync_repos(client, namespace, repos, options, on_progress).await
@@ -472,7 +474,9 @@ pub async fn sync_namespace_streaming<C: PlatformClient + Clone + 'static>(
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
-    let repos = client.list_org_repos(namespace, db, on_progress).await?;
+    let repos = client
+        .list_org_repos_with_concurrency(namespace, db, options.concurrency, on_progress)
+        .await?;
     let repos = maybe_filter_incremental_for_owner(client, namespace, options, db, repos).await?;
 
     sync_repos_streaming(client, namespace, repos, options, model_tx, on_progress).await
@@ -628,7 +632,9 @@ pub async fn sync_user<C: PlatformClient + Clone + 'static>(
     db: Option<&DatabaseConnection>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
-    let repos = client.list_user_repos(username, db, on_progress).await?;
+    let repos = client
+        .list_user_repos_with_concurrency(username, db, options.concurrency, on_progress)
+        .await?;
     let repos = maybe_filter_incremental_for_owner(client, username, options, db, repos).await?;
 
     sync_repos(client, username, repos, options, on_progress).await
@@ -658,7 +664,9 @@ pub async fn sync_user_streaming<C: PlatformClient + Clone + 'static>(
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<SyncResult, PlatformError> {
-    let repos = client.list_user_repos(username, db, on_progress).await?;
+    let repos = client
+        .list_user_repos_with_concurrency(username, db, options.concurrency, on_progress)
+        .await?;
     let repos = maybe_filter_incremental_for_owner(client, username, options, db, repos).await?;
 
     sync_repos_streaming(client, username, repos, options, model_tx, on_progress).await
@@ -1328,6 +1336,126 @@ mod tests {
             _on_progress: Option<&crate::platform::ProgressCallback>,
         ) -> PlatformResult<Vec<PlatformRepo>> {
             panic!("unused in tests")
+        }
+
+        async fn is_repo_starred(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn star_repo(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn unstar_repo(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            panic!("unused in tests")
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            panic!("unused in tests")
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            _repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<usize> {
+            panic!("unused in tests")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ConcurrencyRecordingClient {
+        org_concurrency: Arc<AtomicUsize>,
+        user_concurrency: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PlatformClient for ConcurrencyRecordingClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> PlatformResult<RateLimitInfo> {
+            panic!("unused in tests")
+        }
+
+        async fn get_org_info(&self, _org: &str) -> PlatformResult<OrgInfo> {
+            panic!("unused in tests")
+        }
+
+        async fn get_authenticated_user(&self) -> PlatformResult<UserInfo> {
+            panic!("unused in tests")
+        }
+
+        async fn get_repo(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> PlatformResult<PlatformRepo> {
+            panic!("unused in tests")
+        }
+
+        async fn list_org_repos(
+            &self,
+            _org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            panic!("sync_namespace should call list_org_repos_with_concurrency")
+        }
+
+        async fn list_org_repos_with_concurrency(
+            &self,
+            _org: &str,
+            _db: Option<&DatabaseConnection>,
+            concurrency: usize,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            self.org_concurrency.store(concurrency, Ordering::SeqCst);
+            Ok(vec![mock_repo("org-repo", 1)])
+        }
+
+        async fn list_user_repos(
+            &self,
+            _username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            panic!("sync_user should call list_user_repos_with_concurrency")
+        }
+
+        async fn list_user_repos_with_concurrency(
+            &self,
+            _username: &str,
+            _db: Option<&DatabaseConnection>,
+            concurrency: usize,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            self.user_concurrency.store(concurrency, Ordering::SeqCst);
+            Ok(vec![mock_repo("user-repo", 1)])
         }
 
         async fn is_repo_starred(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
@@ -2518,5 +2646,47 @@ mod tests {
                 .any(|error| error.contains("Task join error:"))
         );
         assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_namespace_uses_list_org_repos_with_explicit_concurrency() {
+        let client = ConcurrencyRecordingClient::default();
+        let options = SyncOptions {
+            star: false,
+            dry_run: true,
+            concurrency: 37,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let (result, models) = sync_namespace(&client, "acme", &options, None, None)
+            .await
+            .expect("namespace sync should succeed");
+
+        assert_eq!(client.org_concurrency.load(Ordering::SeqCst), 37);
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.matched, 1);
+        assert_eq!(models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sync_user_uses_list_user_repos_with_explicit_concurrency() {
+        let client = ConcurrencyRecordingClient::default();
+        let options = SyncOptions {
+            star: false,
+            dry_run: true,
+            concurrency: 23,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let (result, models) = sync_user(&client, "octocat", &options, None, None)
+            .await
+            .expect("user sync should succeed");
+
+        assert_eq!(client.user_concurrency.load(Ordering::SeqCst), 23);
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.matched, 1);
+        assert_eq!(models.len(), 1);
     }
 }

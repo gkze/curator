@@ -352,26 +352,65 @@ impl GiteaClient {
 
     /// List all repositories for an organization with pagination.
     pub async fn list_org_repos(&self, org: &str) -> Result<Vec<GiteaRepo>, GiteaError> {
-        let mut all_repos = Vec::new();
-        let mut page = 1u32;
+        self.list_org_repos_with_concurrency(org, 1).await
+    }
+
+    /// List all repositories for an organization with explicit page
+    /// concurrency.
+    pub async fn list_org_repos_with_concurrency(
+        &self,
+        org: &str,
+        concurrency: usize,
+    ) -> Result<Vec<GiteaRepo>, GiteaError> {
+        let concurrency = concurrency.max(1);
+
+        let first_page: Vec<GiteaRepo> = self
+            .get(&format!("/orgs/{}/repos?page=1&limit={}", org, PAGE_SIZE))
+            .await?;
+
+        let first_page_count = first_page.len();
+        let mut all_repos = first_page;
+
+        if first_page_count < PAGE_SIZE as usize {
+            return Ok(all_repos);
+        }
+
+        let mut page_start = 2u32;
 
         loop {
-            let repos: Vec<GiteaRepo> = self
-                .get(&format!(
-                    "/orgs/{}/repos?page={}&limit={}",
-                    org, page, PAGE_SIZE
-                ))
-                .await?;
+            let page_end = page_start.saturating_add(concurrency.saturating_sub(1) as u32);
+            let page_results = crate::platform::collect_pages_unordered(
+                page_start..=page_end,
+                concurrency,
+                |page| {
+                    let route = format!("/orgs/{}/repos?page={}&limit={}", org, page, PAGE_SIZE);
 
-            let count = repos.len();
-            all_repos.extend(repos);
+                    async move {
+                        let repos: Vec<GiteaRepo> = self.get(&route).await?;
+                        Ok::<(u32, Vec<GiteaRepo>), GiteaError>((page, repos))
+                    }
+                },
+            )
+            .await;
 
-            // If we got fewer than PAGE_SIZE, we've reached the end
-            if count < PAGE_SIZE as usize {
+            let mut page_results: Vec<(u32, Vec<GiteaRepo>)> =
+                page_results.into_iter().collect::<Result<Vec<_>, _>>()?;
+            page_results.sort_by_key(|(page, _)| *page);
+
+            let mut reached_end = false;
+            for (_page, repos) in page_results {
+                let count = repos.len();
+                all_repos.extend(repos);
+                if count < PAGE_SIZE as usize {
+                    reached_end = true;
+                }
+            }
+
+            if reached_end {
                 break;
             }
 
-            page += 1;
+            page_start = page_end.saturating_add(1);
         }
 
         Ok(all_repos)
@@ -432,26 +471,72 @@ impl GiteaClient {
         &self,
         username: &str,
     ) -> Result<Vec<GiteaRepo>, GiteaError> {
-        let mut all_repos = Vec::new();
-        let mut page = 1u32;
+        self.list_user_repos_internal_with_concurrency(username, 1)
+            .await
+    }
+
+    /// List all repositories for a specific user with explicit page
+    /// concurrency.
+    pub async fn list_user_repos_internal_with_concurrency(
+        &self,
+        username: &str,
+        concurrency: usize,
+    ) -> Result<Vec<GiteaRepo>, GiteaError> {
+        let concurrency = concurrency.max(1);
+
+        let first_page: Vec<GiteaRepo> = self
+            .get(&format!(
+                "/users/{}/repos?page=1&limit={}",
+                username, PAGE_SIZE
+            ))
+            .await?;
+
+        let first_page_count = first_page.len();
+        let mut all_repos = first_page;
+
+        if first_page_count < PAGE_SIZE as usize {
+            return Ok(all_repos);
+        }
+
+        let mut page_start = 2u32;
 
         loop {
-            let repos: Vec<GiteaRepo> = self
-                .get(&format!(
-                    "/users/{}/repos?page={}&limit={}",
-                    username, page, PAGE_SIZE
-                ))
-                .await?;
+            let page_end = page_start.saturating_add(concurrency.saturating_sub(1) as u32);
+            let page_results = crate::platform::collect_pages_unordered(
+                page_start..=page_end,
+                concurrency,
+                |page| {
+                    let route = format!(
+                        "/users/{}/repos?page={}&limit={}",
+                        username, page, PAGE_SIZE
+                    );
 
-            let count = repos.len();
-            all_repos.extend(repos);
+                    async move {
+                        let repos: Vec<GiteaRepo> = self.get(&route).await?;
+                        Ok::<(u32, Vec<GiteaRepo>), GiteaError>((page, repos))
+                    }
+                },
+            )
+            .await;
 
-            // If we got fewer than PAGE_SIZE, we've reached the end
-            if count < PAGE_SIZE as usize {
+            let mut page_results: Vec<(u32, Vec<GiteaRepo>)> =
+                page_results.into_iter().collect::<Result<Vec<_>, _>>()?;
+            page_results.sort_by_key(|(page, _)| *page);
+
+            let mut reached_end = false;
+            for (_page, repos) in page_results {
+                let count = repos.len();
+                all_repos.extend(repos);
+                if count < PAGE_SIZE as usize {
+                    reached_end = true;
+                }
+            }
+
+            if reached_end {
                 break;
             }
 
-            page += 1;
+            page_start = page_end.saturating_add(1);
         }
 
         Ok(all_repos)
@@ -606,7 +691,18 @@ impl PlatformClient for GiteaClient {
     async fn list_org_repos(
         &self,
         org: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<Vec<PlatformRepo>> {
+        <Self as PlatformClient>::list_org_repos_with_concurrency(self, org, db, 1, on_progress)
+            .await
+    }
+
+    async fn list_org_repos_with_concurrency(
+        &self,
+        org: &str,
         _db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
         // NOTE: ETag caching not yet implemented for org/user repos (only starred).
@@ -619,7 +715,9 @@ impl PlatformClient for GiteaClient {
             },
         );
 
-        let repos = self.list_org_repos(org).await?;
+        let repos = self
+            .list_org_repos_with_concurrency(org, concurrency)
+            .await?;
 
         emit(
             on_progress,
@@ -629,16 +727,25 @@ impl PlatformClient for GiteaClient {
             },
         );
 
-        // Convert to PlatformRepo
         let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
-
         Ok(platform_repos)
     }
 
     async fn list_user_repos(
         &self,
         username: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<Vec<PlatformRepo>> {
+        self.list_user_repos_with_concurrency(username, db, 1, on_progress)
+            .await
+    }
+
+    async fn list_user_repos_with_concurrency(
+        &self,
+        username: &str,
         _db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
         // NOTE: ETag caching not yet implemented for org/user repos (only starred).
@@ -652,7 +759,7 @@ impl PlatformClient for GiteaClient {
         );
 
         let repos = self
-            .list_user_repos_internal(username)
+            .list_user_repos_internal_with_concurrency(username, concurrency)
             .await
             .map_err(PlatformError::from)?;
 
@@ -664,9 +771,7 @@ impl PlatformClient for GiteaClient {
             },
         );
 
-        // Convert to PlatformRepo
         let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
-
         Ok(platform_repos)
     }
 

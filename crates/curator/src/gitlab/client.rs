@@ -261,10 +261,30 @@ impl GitLabClient {
         cache_key_fn: impl Fn(u32) -> String,
         db: Option<&DatabaseConnection>,
     ) -> Result<(Vec<T>, CacheStats), GitLabError> {
+        self.paginated_fetch_with_concurrency(
+            endpoint_type,
+            cache_key_prefix,
+            url_fn,
+            cache_key_fn,
+            1,
+            db,
+        )
+        .await
+    }
+
+    async fn paginated_fetch_with_concurrency<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint_type: EndpointType,
+        cache_key_prefix: &str,
+        url_fn: impl Fn(u32) -> String,
+        cache_key_fn: impl Fn(u32) -> String,
+        concurrency: usize,
+        db: Option<&DatabaseConnection>,
+    ) -> Result<(Vec<T>, CacheStats), GitLabError> {
         let mut all: Vec<T> = Vec::new();
-        let mut page = 1u32;
         let mut stats = CacheStats::default();
         let mut known_total_pages: Option<u32> = None;
+        let concurrency = concurrency.max(1);
 
         // Try to load stored total_pages from the DB
         if let Some(db) = db
@@ -275,78 +295,193 @@ impl GitLabClient {
             known_total_pages = Some(stored as u32);
         }
 
-        loop {
-            let url = url_fn(page);
-            let cache_key = cache_key_fn(page);
+        // ── First page ─────────────────────────────────────────────
+        let first_url = url_fn(1);
+        let first_cache_key = cache_key_fn(1);
+        let first_etag = if let Some(db) = db {
+            api_cache::get_etag(db, self.instance_id, endpoint_type, &first_cache_key)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
 
-            // Look up cached ETag
-            let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(db, self.instance_id, endpoint_type, &cache_key)
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
+        let first_result: FetchResult<Vec<T>> = self
+            .get_conditional(&first_url, first_etag.as_deref())
+            .await?;
 
-            let result: FetchResult<Vec<T>> =
-                self.get_conditional(&url, cached_etag.as_deref()).await?;
+        let mut first_page_fetched = false;
+        let mut first_page_count = 0usize;
 
-            match result {
-                FetchResult::NotModified => {
-                    stats.record_hit();
-                    if let Some(total) = known_total_pages
-                        && page < total
-                    {
-                        page += 1;
-                        continue;
-                    }
-                    break;
+        match first_result {
+            FetchResult::NotModified => {
+                stats.record_hit();
+            }
+            FetchResult::Fetched {
+                data: items,
+                etag,
+                pagination,
+            } => {
+                stats.record_fetch();
+                first_page_fetched = true;
+                first_page_count = items.len();
+
+                if let Some(tp) = pagination.total_pages {
+                    known_total_pages = Some(tp);
                 }
-                FetchResult::Fetched {
-                    data: items,
-                    etag,
-                    pagination,
-                } => {
-                    stats.record_fetch();
-                    let is_empty = items.is_empty();
 
-                    if let Some(tp) = pagination.total_pages {
-                        known_total_pages = Some(tp);
+                if let Some(db) = db {
+                    if let Err(e) = api_cache::upsert_with_pagination(
+                        db,
+                        self.instance_id,
+                        endpoint_type,
+                        &first_cache_key,
+                        etag,
+                        known_total_pages.map(|t| t as i32),
+                    )
+                    .await
+                    {
+                        tracing::debug!("api cache upsert failed: {e}");
                     }
+                }
 
-                    // Store ETag
-                    if let Some(db) = db {
-                        let tp_to_store = if page == 1 {
-                            known_total_pages.map(|t| t as i32)
-                        } else {
-                            None
-                        };
-                        if let Err(e) = api_cache::upsert_with_pagination(
-                            db,
-                            self.instance_id,
-                            endpoint_type,
-                            &cache_key,
-                            etag,
-                            tp_to_store,
-                        )
+                all.extend(items);
+            }
+        }
+
+        // ── Remaining pages (concurrent when total is known) ──────
+        if let Some(total_pages) = known_total_pages {
+            if total_pages > 1 {
+                let cache_keys: Vec<String> = (2..=total_pages).map(&cache_key_fn).collect();
+                let etags = if let Some(db) = db {
+                    api_cache::get_etags_batch(db, self.instance_id, endpoint_type, &cache_keys)
                         .await
-                        {
-                            tracing::debug!("api cache upsert failed: {e}");
+                        .unwrap_or_default()
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+                let page_results = crate::platform::collect_pages_unordered(
+                    2..=total_pages,
+                    concurrency,
+                    |page| {
+                        let url = url_fn(page);
+                        let cache_key = cache_key_fn(page);
+                        let cached_etag = etags.get(&cache_key).cloned().flatten();
+
+                        async move {
+                            let result: FetchResult<Vec<T>> =
+                                self.get_conditional(&url, cached_etag.as_deref()).await?;
+                            Ok::<_, GitLabError>((page, result, cache_key))
+                        }
+                    },
+                )
+                .await;
+
+                let mut page_results: Vec<(u32, FetchResult<Vec<T>>, String)> =
+                    page_results.into_iter().collect::<Result<Vec<_>, _>>()?;
+                page_results.sort_by_key(|(page, _, _)| *page);
+
+                for (_page, result, cache_key) in page_results {
+                    match result {
+                        FetchResult::NotModified => stats.record_hit(),
+                        FetchResult::Fetched { data, etag, .. } => {
+                            stats.record_fetch();
+
+                            if let Some(db) = db {
+                                if let Err(e) = api_cache::upsert_with_pagination(
+                                    db,
+                                    self.instance_id,
+                                    endpoint_type,
+                                    &cache_key,
+                                    etag,
+                                    None,
+                                )
+                                .await
+                                {
+                                    tracing::debug!("api cache upsert failed: {e}");
+                                }
+                            }
+
+                            all.extend(data);
                         }
                     }
+                }
+            }
 
-                    all.extend(items);
+            return Ok((all, stats));
+        }
 
-                    if is_empty {
+        // Unknown total pages: sequential fallback
+        if first_page_fetched && first_page_count > 0 {
+            let mut page = 2u32;
+
+            loop {
+                let url = url_fn(page);
+                let cache_key = cache_key_fn(page);
+
+                let cached_etag = if let Some(db) = db {
+                    api_cache::get_etag(db, self.instance_id, endpoint_type, &cache_key)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+
+                let result: FetchResult<Vec<T>> =
+                    self.get_conditional(&url, cached_etag.as_deref()).await?;
+
+                match result {
+                    FetchResult::NotModified => {
+                        stats.record_hit();
                         break;
                     }
-                    if let Some(total) = known_total_pages
-                        && page >= total
-                    {
-                        break;
+                    FetchResult::Fetched {
+                        data: items,
+                        etag,
+                        pagination,
+                    } => {
+                        stats.record_fetch();
+                        let is_empty = items.is_empty();
+
+                        if let Some(tp) = pagination.total_pages {
+                            known_total_pages = Some(tp);
+                        }
+
+                        if let Some(db) = db {
+                            let tp_to_store = if page == 1 {
+                                known_total_pages.map(|t| t as i32)
+                            } else {
+                                None
+                            };
+                            if let Err(e) = api_cache::upsert_with_pagination(
+                                db,
+                                self.instance_id,
+                                endpoint_type,
+                                &cache_key,
+                                etag,
+                                tp_to_store,
+                            )
+                            .await
+                            {
+                                tracing::debug!("api cache upsert failed: {e}");
+                            }
+                        }
+
+                        all.extend(items);
+
+                        if is_empty {
+                            break;
+                        }
+                        if let Some(total) = known_total_pages
+                            && page >= total
+                        {
+                            break;
+                        }
+                        page += 1;
                     }
-                    page += 1;
                 }
             }
         }
@@ -365,11 +500,23 @@ impl GitLabClient {
         include_subgroups: bool,
         db: Option<&DatabaseConnection>,
     ) -> Result<(Vec<GitLabProject>, CacheStats), GitLabError> {
+        self.list_group_projects_with_concurrency(group, include_subgroups, 1, db)
+            .await
+    }
+
+    /// List group projects with explicit page concurrency.
+    pub async fn list_group_projects_with_concurrency(
+        &self,
+        group: &str,
+        include_subgroups: bool,
+        concurrency: usize,
+        db: Option<&DatabaseConnection>,
+    ) -> Result<(Vec<GitLabProject>, CacheStats), GitLabError> {
         let include_sub = if include_subgroups { "true" } else { "false" };
         let encoded_group = Self::url_encode_component(group);
         let host = self.host.clone();
 
-        self.paginated_fetch(
+        self.paginated_fetch_with_concurrency(
             EndpointType::OrgRepos,
             group,
             |page| {
@@ -379,6 +526,7 @@ impl GitLabClient {
                 )
             },
             |page| ApiCacheModel::org_repos_key(group, page),
+            concurrency,
             db,
         )
         .await
@@ -420,10 +568,21 @@ impl GitLabClient {
         username: &str,
         db: Option<&DatabaseConnection>,
     ) -> Result<(Vec<GitLabProject>, CacheStats), GitLabError> {
+        self.list_user_projects_with_concurrency(username, 1, db)
+            .await
+    }
+
+    /// List user projects with explicit page concurrency.
+    pub async fn list_user_projects_with_concurrency(
+        &self,
+        username: &str,
+        concurrency: usize,
+        db: Option<&DatabaseConnection>,
+    ) -> Result<(Vec<GitLabProject>, CacheStats), GitLabError> {
         let user_id = self.resolve_user_id(username).await?;
         let host = self.host.clone();
 
-        self.paginated_fetch(
+        self.paginated_fetch_with_concurrency(
             EndpointType::UserRepos,
             username,
             |page| {
@@ -433,6 +592,7 @@ impl GitLabClient {
                 )
             },
             |page| ApiCacheModel::user_repos_key(username, page),
+            concurrency,
             db,
         )
         .await
@@ -794,6 +954,17 @@ impl PlatformClient for GitLabClient {
         db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
+        self.list_org_repos_with_concurrency(org, db, 1, on_progress)
+            .await
+    }
+
+    async fn list_org_repos_with_concurrency(
+        &self,
+        org: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<Vec<PlatformRepo>> {
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -803,7 +974,9 @@ impl PlatformClient for GitLabClient {
             },
         );
 
-        let (projects, stats) = self.list_group_projects(org, true, db).await?;
+        let (projects, stats) = self
+            .list_group_projects_with_concurrency(org, true, concurrency, db)
+            .await?;
 
         // Cache-hit fallback: if every page was 304, load from the local DB.
         if stats.all_cached()
@@ -838,6 +1011,17 @@ impl PlatformClient for GitLabClient {
         db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
+        self.list_user_repos_with_concurrency(username, db, 1, on_progress)
+            .await
+    }
+
+    async fn list_user_repos_with_concurrency(
+        &self,
+        username: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<Vec<PlatformRepo>> {
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -847,7 +1031,9 @@ impl PlatformClient for GitLabClient {
             },
         );
 
-        let (projects, stats) = self.list_user_projects(username, db).await?;
+        let (projects, stats) = self
+            .list_user_projects_with_concurrency(username, concurrency, db)
+            .await?;
 
         // Cache-hit fallback
         if stats.all_cached()

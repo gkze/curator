@@ -169,6 +169,22 @@ pub trait PlatformClient: Send + Sync {
         on_progress: Option<&ProgressCallback>,
     ) -> Result<Vec<PlatformRepo>>;
 
+    /// List all repositories for an organization with explicit page concurrency.
+    ///
+    /// Default implementation falls back to `list_org_repos` and ignores
+    /// `concurrency`, preserving backward compatibility for platform clients
+    /// that have not implemented concurrent page fetching yet.
+    async fn list_org_repos_with_concurrency(
+        &self,
+        org: &str,
+        db: Option<&DatabaseConnection>,
+        concurrency: usize,
+        on_progress: Option<&ProgressCallback>,
+    ) -> Result<Vec<PlatformRepo>> {
+        let _ = concurrency;
+        self.list_org_repos(org, db, on_progress).await
+    }
+
     /// List all repositories for a user.
     ///
     /// This should handle pagination internally and return all repositories
@@ -182,6 +198,22 @@ pub trait PlatformClient: Send + Sync {
         db: Option<&DatabaseConnection>,
         on_progress: Option<&ProgressCallback>,
     ) -> Result<Vec<PlatformRepo>>;
+
+    /// List all repositories for a user with explicit page concurrency.
+    ///
+    /// Default implementation falls back to `list_user_repos` and ignores
+    /// `concurrency`, preserving backward compatibility for platform clients
+    /// that have not implemented concurrent page fetching yet.
+    async fn list_user_repos_with_concurrency(
+        &self,
+        username: &str,
+        db: Option<&DatabaseConnection>,
+        concurrency: usize,
+        on_progress: Option<&ProgressCallback>,
+    ) -> Result<Vec<PlatformRepo>> {
+        let _ = concurrency;
+        self.list_user_repos(username, db, on_progress).await
+    }
 
     /// Check if a repository is starred by the authenticated user.
     async fn is_repo_starred(&self, owner: &str, name: &str) -> Result<bool>;

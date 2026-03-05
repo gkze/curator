@@ -96,25 +96,36 @@ pub struct PaginatedFetchResult<T> {
 impl GitHubClient {
     /// Fetch all pages of a paginated endpoint with ETag caching.
     ///
-    /// This method:
-    /// - Checks for cached ETags before each request
-    /// - Skips fetching if the server returns 304 Not Modified
-    /// - Stores new ETags and pagination info after successful fetches
-    /// - Continues through all pages using stored pagination metadata
-    ///
-    /// If all pages are cache hits and db is provided, attempts to load
-    /// cached data from the database.
+    /// Uses single-page (sequential) fetching. For concurrent pagination,
+    /// use `fetch_pages_with_concurrency`.
     pub async fn fetch_pages<T: DeserializeOwned>(
         &self,
         config: &PaginatedFetchConfig<'_>,
         db: Option<&DatabaseConnection>,
         on_progress: Option<&ProgressCallback>,
     ) -> platform::Result<PaginatedFetchResult<T>> {
+        self.fetch_pages_with_concurrency(config, db, 1, on_progress)
+            .await
+    }
+
+    /// Fetch all pages of a paginated endpoint with ETag caching and explicit
+    /// page concurrency.
+    ///
+    /// The first page is always fetched first to establish pagination metadata.
+    /// If total pages are known (from cache, headers, or expected totals),
+    /// remaining pages are fetched concurrently.
+    pub async fn fetch_pages_with_concurrency<T: DeserializeOwned>(
+        &self,
+        config: &PaginatedFetchConfig<'_>,
+        db: Option<&DatabaseConnection>,
+        concurrency: usize,
+        on_progress: Option<&ProgressCallback>,
+    ) -> platform::Result<PaginatedFetchResult<T>> {
         let mut all_items: Vec<T> = Vec::new();
-        let mut page = 1u32;
         let mut stats = CacheStats::default();
         let mut known_total_pages: Option<u32> = None;
         let mut all_cache_hits = true;
+        let concurrency = concurrency.max(1);
 
         // Try to get stored total_pages from the database
         if let Some(db) = db
@@ -129,135 +140,297 @@ impl GitHubClient {
             known_total_pages = Some(stored_total as u32);
         }
 
-        // Calculate expected pages
-        let expected_pages = known_total_pages
-            .or_else(|| config.expected_total_repos.map(|t| t.div_ceil(100) as u32));
+        let fallback_expected_pages = config.expected_total_repos.map(|t| t.div_ceil(100) as u32);
 
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
                 namespace: config.namespace.to_string(),
                 total_repos: config.expected_total_repos,
-                expected_pages,
+                expected_pages: known_total_pages.or(fallback_expected_pages),
             },
         );
 
-        loop {
-            // Check rate limit before making request
-            if !config.skip_rate_checks {
-                check_rate_limit(self.inner())
-                    .await
-                    .map_err(platform::PlatformError::from)?;
-            }
-
-            let route = (config.route_fn)(page);
-            let cache_key = (config.cache_key_fn)(page);
-
-            // Try to get cached ETag
-            let cached_etag = if let Some(db) = db {
-                api_cache::get_etag(db, self.instance_id(), config.endpoint_type, &cache_key)
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
-            };
-
-            // Make conditional request
-            let result: FetchResult<Vec<T>> = self
-                .get_conditional(&route, cached_etag.as_deref())
+        // ── First page (required for pagination metadata) ───────────────────
+        if !config.skip_rate_checks {
+            check_rate_limit(self.inner())
                 .await
                 .map_err(platform::PlatformError::from)?;
+        }
 
-            match result {
-                FetchResult::NotModified => {
-                    stats.cache_hits += 1;
+        let first_route = (config.route_fn)(1);
+        let first_cache_key = (config.cache_key_fn)(1);
 
-                    emit(
-                        on_progress,
-                        SyncProgress::FetchedPage {
-                            namespace: config.namespace.to_string(),
-                            page,
-                            count: 0,
-                            total_so_far: all_items.len(),
-                            expected_pages: known_total_pages,
-                        },
-                    );
+        let first_etag = if let Some(db) = db {
+            api_cache::get_etag(
+                db,
+                self.instance_id(),
+                config.endpoint_type,
+                &first_cache_key,
+            )
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
 
-                    // Continue to next page if we know there are more
-                    if let Some(total) = known_total_pages
-                        && page < total
-                    {
-                        page += 1;
-                        continue;
-                    }
-                    // If we don't know total pages and hit cache, we're done
-                    break;
+        let first_result: FetchResult<Vec<T>> = self
+            .get_conditional(&first_route, first_etag.as_deref())
+            .await
+            .map_err(platform::PlatformError::from)?;
+
+        let mut first_page_count = 0usize;
+        let mut first_page_fetched = false;
+
+        match first_result {
+            FetchResult::NotModified => {
+                stats.cache_hits += 1;
+
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
+                        namespace: config.namespace.to_string(),
+                        page: 1,
+                        count: 0,
+                        total_so_far: all_items.len(),
+                        expected_pages: known_total_pages.or(fallback_expected_pages),
+                    },
+                );
+            }
+            FetchResult::Fetched {
+                data: items,
+                etag,
+                pagination,
+            } => {
+                first_page_fetched = true;
+                all_cache_hits = false;
+                stats.pages_fetched += 1;
+                first_page_count = items.len();
+
+                if let Some(total) = pagination.total_pages {
+                    known_total_pages = Some(total);
+                } else if known_total_pages.is_none() {
+                    known_total_pages = fallback_expected_pages;
                 }
-                FetchResult::Fetched {
-                    data: items,
-                    etag,
-                    pagination,
-                } => {
-                    all_cache_hits = false;
-                    stats.pages_fetched += 1;
-                    let count = items.len();
 
-                    // Update known total pages from Link header
-                    if let Some(total) = pagination.total_pages {
-                        known_total_pages = Some(total);
+                if let Some(db) = db
+                    && let Err(e) = api_cache::upsert_with_pagination(
+                        db,
+                        self.instance_id(),
+                        config.endpoint_type,
+                        &first_cache_key,
+                        etag,
+                        known_total_pages.map(|t| t as i32),
+                    )
+                    .await
+                {
+                    tracing::debug!("api cache upsert failed: {e}");
+                }
+
+                all_items.extend(items);
+
+                emit(
+                    on_progress,
+                    SyncProgress::FetchedPage {
+                        namespace: config.namespace.to_string(),
+                        page: 1,
+                        count: first_page_count,
+                        total_so_far: all_items.len(),
+                        expected_pages: known_total_pages,
+                    },
+                );
+            }
+        }
+
+        // ── Remaining pages (concurrent when page count is known) ───────────
+        if let Some(last_page) = known_total_pages {
+            if last_page > 1 {
+                let page_cache_keys: Vec<String> = (2..=last_page)
+                    .map(|page| (config.cache_key_fn)(page))
+                    .collect();
+
+                let etags_map = if let Some(db) = db {
+                    api_cache::get_etags_batch(
+                        db,
+                        self.instance_id(),
+                        config.endpoint_type,
+                        &page_cache_keys,
+                    )
+                    .await
+                    .unwrap_or_default()
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+                let client = self.clone();
+                let page_results = crate::platform::collect_pages_unordered(
+                    2..=last_page,
+                    concurrency,
+                    |page| {
+                        let task_client = client.clone();
+                        let route = (config.route_fn)(page);
+                        let cache_key = (config.cache_key_fn)(page);
+                        let cached_etag = etags_map.get(&cache_key).cloned().flatten();
+                        let skip_rate_checks = config.skip_rate_checks;
+
+                        async move {
+                            if !skip_rate_checks {
+                                check_rate_limit(task_client.inner())
+                                    .await
+                                    .map_err(platform::PlatformError::from)?;
+                            }
+
+                            let result: FetchResult<Vec<T>> = task_client
+                                .get_conditional(&route, cached_etag.as_deref())
+                                .await
+                                .map_err(platform::PlatformError::from)?;
+
+                            Ok::<(u32, FetchResult<Vec<T>>, Option<String>), platform::PlatformError>((
+                                page,
+                                result,
+                                Some(cache_key),
+                            ))
+                        }
+                    },
+                )
+                .await;
+
+                let mut page_results: Vec<(u32, FetchResult<Vec<T>>, Option<String>)> =
+                    page_results.into_iter().collect::<Result<Vec<_>, _>>()?;
+                page_results.sort_by_key(|(page, _, _)| *page);
+
+                for (page, result, cache_key) in page_results {
+                    match result {
+                        FetchResult::NotModified => {
+                            stats.cache_hits += 1;
+                            emit(
+                                on_progress,
+                                SyncProgress::FetchedPage {
+                                    namespace: config.namespace.to_string(),
+                                    page,
+                                    count: 0,
+                                    total_so_far: all_items.len(),
+                                    expected_pages: known_total_pages,
+                                },
+                            );
+                        }
+                        FetchResult::Fetched { data, etag, .. } => {
+                            all_cache_hits = false;
+                            stats.pages_fetched += 1;
+                            let count = data.len();
+
+                            if let (Some(db), Some(cache_key)) = (db, cache_key)
+                                && let Err(e) = api_cache::upsert_with_pagination(
+                                    db,
+                                    self.instance_id(),
+                                    config.endpoint_type,
+                                    &cache_key,
+                                    etag,
+                                    None,
+                                )
+                                .await
+                            {
+                                tracing::debug!("api cache upsert failed: {e}");
+                            }
+
+                            all_items.extend(data);
+
+                            emit(
+                                on_progress,
+                                SyncProgress::FetchedPage {
+                                    namespace: config.namespace.to_string(),
+                                    page,
+                                    count,
+                                    total_so_far: all_items.len(),
+                                    expected_pages: known_total_pages,
+                                },
+                            );
+                        }
                     }
+                }
+            }
+        } else if first_page_fetched && first_page_count >= 100 {
+            // Unknown total page count: fall back to sequential pagination.
+            let mut page = 2u32;
 
-                    // Store new ETag and pagination info
-                    if let Some(db) = db {
-                        let total_pages_to_store = if page == 1 {
-                            known_total_pages.map(|t| t as i32)
-                        } else {
-                            None
-                        };
-
-                        if let Err(e) = api_cache::upsert_with_pagination(
-                            db,
-                            self.instance_id(),
-                            config.endpoint_type,
-                            &cache_key,
-                            etag,
-                            total_pages_to_store,
-                        )
+            loop {
+                if !config.skip_rate_checks {
+                    check_rate_limit(self.inner())
                         .await
+                        .map_err(platform::PlatformError::from)?;
+                }
+
+                let route = (config.route_fn)(page);
+                let cache_key = (config.cache_key_fn)(page);
+
+                let cached_etag = if let Some(db) = db {
+                    api_cache::get_etag(db, self.instance_id(), config.endpoint_type, &cache_key)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+
+                let result: FetchResult<Vec<T>> = self
+                    .get_conditional(&route, cached_etag.as_deref())
+                    .await
+                    .map_err(platform::PlatformError::from)?;
+
+                match result {
+                    FetchResult::NotModified => {
+                        stats.cache_hits += 1;
+                        emit(
+                            on_progress,
+                            SyncProgress::FetchedPage {
+                                namespace: config.namespace.to_string(),
+                                page,
+                                count: 0,
+                                total_so_far: all_items.len(),
+                                expected_pages: known_total_pages,
+                            },
+                        );
+                        break;
+                    }
+                    FetchResult::Fetched { data, etag, .. } => {
+                        all_cache_hits = false;
+                        stats.pages_fetched += 1;
+                        let count = data.len();
+
+                        if let Some(db) = db
+                            && let Err(e) = api_cache::upsert_with_pagination(
+                                db,
+                                self.instance_id(),
+                                config.endpoint_type,
+                                &cache_key,
+                                etag,
+                                None,
+                            )
+                            .await
                         {
                             tracing::debug!("api cache upsert failed: {e}");
                         }
-                    }
 
-                    all_items.extend(items);
+                        all_items.extend(data);
 
-                    emit(
-                        on_progress,
-                        SyncProgress::FetchedPage {
-                            namespace: config.namespace.to_string(),
-                            page,
-                            count,
-                            total_so_far: all_items.len(),
-                            expected_pages: known_total_pages,
-                        },
-                    );
+                        emit(
+                            on_progress,
+                            SyncProgress::FetchedPage {
+                                namespace: config.namespace.to_string(),
+                                page,
+                                count,
+                                total_so_far: all_items.len(),
+                                expected_pages: known_total_pages,
+                            },
+                        );
 
-                    // Check if we should continue
-                    if let Some(total) = known_total_pages {
-                        if page < total {
-                            page += 1;
-                            continue;
+                        if count < 100 {
+                            break;
                         }
-                        break;
-                    }
 
-                    // No pagination info - use count-based heuristic
-                    if count < 100 {
-                        break;
+                        page += 1;
                     }
-
-                    page += 1;
                 }
             }
         }

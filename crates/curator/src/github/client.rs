@@ -387,28 +387,25 @@ impl GitHubClient {
 
     /// List organization repositories with ETag caching support.
     ///
-    /// This method supports conditional requests using ETags to avoid
-    /// refetching unchanged data. When a database connection is provided,
-    /// it will:
-    /// - Check for cached ETags before each page fetch
-    /// - Skip fetching if the server returns 304 Not Modified
-    /// - Store new ETags and pagination info after successful fetches
-    /// - Continue checking all pages using stored pagination metadata
-    ///
-    /// # Arguments
-    ///
-    /// * `org` - The organization name
-    /// * `db` - Optional database connection for ETag caching
-    /// * `on_progress` - Optional progress callback
-    ///
-    /// # Returns
-    ///
-    /// A tuple of `(repos, cache_stats)` where `cache_stats` indicates
-    /// how many pages were cache hits vs fetched.
+    /// Uses sequential page fetching. For concurrent pagination use
+    /// `list_org_repos_cached_with_concurrency`.
     pub async fn list_org_repos_cached(
         &self,
         org: &str,
         db: Option<&sea_orm::DatabaseConnection>,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
+        self.list_org_repos_cached_with_concurrency(org, db, 1, on_progress)
+            .await
+    }
+
+    /// List organization repositories with ETag caching support and explicit
+    /// page concurrency.
+    pub async fn list_org_repos_cached_with_concurrency(
+        &self,
+        org: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
         use super::pagination::PaginatedFetchConfig;
@@ -420,7 +417,12 @@ impl GitHubClient {
         let config = PaginatedFetchConfig::org_repos(org, total_repos);
 
         let result = self
-            .fetch_pages::<octocrab::models::Repository>(&config, db, on_progress)
+            .fetch_pages_with_concurrency::<octocrab::models::Repository>(
+                &config,
+                db,
+                concurrency,
+                on_progress,
+            )
             .await?;
 
         // Convert to PlatformRepo
@@ -506,28 +508,25 @@ impl GitHubClient {
 
     /// List user repositories with ETag caching support.
     ///
-    /// This method supports conditional requests using ETags to avoid
-    /// refetching unchanged data. When a database connection is provided,
-    /// it will:
-    /// - Check for cached ETags before each page fetch
-    /// - Skip fetching if the server returns 304 Not Modified
-    /// - Store new ETags and pagination info after successful fetches
-    /// - Continue checking all pages using stored pagination metadata
-    ///
-    /// # Arguments
-    ///
-    /// * `username` - The username whose repositories to fetch
-    /// * `db` - Optional database connection for ETag caching
-    /// * `on_progress` - Optional progress callback
-    ///
-    /// # Returns
-    ///
-    /// A tuple of `(repos, cache_stats)` where `cache_stats` indicates
-    /// how many pages were cache hits vs fetched.
+    /// Uses sequential page fetching. For concurrent pagination use
+    /// `list_user_repos_cached_with_concurrency`.
     pub async fn list_user_repos_cached(
         &self,
         username: &str,
         db: Option<&sea_orm::DatabaseConnection>,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
+        self.list_user_repos_cached_with_concurrency(username, db, 1, on_progress)
+            .await
+    }
+
+    /// List user repositories with ETag caching support and explicit page
+    /// concurrency.
+    pub async fn list_user_repos_cached_with_concurrency(
+        &self,
+        username: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<(Vec<PlatformRepo>, CacheStats)> {
         use super::pagination::PaginatedFetchConfig;
@@ -547,7 +546,12 @@ impl GitHubClient {
         let config = PaginatedFetchConfig::user_repos(username, total_repos);
 
         let result = self
-            .fetch_pages::<octocrab::models::Repository>(&config, db, on_progress)
+            .fetch_pages_with_concurrency::<octocrab::models::Repository>(
+                &config,
+                db,
+                concurrency,
+                on_progress,
+            )
             .await?;
 
         // Convert to PlatformRepo
@@ -720,82 +724,23 @@ impl PlatformClient for GitHubClient {
         db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
-        // Use cached version if database connection is provided
-        if let Some(db) = db {
-            let (repos, _stats) = self
-                .list_org_repos_cached(org, Some(db), on_progress)
-                .await?;
-            return Ok(repos);
-        }
+        let (repos, _stats) = self
+            .list_org_repos_cached_with_concurrency(org, db, 1, on_progress)
+            .await?;
+        Ok(repos)
+    }
 
-        // Non-cached fallback
-        let mut all_repos = Vec::new();
-        let mut page = 1u32;
-
-        // Get org info to know total repos upfront
-        let org_info = self.get_org_info(org).await.ok();
-        let total_repos = org_info.as_ref().map(|i| i.public_repos);
-
-        emit(
-            on_progress,
-            SyncProgress::FetchingRepos {
-                namespace: org.to_string(),
-                total_repos,
-                expected_pages: total_repos.map(|t| t.div_ceil(100) as u32),
-            },
-        );
-
-        loop {
-            // Check rate limit before making request
-            check_rate_limit(&self.inner)
-                .await
-                .map_err(PlatformError::from)?;
-
-            let page_result = self
-                .inner
-                .orgs(org)
-                .list_repos()
-                .per_page(100)
-                .page(page)
-                .send()
-                .await
-                .map_err(|e| PlatformError::api(e.to_string()))?;
-
-            let repos: Vec<_> = page_result.items;
-            let count = repos.len();
-
-            // Convert to PlatformRepo
-            let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
-            all_repos.extend(platform_repos);
-
-            emit(
-                on_progress,
-                SyncProgress::FetchedPage {
-                    namespace: org.to_string(),
-                    page,
-                    count,
-                    total_so_far: all_repos.len(),
-                    expected_pages: None,
-                },
-            );
-
-            // If we got fewer than 100, we've reached the end
-            if count < 100 {
-                break;
-            }
-
-            page += 1;
-        }
-
-        emit(
-            on_progress,
-            SyncProgress::FetchComplete {
-                namespace: org.to_string(),
-                total: all_repos.len(),
-            },
-        );
-
-        Ok(all_repos)
+    async fn list_org_repos_with_concurrency(
+        &self,
+        org: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<Vec<PlatformRepo>> {
+        let (repos, _stats) = self
+            .list_org_repos_cached_with_concurrency(org, db, concurrency, on_progress)
+            .await?;
+        Ok(repos)
     }
 
     async fn list_user_repos(
@@ -804,87 +749,23 @@ impl PlatformClient for GitHubClient {
         db: Option<&sea_orm::DatabaseConnection>,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
-        // Use cached version if database connection is provided
-        if let Some(db) = db {
-            let (repos, _stats) = self
-                .list_user_repos_cached(username, Some(db), on_progress)
-                .await?;
-            return Ok(repos);
-        }
+        let (repos, _stats) = self
+            .list_user_repos_cached_with_concurrency(username, db, 1, on_progress)
+            .await?;
+        Ok(repos)
+    }
 
-        // Non-cached fallback
-        let mut all_repos = Vec::new();
-        let mut page = 1u32;
-
-        // Get user info to know total repos upfront
-        let user_info: Option<serde_json::Value> = self
-            .inner
-            .get(format!("/users/{}", username), None::<&()>)
-            .await
-            .ok();
-        let total_repos = user_info
-            .as_ref()
-            .and_then(|u| u.get("public_repos"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-
-        emit(
-            on_progress,
-            SyncProgress::FetchingRepos {
-                namespace: username.to_string(),
-                total_repos,
-                expected_pages: total_repos.map(|t| t.div_ceil(100) as u32),
-            },
-        );
-
-        loop {
-            // Check rate limit before making request
-            check_rate_limit(&self.inner)
-                .await
-                .map_err(PlatformError::from)?;
-
-            // GET /users/{username}/repos - lists public repos for the user
-            let route = format!("/users/{}/repos?per_page=100&page={}", username, page);
-            let repos: Vec<octocrab::models::Repository> = self
-                .inner
-                .get(&route, None::<&()>)
-                .await
-                .map_err(|e| PlatformError::api(e.to_string()))?;
-
-            let count = repos.len();
-
-            // Convert to PlatformRepo
-            let platform_repos: Vec<PlatformRepo> = repos.iter().map(to_platform_repo).collect();
-            all_repos.extend(platform_repos);
-
-            emit(
-                on_progress,
-                SyncProgress::FetchedPage {
-                    namespace: username.to_string(),
-                    page,
-                    count,
-                    total_so_far: all_repos.len(),
-                    expected_pages: None,
-                },
-            );
-
-            // If we got fewer than 100, we've reached the end
-            if count < 100 {
-                break;
-            }
-
-            page += 1;
-        }
-
-        emit(
-            on_progress,
-            SyncProgress::FetchComplete {
-                namespace: username.to_string(),
-                total: all_repos.len(),
-            },
-        );
-
-        Ok(all_repos)
+    async fn list_user_repos_with_concurrency(
+        &self,
+        username: &str,
+        db: Option<&sea_orm::DatabaseConnection>,
+        concurrency: usize,
+        on_progress: Option<&platform::ProgressCallback>,
+    ) -> platform::Result<Vec<PlatformRepo>> {
+        let (repos, _stats) = self
+            .list_user_repos_cached_with_concurrency(username, db, concurrency, on_progress)
+            .await?;
+        Ok(repos)
     }
 
     async fn is_repo_starred(&self, owner: &str, name: &str) -> platform::Result<bool> {
