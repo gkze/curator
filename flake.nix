@@ -158,6 +158,10 @@
           rust-overlay.overlays.default
         ];
 
+        # Set explicit pname so flakelight doesn't need to infer default package
+        # name from mocked pkgs during overlay schema checks.
+        pname = "curator";
+
         package =
           { pkgs, ... }:
           let
