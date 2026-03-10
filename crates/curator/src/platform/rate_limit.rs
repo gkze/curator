@@ -300,4 +300,39 @@ mod tests {
         });
         limiter.wait().await;
     }
+
+    #[test]
+    fn adaptive_rate_limiter_exposes_quota_and_current_rps_helpers() {
+        let quota = AdaptiveRateLimiter::quota_for_rps(0.0001);
+        let _ = quota;
+
+        let limiter = AdaptiveRateLimiter::new(1000);
+        assert!((0.5..=50.0).contains(&limiter.current_rps()));
+
+        let info = RateLimitInfo {
+            limit: 5000,
+            remaining: 50,
+            reset_at: Utc::now() + ChronoDuration::seconds(10),
+            retry_after: Some(Duration::from_millis(10)),
+        };
+        limiter.update(&info);
+        assert!((0.5..=50.0).contains(&limiter.current_rps()));
+    }
+
+    #[tokio::test]
+    async fn adaptive_rate_limiter_wait_clears_expired_retry_after() {
+        let limiter = AdaptiveRateLimiter::new(5);
+        limiter.update(&RateLimitInfo {
+            limit: 5000,
+            remaining: 100,
+            reset_at: Utc::now() + ChronoDuration::seconds(30),
+            retry_after: Some(Duration::from_millis(1)),
+        });
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        limiter.wait().await;
+
+        let state = limiter.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(state.retry_until.is_none());
+    }
 }

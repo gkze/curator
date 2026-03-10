@@ -374,6 +374,32 @@ pub async fn request_device_code_default(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn spawn_http_server(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer);
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        format!("http://{}", addr)
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
 
     #[test]
     fn test_client_id_is_set() {
@@ -468,6 +494,37 @@ mod tests {
     }
 
     #[test]
+    fn test_access_token_response_debug_redacts_secrets() {
+        let response = AccessTokenResponse {
+            access_token: "secret-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: Some(60),
+            scope: Some("api".to_string()),
+            created_at: Some(1),
+            refresh_token: Some("refresh-secret".to_string()),
+        };
+
+        let debug = format!("{response:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("refresh-secret"));
+    }
+
+    #[test]
+    fn test_device_code_response_deserialize_without_complete_uri() {
+        let json = r#"{
+            "device_code": "abc",
+            "user_code": "1234",
+            "verification_uri": "https://gitlab.com/oauth/device",
+            "expires_in": 300,
+            "interval": 5
+        }"#;
+
+        let response: DeviceCodeResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.verification_uri_complete, None);
+    }
+
+    #[test]
     fn test_token_expires_at_calculation() {
         let token = AccessTokenResponse {
             access_token: "t".into(),
@@ -541,5 +598,81 @@ mod tests {
             response.error_description.as_deref(),
             Some("The authorization request is still pending.")
         );
+    }
+
+    #[test]
+    fn test_token_response_deserializes_success_and_error_variants() {
+        let success: TokenResponse =
+            serde_json::from_str(r#"{"access_token":"TOKEN","token_type":"Bearer"}"#).unwrap();
+        assert!(matches!(success, TokenResponse::Success(_)));
+
+        let error: TokenResponse =
+            serde_json::from_str(r#"{"error":"access_denied","error_description":"denied"}"#)
+                .unwrap();
+        assert!(matches!(error, TokenResponse::Error(_)));
+    }
+
+    #[test]
+    fn test_base_url_trims_multiple_trailing_slashes() {
+        assert_eq!(
+            base_url("gitlab.example.com///"),
+            "https://gitlab.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_device_code_success_and_error() {
+        let ok_body = r#"{"device_code":"abc","user_code":"123","verification_uri":"https://gitlab.example/device","expires_in":300,"interval":1}"#;
+        let host = spawn_http_server(vec![http_response("200 OK", ok_body)]);
+        let response = request_device_code(&host, "cid", "api").await.unwrap();
+        assert_eq!(response.device_code, "abc");
+
+        let host = spawn_http_server(vec![http_response("400 Bad Request", r#"{"error":"bad"}"#)]);
+        let err = request_device_code(&host, "cid", "api").await.unwrap_err();
+        assert!(err.to_string().contains("Failed to get device code"));
+    }
+
+    #[tokio::test]
+    async fn test_poll_for_token_handles_pending_then_success() {
+        let host = spawn_http_server(vec![
+            http_response(
+                "400 Bad Request",
+                r#"{"error":"authorization_pending","error_description":"wait"}"#,
+            ),
+            http_response(
+                "200 OK",
+                r#"{"access_token":"TOKEN","token_type":"Bearer"}"#,
+            ),
+        ]);
+        let device_code = DeviceCodeResponse {
+            device_code: "abc".to_string(),
+            user_code: "123".to_string(),
+            verification_uri: "https://gitlab.example/device".to_string(),
+            verification_uri_complete: None,
+            expires_in: 5,
+            interval: 0,
+        };
+
+        let response = poll_for_token(&host, "cid", &device_code).await.unwrap();
+        assert_eq!(response.access_token, "TOKEN");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_access_token_success_and_error_variant() {
+        let host = spawn_http_server(vec![http_response(
+            "200 OK",
+            r#"{"access_token":"TOKEN","token_type":"Bearer","refresh_token":"REFRESH"}"#,
+        )]);
+        let response = refresh_access_token(&host, "cid", "refresh").await.unwrap();
+        assert_eq!(response.refresh_token.as_deref(), Some("REFRESH"));
+
+        let host = spawn_http_server(vec![http_response(
+            "200 OK",
+            r#"{"error":"invalid_grant","error_description":"nope"}"#,
+        )]);
+        let err = refresh_access_token(&host, "cid", "refresh")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nope"));
     }
 }

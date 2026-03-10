@@ -168,4 +168,59 @@ mod tests {
         let err = GiteaError::OrgNotFound("test-org".to_string());
         assert_eq!(short_error_message(&err), "Org not found: test-org");
     }
+
+    #[test]
+    fn test_platform_conversion_covers_remaining_variants() {
+        let http: PlatformError = GiteaError::Http("boom".into()).into();
+        assert!(matches!(http, PlatformError::Network { .. }));
+
+        let api_auth: PlatformError = GiteaError::Api {
+            status: 401,
+            message: "unauthorized".into(),
+        }
+        .into();
+        assert!(matches!(api_auth, PlatformError::AuthRequired));
+
+        let api_rate: PlatformError = GiteaError::Api {
+            status: 429,
+            message: "slow down".into(),
+        }
+        .into();
+        assert!(matches!(api_rate, PlatformError::RateLimited { .. }));
+
+        let org: PlatformError = GiteaError::OrgNotFound("org".into()).into();
+        assert!(matches!(org, PlatformError::NotFound { .. }));
+
+        let repo: PlatformError = GiteaError::RepoNotFound("repo".into()).into();
+        assert!(matches!(repo, PlatformError::NotFound { .. }));
+
+        let config: PlatformError = GiteaError::Config("bad".into()).into();
+        assert!(matches!(config, PlatformError::Internal { .. }));
+    }
+
+    #[test]
+    fn test_short_error_message_covers_http_json_and_truncation() {
+        assert_eq!(
+            short_error_message(&GiteaError::Http("timeout".into())),
+            "Network error"
+        );
+
+        let json_err = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert_eq!(
+            short_error_message(&GiteaError::Json(json_err)),
+            "JSON parse error"
+        );
+
+        let long = GiteaError::Api {
+            status: 500,
+            message: "x".repeat(80),
+        };
+        assert!(short_error_message(&long).ends_with("..."));
+
+        let repo = GiteaError::RepoNotFound("repo".into());
+        assert_eq!(short_error_message(&repo), "Repo not found: repo");
+
+        let config = GiteaError::Config("broken".into());
+        assert_eq!(short_error_message(&config), "Config: broken");
+    }
 }

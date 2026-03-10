@@ -161,4 +161,29 @@ mod tests {
         let err = GitLabError::from_status_code(500, "internal server error");
         assert!(matches!(err, GitLabError::Api(_)));
     }
+
+    #[test]
+    fn test_api_constructor_and_platform_conversions_cover_all_variants() {
+        assert!(matches!(GitLabError::api("oops"), GitLabError::Api(_)));
+
+        let group: PlatformError = GitLabError::GroupNotFound("team".into()).into();
+        assert!(matches!(group, PlatformError::NotFound { .. }));
+
+        let project: PlatformError = GitLabError::ProjectNotFound("repo".into()).into();
+        assert!(matches!(project, PlatformError::NotFound { .. }));
+
+        let api: PlatformError = GitLabError::Api("api msg".into()).into();
+        assert!(matches!(api, PlatformError::Api { .. }));
+
+        let http: PlatformError = GitLabError::Http("net".into()).into();
+        assert!(matches!(http, PlatformError::Api { .. }));
+
+        let deser: PlatformError = GitLabError::Deserialize("bad json".into()).into();
+        assert!(matches!(deser, PlatformError::Internal { .. }));
+    }
+
+    #[test]
+    fn test_is_rate_limit_error_rejects_http_variant() {
+        assert!(!is_rate_limit_error(&GitLabError::Http("timeout".into())));
+    }
 }

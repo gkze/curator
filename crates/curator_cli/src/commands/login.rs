@@ -15,6 +15,7 @@ use curator::{
 };
 
 use crate::config::Config;
+use crate::credentials::{StoredCredential, save_credential};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoginMethod {
@@ -62,11 +63,11 @@ pub async fn handle_login(
     // Dispatch to the appropriate OAuth flow based on platform type
     match instance.platform_type {
         #[cfg(feature = "github")]
-        PlatformType::GitHub => login_github(&instance, config, is_tty).await?,
+        PlatformType::GitHub => login_github(&instance, db, config, is_tty).await?,
         #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => login_gitlab(&instance, config, is_tty).await?,
+        PlatformType::GitLab => login_gitlab(&instance, db, config, is_tty).await?,
         #[cfg(feature = "gitea")]
-        PlatformType::Gitea => login_gitea(&instance, config, is_tty).await?,
+        PlatformType::Gitea => login_gitea(&instance, db, config, is_tty).await?,
         #[cfg(not(feature = "github"))]
         PlatformType::GitHub => {
             return Err(crate::commands::shared::unsupported_platform_error(
@@ -144,7 +145,8 @@ async fn get_or_create_instance(
 #[cfg(feature = "github")]
 async fn login_github(
     instance: &InstanceModel,
-    _config: &Config,
+    db: &DatabaseConnection,
+    config: &Config,
     is_tty: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use curator::github::oauth::{poll_for_token, request_device_code_default};
@@ -203,24 +205,33 @@ async fn login_github(
                     }
                 };
 
-                let config_path = Config::save_github_token(&token_response.access_token)?;
+                let location = save_credential(
+                    instance,
+                    &StoredCredential {
+                        access_token: token_response.access_token,
+                        refresh_token: None,
+                        token_expires_at: None,
+                        auth_kind: "oauth".to_string(),
+                        token_type: Some(token_response.token_type),
+                    },
+                    config,
+                    db,
+                )
+                .await?;
 
                 if is_tty {
                     println!();
                     println!(
-                        "{} GitHub token saved to: {}",
+                        "{} GitHub credential saved to: {}",
                         style("✓").green().bold(),
-                        config_path.display()
+                        location.describe()
                     );
                     println!();
                     println!("You can now use curator commands like:");
                     println!("  curator sync stars github");
                     println!("  curator sync org github <org-name>");
                 } else {
-                    tracing::info!(
-                        config_path = %config_path.display(),
-                        "GitHub authentication successful"
-                    );
+                    tracing::info!(location = %location.describe(), "GitHub authentication successful");
                 }
 
                 return Ok(());
@@ -235,13 +246,25 @@ async fn login_github(
                     is_tty,
                 )?;
 
-                let config_path = Config::save_github_token(&token)?;
+                let location = save_credential(
+                    instance,
+                    &StoredCredential {
+                        access_token: token,
+                        refresh_token: None,
+                        token_expires_at: None,
+                        auth_kind: "pat".to_string(),
+                        token_type: None,
+                    },
+                    config,
+                    db,
+                )
+                .await?;
                 if is_tty {
                     println!();
                     println!(
-                        "{} GitHub token saved to: {}",
+                        "{} GitHub credential saved to: {}",
                         style("✓").green().bold(),
-                        config_path.display()
+                        location.describe()
                     );
                 }
                 return Ok(());
@@ -260,7 +283,8 @@ async fn login_github(
 #[cfg(feature = "gitlab")]
 async fn login_gitlab(
     instance: &InstanceModel,
-    _config: &Config,
+    db: &DatabaseConnection,
+    config: &Config,
     is_tty: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use curator::gitlab::oauth;
@@ -324,20 +348,28 @@ async fn login_gitlab(
                     };
 
                 let expires_at = oauth::token_expires_at(&token_response);
-                let config_path = Config::save_gitlab_oauth_tokens(
-                    &token_response.access_token,
-                    token_response.refresh_token.as_deref(),
-                    expires_at,
-                )?;
+                let location = save_credential(
+                    instance,
+                    &StoredCredential {
+                        access_token: token_response.access_token,
+                        refresh_token: token_response.refresh_token,
+                        token_expires_at: expires_at,
+                        auth_kind: "oauth".to_string(),
+                        token_type: Some(token_response.token_type),
+                    },
+                    config,
+                    db,
+                )
+                .await?;
 
                 if is_tty {
                     println!();
                     println!(
-                        "{} GitLab token saved to: {}",
+                        "{} GitLab credential saved to: {}",
                         style("✓").green().bold(),
-                        config_path.display()
+                        location.describe()
                     );
-                    if token_response.refresh_token.is_some() {
+                    if expires_at.is_some() {
                         println!("Token will be automatically refreshed when it expires.");
                     }
                     println!();
@@ -345,10 +377,7 @@ async fn login_gitlab(
                     println!("  curator sync stars {}", instance.name);
                     println!("  curator sync org {} <group-path>", instance.name);
                 } else {
-                    tracing::info!(
-                        config_path = %config_path.display(),
-                        "GitLab authentication successful"
-                    );
+                    tracing::info!(location = %location.describe(), "GitLab authentication successful");
                 }
 
                 return Ok(());
@@ -366,13 +395,25 @@ async fn login_gitlab(
                     is_tty,
                 )?;
 
-                let config_path = Config::save_gitlab_oauth_tokens(&token, None, None)?;
+                let location = save_credential(
+                    instance,
+                    &StoredCredential {
+                        access_token: token,
+                        refresh_token: None,
+                        token_expires_at: None,
+                        auth_kind: "pat".to_string(),
+                        token_type: None,
+                    },
+                    config,
+                    db,
+                )
+                .await?;
                 if is_tty {
                     println!();
                     println!(
-                        "{} GitLab token saved to: {}",
+                        "{} GitLab credential saved to: {}",
                         style("✓").green().bold(),
-                        config_path.display()
+                        location.describe()
                     );
                 }
                 return Ok(());
@@ -394,7 +435,8 @@ async fn login_gitlab(
 #[cfg(feature = "gitea")]
 async fn login_gitea(
     instance: &InstanceModel,
-    _config: &Config,
+    db: &DatabaseConnection,
+    config: &Config,
     is_tty: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use curator::gitea::oauth;
@@ -429,29 +471,38 @@ async fn login_gitea(
 
                 let expires_at = oauth::token_expires_at(&token_response);
 
-                let config_path = if instance.is_codeberg() {
-                    Config::save_codeberg_oauth_tokens(
-                        &token_response.access_token,
-                        token_response.refresh_token.as_deref(),
-                        expires_at,
-                    )?
-                } else {
-                    Config::save_gitea_token(&instance.host, &token_response.access_token)?
-                };
+                let location = save_credential(
+                    instance,
+                    &StoredCredential {
+                        access_token: token_response.access_token,
+                        refresh_token: token_response.refresh_token,
+                        token_expires_at: expires_at,
+                        auth_kind: if instance.is_codeberg() {
+                            "oauth"
+                        } else {
+                            "pat"
+                        }
+                        .to_string(),
+                        token_type: Some(token_response.token_type),
+                    },
+                    config,
+                    db,
+                )
+                .await?;
 
                 if is_tty {
                     println!();
                     println!(
-                        "{} {} token saved to: {}",
+                        "{} {} credential saved to: {}",
                         style("✓").green().bold(),
                         if instance.is_codeberg() {
                             "Codeberg"
                         } else {
                             "Gitea/Forgejo"
                         },
-                        config_path.display()
+                        location.describe()
                     );
-                    if instance.is_codeberg() && token_response.refresh_token.is_some() {
+                    if instance.is_codeberg() && expires_at.is_some() {
                         println!("Token will be automatically refreshed when it expires.");
                     }
                     println!();
@@ -460,7 +511,7 @@ async fn login_gitea(
                     println!("  curator sync org {} <org-name>", instance.name);
                 } else {
                     tracing::info!(
-                        config_path = %config_path.display(),
+                        location = %location.describe(),
                         host = %instance.host,
                         "Gitea authentication successful"
                     );
@@ -496,19 +547,27 @@ async fn login_gitea(
                     is_tty,
                 )?;
 
-                let config_path = if instance.is_codeberg() {
-                    Config::save_codeberg_oauth_tokens(&token, None, None)?
-                } else {
-                    Config::save_gitea_token(&instance.host, &token)?
-                };
+                let location = save_credential(
+                    instance,
+                    &StoredCredential {
+                        access_token: token,
+                        refresh_token: None,
+                        token_expires_at: None,
+                        auth_kind: "pat".to_string(),
+                        token_type: None,
+                    },
+                    config,
+                    db,
+                )
+                .await?;
 
                 if is_tty {
                     println!();
                     println!(
-                        "{} {} token saved to: {}",
+                        "{} {} credential saved to: {}",
                         style("✓").green().bold(),
                         provider,
-                        config_path.display()
+                        location.describe()
                     );
                 }
                 return Ok(());
@@ -574,22 +633,26 @@ mod tests {
 
     use crate::test_support::env_lock;
 
-    fn assert_config_value(path: &std::path::Path, section: &str, key: &str, expected: &str) {
-        let config_contents =
-            fs::read_to_string(path).expect("login flow should write config file");
-        let document = config_contents
+    fn assert_auth_value(path: &std::path::Path, instance: &str, key: &str, expected: &str) {
+        let auth_contents = fs::read_to_string(path).expect("login flow should write auth file");
+        let document = auth_contents
             .parse::<DocumentMut>()
-            .expect("config file should remain valid toml");
+            .expect("auth file should remain valid toml");
 
-        let section = document
-            .get(section)
+        let instances = document
+            .get("instances")
             .and_then(|value| value.as_table())
-            .expect("config file should include expected section");
+            .expect("auth file should include instances table");
+
+        let section = instances
+            .get(instance)
+            .and_then(|value| value.as_table())
+            .expect("auth file should include expected instance table");
 
         let actual = section
             .get(key)
             .and_then(|value| value.as_str())
-            .expect("config value should be a string");
+            .expect("auth value should be a string");
 
         assert_eq!(actual, expected);
     }
@@ -623,9 +686,8 @@ mod tests {
                 previous_xdg_config_home,
             }
         }
-
-        fn config_path(&self) -> std::path::PathBuf {
-            Config::default_config_path().expect("config path should be available")
+        fn auth_path(&self) -> std::path::PathBuf {
+            self.temp_dir.join("curator").join("auth.toml")
         }
     }
 
@@ -1060,14 +1122,22 @@ mod tests {
             std::env::set_var("CURATOR_GITHUB_TOKEN", "gh_test_token");
         }
 
-        let result = handle_login(&instance.name, &db, &Config::default()).await;
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(config_env.auth_path().display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        let result = handle_login(&instance.name, &db, &config).await;
         assert!(
             result.is_ok(),
             "github token flow should succeed: {result:?}"
         );
 
-        let config_path = config_env.config_path();
-        assert_config_value(&config_path, "github", "token", "gh_test_token");
+        let auth_path = config_env.auth_path();
+        assert_auth_value(&auth_path, "github", "access_token", "gh_test_token");
 
         unsafe {
             std::env::remove_var("CURATOR_GITHUB_TOKEN");
@@ -1088,14 +1158,22 @@ mod tests {
             std::env::set_var("CURATOR_GITLAB_TOKEN", "gl_test_token");
         }
 
-        let result = handle_login(&instance.name, &db, &Config::default()).await;
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(config_env.auth_path().display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        let result = handle_login(&instance.name, &db, &config).await;
         assert!(
             result.is_ok(),
             "gitlab token flow should succeed: {result:?}"
         );
 
-        let config_path = config_env.config_path();
-        assert_config_value(&config_path, "gitlab", "token", "gl_test_token");
+        let auth_path = config_env.auth_path();
+        assert_auth_value(&auth_path, "gitlab", "access_token", "gl_test_token");
 
         unsafe {
             std::env::remove_var("CURATOR_GITLAB_TOKEN");
@@ -1117,15 +1195,27 @@ mod tests {
             std::env::set_var("CURATOR_GITEA_TOKEN", "gitea_test_token");
         }
 
-        let result = handle_login(&instance.name, &db, &Config::default()).await;
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(config_env.auth_path().display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        let result = handle_login(&instance.name, &db, &config).await;
         assert!(
             result.is_ok(),
             "gitea token flow should succeed: {result:?}"
         );
 
-        let config_path = config_env.config_path();
-        assert_config_value(&config_path, "gitea", "token", "gitea_test_token");
-        assert_config_value(&config_path, "gitea", "host", "gitea.example");
+        let auth_path = config_env.auth_path();
+        assert_auth_value(
+            &auth_path,
+            "login-gitea",
+            "access_token",
+            "gitea_test_token",
+        );
 
         unsafe {
             std::env::remove_var("CURATOR_GITEA_TOKEN");
@@ -1146,17 +1236,441 @@ mod tests {
             std::env::set_var("CURATOR_CODEBERG_TOKEN", "codeberg_test_token");
         }
 
-        let result = handle_login(&instance.name, &db, &Config::default()).await;
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(config_env.auth_path().display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        let result = handle_login(&instance.name, &db, &config).await;
         assert!(
             result.is_ok(),
             "codeberg token flow should succeed: {result:?}"
         );
 
-        let config_path = config_env.config_path();
-        assert_config_value(&config_path, "codeberg", "token", "codeberg_test_token");
+        let auth_path = config_env.auth_path();
+        assert_auth_value(
+            &auth_path,
+            "codeberg",
+            "access_token",
+            "codeberg_test_token",
+        );
 
         unsafe {
             std::env::remove_var("CURATOR_CODEBERG_TOKEN");
         }
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn handle_login_gitlab_auto_without_client_id_falls_back_to_pat() {
+        let config_env = TempConfigEnv::new("gitlab-auto-pat");
+        let db = setup_db("gitlab-auto-pat").await;
+        let instance = sample_instance(
+            "work-gitlab-auto",
+            "auto",
+            PlatformType::GitLab,
+            "gitlab.auto.test",
+        );
+        insert_instance(&db, &instance).await;
+
+        unsafe {
+            std::env::set_var("CURATOR_GITLAB_TOKEN", "gl_auto_token");
+        }
+
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(config_env.auth_path().display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        handle_login(&instance.name, &db, &config).await.unwrap();
+
+        assert_auth_value(
+            &config_env.auth_path(),
+            "work-gitlab-auto",
+            "access_token",
+            "gl_auto_token",
+        );
+
+        unsafe {
+            std::env::remove_var("CURATOR_GITLAB_TOKEN");
+        }
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn login_github_returns_no_supported_method_for_non_github_device_only_instance() {
+        let db = setup_db("github-no-supported-method").await;
+        let instance = sample_instance(
+            "ghe-device-only",
+            "device",
+            PlatformType::GitHub,
+            "github.enterprise.test",
+        );
+
+        let err = login_github(&instance, &db, &Config::default(), false)
+            .await
+            .expect_err("non-github device-only instance should fail");
+        assert!(err.to_string().contains("No token provided for GitHub"));
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn login_gitlab_returns_guidance_when_no_client_id_or_token() {
+        let _guard = env_lock().lock().await;
+        let db = setup_db("gitlab-no-method").await;
+        let instance = sample_instance(
+            "gitlab-missing-auth",
+            "device",
+            PlatformType::GitLab,
+            "gitlab.missing.test",
+        );
+        unsafe {
+            std::env::remove_var("CURATOR_GITLAB_TOKEN");
+        }
+
+        let err = login_gitlab(&instance, &db, &Config::default(), false)
+            .await
+            .expect_err("missing gitlab auth inputs should fail");
+        assert!(err.to_string().contains("No token provided for GitLab"));
+    }
+
+    #[cfg(feature = "gitea")]
+    #[tokio::test]
+    async fn login_gitea_returns_guidance_when_no_client_id_or_token() {
+        let _guard = env_lock().lock().await;
+        let db = setup_db("gitea-no-method").await;
+        let instance = sample_instance(
+            "forgejo-missing-auth",
+            "pkce",
+            PlatformType::Gitea,
+            "forgejo.missing.test",
+        );
+        unsafe {
+            std::env::remove_var("CURATOR_GITEA_TOKEN");
+        }
+
+        let err = login_gitea(&instance, &db, &Config::default(), false)
+            .await
+            .expect_err("missing gitea auth inputs should fail");
+        assert!(
+            err.to_string()
+                .contains("No token provided for Gitea/Forgejo")
+        );
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn handle_login_github_auto_without_device_support_falls_back_to_pat() {
+        let _guard = env_lock().lock().await;
+        let config_env = TempConfigEnv::new("github-auto-pat");
+        let db = setup_db("github-auto-pat").await;
+        let instance = sample_instance(
+            "work-ghe",
+            "auto",
+            PlatformType::GitHub,
+            "github.enterprise.test",
+        );
+        insert_instance(&db, &instance).await;
+
+        unsafe {
+            std::env::set_var("CURATOR_GITHUB_TOKEN", "gh_enterprise_token");
+        }
+
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(config_env.auth_path().display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        handle_login(&instance.name, &db, &config).await.unwrap();
+        assert_auth_value(
+            &config_env.auth_path(),
+            "work-ghe",
+            "access_token",
+            "gh_enterprise_token",
+        );
+
+        unsafe {
+            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+        }
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn handle_login_gitlab_token_flow_with_env_token() {
+        let _guard = env_lock().lock().await;
+        let config_env = TempConfigEnv::new("gitlab-token-flow");
+        let db = setup_db("gitlab-token-flow").await;
+        let instance = sample_instance(
+            "gitlab-token",
+            "token",
+            PlatformType::GitLab,
+            "gitlab.token.test",
+        );
+        insert_instance(&db, &instance).await;
+
+        unsafe {
+            std::env::set_var("CURATOR_GITLAB_TOKEN", "gitlab_pat_token");
+        }
+
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(config_env.auth_path().display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        handle_login(&instance.name, &db, &config).await.unwrap();
+        assert_auth_value(
+            &config_env.auth_path(),
+            "gitlab-token",
+            "access_token",
+            "gitlab_pat_token",
+        );
+
+        unsafe {
+            std::env::remove_var("CURATOR_GITLAB_TOKEN");
+        }
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn login_github_token_only_without_token_errors() {
+        let db = setup_db("github-token-missing").await;
+        let instance = sample_instance(
+            "github-token-missing",
+            "token",
+            PlatformType::GitHub,
+            "github.enterprise.test",
+        );
+
+        let err = login_github(&instance, &db, &Config::default(), false)
+            .await
+            .expect_err("github token-only flow without token should fail");
+        assert!(err.to_string().contains("No token provided for GitHub"));
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn login_gitlab_token_only_without_token_errors() {
+        let db = setup_db("gitlab-token-missing").await;
+        let instance = sample_instance(
+            "gitlab-token-missing",
+            "token",
+            PlatformType::GitLab,
+            "gitlab.missing.test",
+        );
+
+        let err = login_gitlab(&instance, &db, &Config::default(), false)
+            .await
+            .expect_err("gitlab token-only flow without token should fail");
+        assert!(err.to_string().contains("No token provided for GitLab"));
+    }
+
+    #[cfg(feature = "gitea")]
+    #[tokio::test]
+    async fn login_gitea_token_only_without_token_errors() {
+        let db = setup_db("gitea-token-missing").await;
+        let instance = sample_instance(
+            "gitea-token-missing",
+            "token",
+            PlatformType::Gitea,
+            "forgejo.missing.test",
+        );
+
+        let err = login_gitea(&instance, &db, &Config::default(), false)
+            .await
+            .expect_err("gitea token-only flow without token should fail");
+        assert!(
+            err.to_string()
+                .contains("No token provided for Gitea/Forgejo")
+        );
+    }
+
+    #[cfg(feature = "gitea")]
+    #[tokio::test]
+    async fn handle_login_gitea_auto_without_client_id_falls_back_to_pat() {
+        let _guard = env_lock().lock().await;
+        let config_env = TempConfigEnv::new("gitea-auto-pat");
+        let db = setup_db("gitea-auto-pat").await;
+        let instance = sample_instance(
+            "forgejo-auto",
+            "auto",
+            PlatformType::Gitea,
+            "forgejo.auto.test",
+        );
+        insert_instance(&db, &instance).await;
+
+        unsafe {
+            std::env::set_var("CURATOR_GITEA_TOKEN", "forgejo_pat_token");
+        }
+
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(config_env.auth_path().display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        handle_login(&instance.name, &db, &config).await.unwrap();
+        assert_auth_value(
+            &config_env.auth_path(),
+            "forgejo-auto",
+            "access_token",
+            "forgejo_pat_token",
+        );
+
+        unsafe {
+            std::env::remove_var("CURATOR_GITEA_TOKEN");
+        }
+    }
+
+    #[test]
+    fn login_method_order_handles_unknown_flow_as_auto() {
+        let instance = sample_instance("github", "unexpected", PlatformType::GitHub, "github.com");
+        assert_eq!(
+            login_method_order(&instance),
+            vec![LoginMethod::Device, LoginMethod::Pkce, LoginMethod::Token]
+        );
+    }
+
+    #[test]
+    fn resolve_client_id_returns_none_for_unknown_custom_instance() {
+        let instance = sample_instance(
+            "custom-gitlab",
+            "auto",
+            PlatformType::GitLab,
+            "gitlab.custom.test",
+        );
+        assert_eq!(resolve_client_id(&instance), None);
+    }
+
+    #[tokio::test]
+    async fn read_token_with_prompt_reads_and_trims_env_token() {
+        let _guard = env_lock().lock().await;
+        unsafe {
+            std::env::set_var("CURATOR_TEST_TOKEN", "  secret-token  ");
+        }
+
+        let token = read_token_with_prompt(
+            "CURATOR_TEST_TOKEN",
+            "TestProvider",
+            Some("https://example.com/tokens"),
+            "Test token",
+            false,
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("CURATOR_TEST_TOKEN");
+        }
+
+        assert_eq!(token, "secret-token");
+    }
+
+    #[tokio::test]
+    async fn read_token_with_prompt_rejects_missing_non_tty_env() {
+        let _guard = env_lock().lock().await;
+        unsafe {
+            std::env::remove_var("CURATOR_TEST_TOKEN");
+        }
+
+        let err = read_token_with_prompt(
+            "CURATOR_TEST_TOKEN",
+            "TestProvider",
+            None,
+            "Test token",
+            false,
+        )
+        .expect_err("missing non-tty token should fail");
+
+        assert!(
+            err.to_string()
+                .contains("No token provided for TestProvider")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_token_with_prompt_rejects_empty_env_token() {
+        let _guard = env_lock().lock().await;
+        unsafe {
+            std::env::set_var("CURATOR_TEST_TOKEN", "   ");
+        }
+
+        let err = read_token_with_prompt(
+            "CURATOR_TEST_TOKEN",
+            "TestProvider",
+            None,
+            "Test token",
+            false,
+        )
+        .expect_err("empty token should fail");
+
+        unsafe {
+            std::env::remove_var("CURATOR_TEST_TOKEN");
+        }
+
+        assert!(err.to_string().contains("Empty token provided"));
+    }
+
+    #[test]
+    fn login_method_order_for_gitea_device_flow_falls_back_to_token_only() {
+        let instance = sample_instance("forgejo", "device", PlatformType::Gitea, "forgejo.example");
+        assert_eq!(
+            login_method_order(&instance),
+            vec![LoginMethod::Device, LoginMethod::Pkce, LoginMethod::Token]
+        );
+    }
+
+    #[cfg(feature = "gitea")]
+    #[tokio::test]
+    async fn login_gitea_auto_without_pkce_support_falls_back_to_token_error() {
+        let db = setup_db("gitea-auto-no-token").await;
+        let instance = sample_instance(
+            "forgejo-auto-no-token",
+            "auto",
+            PlatformType::Gitea,
+            "forgejo.auto.test",
+        );
+
+        let err = login_gitea(&instance, &db, &Config::default(), false)
+            .await
+            .expect_err("gitea auto without token should fail");
+        assert!(
+            err.to_string()
+                .contains("No token provided for Gitea/Forgejo")
+        );
+    }
+
+    #[test]
+    fn read_token_with_prompt_trims_newlines_from_env_token() {
+        unsafe {
+            std::env::set_var("CURATOR_TEST_TOKEN", "token-with-newline\n");
+        }
+
+        let token = read_token_with_prompt(
+            "CURATOR_TEST_TOKEN",
+            "TestProvider",
+            None,
+            "Test token",
+            false,
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("CURATOR_TEST_TOKEN");
+        }
+
+        assert_eq!(token, "token-with-newline");
     }
 }

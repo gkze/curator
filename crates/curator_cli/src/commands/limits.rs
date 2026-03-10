@@ -10,7 +10,7 @@ use curator::PlatformType;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::commands::shared::find_instance_by_name;
 #[cfg(feature = "github")]
-use crate::commands::shared::get_token_for_instance;
+use crate::commands::shared::get_token_for_instance_with_db;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::config::Config;
 
@@ -43,7 +43,7 @@ pub(crate) async fn handle_limits(
         PlatformType::GitHub => {
             use curator::github::GitHubClient;
 
-            let token = get_token_for_instance(&instance, config).await?;
+            let token = get_token_for_instance_with_db(&instance, config, Some(db)).await?;
             let client = GitHubClient::new(&token, Uuid::nil(), None)?;
             let rate_limits = curator::github::get_rate_limits(client.inner()).await?;
             let items = github_rate_limits_to_display(&rate_limits.resources);
@@ -303,6 +303,9 @@ fn format_duration(duration: chrono::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
+    use uuid::Uuid;
 
     #[cfg(feature = "github")]
     fn sample_resource(
@@ -412,5 +415,104 @@ mod tests {
             .expect("json rendering should succeed");
         info.print(OutputFormat::Table)
             .expect("table rendering should succeed");
+    }
+
+    #[cfg(feature = "github")]
+    #[test]
+    fn rate_limit_display_handles_zero_limit_and_sorts_resources() {
+        let zero = sample_resource(0, 5, 0, 0);
+        let display = RateLimitDisplay::from_github_resource("core", &zero);
+        assert_eq!(display.usage_percent, "0.0%");
+        assert_eq!(display.reset_in, "now");
+
+        let items = vec![
+            RateLimitDisplay {
+                resource: "zeta".into(),
+                limit: "1".into(),
+                used: "0".into(),
+                remaining: "1".into(),
+                usage_percent: "0.0%".into(),
+                reset_at: "2099-01-01 00:00:00 UTC".into(),
+                reset_in: "1m".into(),
+            },
+            RateLimitDisplay {
+                resource: "alpha".into(),
+                limit: "1".into(),
+                used: "0".into(),
+                remaining: "1".into(),
+                usage_percent: "0.0%".into(),
+                reset_at: "2099-01-01 00:00:00 UTC".into(),
+                reset_in: "1m".into(),
+            },
+        ];
+        RateLimitDisplay::print_many(items, OutputFormat::Table).unwrap();
+    }
+
+    #[cfg(any(feature = "gitlab", feature = "gitea"))]
+    #[test]
+    fn rate_limit_info_message_json_path_is_serializable() {
+        let info = RateLimitInfoMessage {
+            platform: "Gitea (forge.test)".to_string(),
+            message: "Header-based rate limiting".to_string(),
+            default_limit: "Varies".to_string(),
+            note: "Headers".to_string(),
+            docs_url: "https://example.invalid".to_string(),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("forge.test"));
+    }
+
+    #[cfg(any(feature = "gitlab", feature = "gitea"))]
+    async fn setup_db(label: &str) -> DatabaseConnection {
+        curator::db::connect_and_migrate(&format!(
+            "sqlite://{}?mode=rwc",
+            std::env::temp_dir()
+                .join(format!("curator-limits-{label}-{}.db", Uuid::new_v4()))
+                .display()
+        ))
+        .await
+        .unwrap()
+    }
+
+    #[cfg(any(feature = "gitlab", feature = "gitea"))]
+    async fn insert_instance(
+        db: &DatabaseConnection,
+        name: &str,
+        platform_type: PlatformType,
+        host: &str,
+    ) {
+        curator::entity::instance::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            name: Set(name.to_string()),
+            platform_type: Set(platform_type),
+            host: Set(host.to_string()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set("auto".to_string()),
+            created_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn handle_limits_gitlab_branch_succeeds() {
+        let db = setup_db("gitlab").await;
+        insert_instance(&db, "work-gitlab", PlatformType::GitLab, "gitlab.work.test").await;
+        handle_limits("work-gitlab", OutputFormat::Json, &Config::default(), &db)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "gitea")]
+    #[tokio::test]
+    async fn handle_limits_gitea_branch_succeeds() {
+        let db = setup_db("gitea").await;
+        insert_instance(&db, "forgejo", PlatformType::Gitea, "forgejo.work.test").await;
+        handle_limits("forgejo", OutputFormat::Table, &Config::default(), &db)
+            .await
+            .unwrap();
     }
 }

@@ -50,6 +50,7 @@ pub fn is_rate_limit_error_from_github(e: &GitHubError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::PlatformError;
 
     #[test]
     fn test_is_rate_limit_error_from_github() {
@@ -63,5 +64,18 @@ mod tests {
 
         let auth_required = GitHubError::AuthRequired;
         assert!(!is_rate_limit_error_from_github(&auth_required));
+    }
+
+    #[test]
+    fn github_error_display_and_short_message_cover_variants() {
+        let org = GitHubError::OrgNotFound("rust-lang".to_string());
+        assert!(org.to_string().contains("rust-lang"));
+        assert!(short_error_message(&PlatformError::from(org)).contains("rust-lang"));
+
+        let auth = GitHubError::AuthRequired;
+        assert!(auth.to_string().contains("Authentication required"));
+
+        let internal = GitHubError::Internal("boom".to_string());
+        assert!(internal.to_string().contains("boom"));
     }
 }

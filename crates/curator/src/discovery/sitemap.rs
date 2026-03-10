@@ -165,6 +165,35 @@ fn parse_sitemap(xml: &str) -> SitemapParse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{HttpError, HttpResponse};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct MockTransport {
+        responses: Arc<Mutex<HashMap<String, HttpResponse>>>,
+    }
+
+    #[async_trait]
+    impl HttpTransport for MockTransport {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .get(&request.url)
+                .cloned()
+                .ok_or_else(|| HttpError::Transport("missing".to_string()))
+        }
+    }
+
+    fn response(status: u16, body: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: vec![],
+            body: body.as_bytes().to_vec(),
+        }
+    }
 
     #[test]
     fn test_parse_urlset() {
@@ -202,5 +231,61 @@ mod tests {
             }
             SitemapParse::UrlSet(_) => panic!("expected sitemap index"),
         }
+    }
+
+    #[tokio::test]
+    async fn collect_sitemap_urls_uses_robots_and_respects_max_urls() {
+        let start = Url::parse("https://example.com").unwrap();
+        let transport = MockTransport {
+            responses: Arc::new(Mutex::new(HashMap::from([
+                (
+                    "https://example.com/robots.txt".to_string(),
+                    response(
+                        200,
+                        "Sitemap: https://example.com/sitemap.xml\nSitemap: https://example.com/sitemap.xml",
+                    ),
+                ),
+                (
+                    "https://example.com/sitemap.xml".to_string(),
+                    response(
+                        200,
+                        r#"<urlset><url><loc>https://example.com/a</loc></url><url><loc>https://example.com/b</loc></url></urlset>"#,
+                    ),
+                ),
+            ]))),
+        };
+
+        let urls = collect_sitemap_urls(&transport, &start, 1, "curator-test").await;
+        assert_eq!(urls, vec![Url::parse("https://example.com/a").unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn collect_sitemap_urls_falls_back_to_default_sitemap_and_skips_bad_urls() {
+        let start = Url::parse("https://example.com/path").unwrap();
+        let transport = MockTransport {
+            responses: Arc::new(Mutex::new(HashMap::from([
+                (
+                    "https://example.com/robots.txt".to_string(),
+                    response(404, "missing"),
+                ),
+                (
+                    "https://example.com/sitemap.xml".to_string(),
+                    response(
+                        200,
+                        r#"<sitemapindex><sitemap><loc>not-a-url</loc></sitemap><sitemap><loc>https://example.com/nested.xml</loc></sitemap></sitemapindex>"#,
+                    ),
+                ),
+                (
+                    "https://example.com/nested.xml".to_string(),
+                    response(
+                        200,
+                        r#"<urlset><url><loc>https://example.com/final</loc></url></urlset>"#,
+                    ),
+                ),
+            ]))),
+        };
+
+        let urls = collect_sitemap_urls(&transport, &start, 10, "curator-test").await;
+        assert_eq!(urls, vec![Url::parse("https://example.com/final").unwrap()]);
     }
 }

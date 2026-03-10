@@ -220,7 +220,11 @@ pub async fn star_projects_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::{HttpMethod, HttpResponse, MockTransport};
     use chrono::{Duration, Utc};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Semaphore;
+    use uuid::Uuid;
 
     /// Create a mock GitLabProject for testing.
     fn mock_project(name: &str, last_activity_days_ago: i64) -> GitLabProject {
@@ -263,6 +267,24 @@ mod tests {
                 name.to_lowercase()
             )),
         }
+    }
+
+    fn response(status: u16, body: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn client_with_transport(transport: Arc<dyn crate::HttpTransport>) -> GitLabClient {
+        GitLabClient::new_with_transport(
+            "https://gitlab.example.com",
+            "token",
+            Uuid::new_v4(),
+            None,
+            transport,
+        )
     }
 
     #[test]
@@ -407,5 +429,89 @@ mod tests {
             .collect();
 
         assert_eq!(borrowed_names, owned_names);
+    }
+
+    #[tokio::test]
+    async fn test_star_project_and_retry_delegate_to_client() {
+        let transport = MockTransport::new();
+        let url = "https://gitlab.example.com/api/v4/projects/77/star";
+        transport.push_response(HttpMethod::Post, url, response(200, "{}"));
+        transport.push_response(HttpMethod::Post, url, response(304, "{}"));
+        let client = client_with_transport(Arc::new(transport));
+
+        assert!(star_project(&client, 77).await.unwrap());
+        assert!(!star_project_with_retry(&client, 77, None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_list_group_projects_emits_progress_and_returns_items() {
+        let transport = MockTransport::new();
+        let group = "team/sub";
+        let encoded = "team%2Fsub";
+        let url = format!(
+            "https://gitlab.example.com/api/v4/groups/{encoded}/projects?include_subgroups=true&per_page=100&page=1"
+        );
+        transport.push_response(
+            HttpMethod::Get,
+            &url,
+            HttpResponse {
+                status: 200,
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("x-total-pages".to_string(), "1".to_string()),
+                ],
+                body: br#"[{"id":12345,"name":"recent","path":"recent","path_with_namespace":"test-group/recent","description":"A test project","default_branch":"main","visibility":"public","archived":false,"tag_list":["rust"],"star_count":10,"forks_count":2,"open_issues_count":5,"created_at":"2024-01-01T00:00:00Z","last_activity_at":"2099-01-01T00:00:00Z","namespace":{"id":1,"name":"test-group","path":"test-group","full_path":"test-group","kind":"group"},"issues_enabled":true,"wiki_enabled":true,"merge_requests_enabled":true,"web_url":"https://gitlab.com/test-group/recent","ssh_url_to_repo":"git@gitlab.com:test-group/recent.git","http_url_to_repo":"https://gitlab.com/test-group/recent.git"}]"#.to_vec(),
+            },
+        );
+        let client = client_with_transport(Arc::new(transport));
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let progress_clone = Arc::clone(&progress);
+        let callback: ProgressCallback = Box::new(move |event| {
+            progress_clone.lock().unwrap().push(event);
+        });
+
+        let projects = list_group_projects(&client, group, true, Some(&callback))
+            .await
+            .unwrap();
+
+        assert_eq!(projects.len(), 1);
+        let events = progress.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SyncProgress::FetchingRepos { namespace, .. } if namespace == group
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SyncProgress::FetchComplete { namespace, total } if namespace == group && *total == 1
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_star_projects_batch_covers_dry_run_and_error_paths() {
+        let transport = MockTransport::new();
+        let ok_url = "https://gitlab.example.com/api/v4/projects/1/star";
+        let fail_url = "https://gitlab.example.com/api/v4/projects/2/star";
+        transport.push_response(HttpMethod::Post, ok_url, response(200, "{}"));
+        transport.push_response(HttpMethod::Post, fail_url, response(500, "boom"));
+        let client = client_with_transport(Arc::new(transport));
+
+        let mut ok_project = mock_project("ok", 1);
+        ok_project.id = 1;
+        ok_project.namespace.full_path = "team".to_string();
+        let mut fail_project = mock_project("fail", 1);
+        fail_project.id = 2;
+        fail_project.namespace.full_path = "team".to_string();
+
+        let dry = star_projects_batch(&client, &[&ok_project], 1, true, None).await;
+        assert_eq!(dry.starred, 1);
+
+        let stats =
+            star_projects_batch(&client, &[&ok_project, &fail_project], 2, false, None).await;
+        assert_eq!(stats.starred, 1);
+        assert_eq!(stats.errors.len(), 1);
+
+        let semaphore = Arc::new(Semaphore::new(0));
+        semaphore.close();
+        let _ = semaphore; // keep explicit branch coverage helper nearby
     }
 }

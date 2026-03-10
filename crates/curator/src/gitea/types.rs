@@ -132,3 +132,94 @@ pub struct GiteaAuthUser {
     #[serde(default)]
     pub followers_count: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gitea_repo_deserializes_defaults_and_optional_fields() {
+        let json = r#"{
+            "id": 1,
+            "name": "repo",
+            "full_name": "owner/repo",
+            "private": false,
+            "fork": false,
+            "archived": false,
+            "mirror": false,
+            "empty": false,
+            "template": false,
+            "stars_count": 1,
+            "forks_count": 2,
+            "open_issues_count": 3,
+            "watchers_count": 4,
+            "size": 5,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-02T00:00:00Z",
+            "pushed_at": null,
+            "owner": {"id": 2, "login": "owner"},
+            "html_url": "https://example.com/owner/repo"
+        }"#;
+
+        let repo: GiteaRepo = serde_json::from_str(json).unwrap();
+        assert_eq!(repo.full_name, "owner/repo");
+        assert!(repo.topics.is_empty());
+        assert!(!repo.has_issues);
+        assert!(!repo.has_wiki);
+        assert!(!repo.has_pull_requests);
+        assert!(repo.pushed_at.is_none());
+    }
+
+    #[test]
+    fn gitea_repo_deserializes_topics_and_feature_flags() {
+        let json = r#"{
+            "id": 1,
+            "name": "repo",
+            "full_name": "owner/repo",
+            "private": true,
+            "fork": true,
+            "archived": true,
+            "mirror": true,
+            "empty": true,
+            "template": true,
+            "stars_count": 1,
+            "forks_count": 2,
+            "open_issues_count": 3,
+            "watchers_count": 4,
+            "size": 5,
+            "language": "Rust",
+            "topics": ["rust", "cli"],
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-02T00:00:00Z",
+            "pushed_at": "2024-01-03T00:00:00Z",
+            "owner": {"id": 2, "login": "owner", "full_name": "Owner"},
+            "html_url": "https://example.com/owner/repo",
+            "ssh_url": "git@example.com:owner/repo.git",
+            "clone_url": "https://example.com/owner/repo.git",
+            "website": "https://repo.example.com",
+            "has_issues": true,
+            "has_wiki": true,
+            "has_pull_requests": true
+        }"#;
+
+        let repo: GiteaRepo = serde_json::from_str(json).unwrap();
+        assert_eq!(repo.language.as_deref(), Some("Rust"));
+        assert_eq!(repo.topics, vec!["rust", "cli"]);
+        assert!(repo.has_issues && repo.has_wiki && repo.has_pull_requests);
+        assert_eq!(repo.owner.full_name.as_deref(), Some("Owner"));
+    }
+
+    #[test]
+    fn gitea_org_and_auth_user_deserialize_defaults() {
+        let org: GiteaOrg =
+            serde_json::from_str(r#"{"id":1,"username":"org","repo_count":7}"#).unwrap();
+        assert_eq!(org.username, "org");
+        assert_eq!(org.repo_count, 7);
+        assert!(org.visibility.is_none());
+
+        let user: GiteaAuthUser = serde_json::from_str(r#"{"id":2,"login":"user"}"#).unwrap();
+        assert_eq!(user.login, "user");
+        assert_eq!(user.followers_count, 0);
+        assert!(user.email.is_none());
+    }
+}

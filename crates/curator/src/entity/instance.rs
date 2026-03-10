@@ -55,6 +55,9 @@ pub enum Relation {
     /// An instance has many API cache entries.
     #[sea_orm(has_many = "super::api_cache::Entity")]
     ApiCache,
+    /// An instance has at most one stored credential record.
+    #[sea_orm(has_many = "super::instance_credential::Entity")]
+    InstanceCredentials,
 }
 
 impl Related<super::code_repository::Entity> for Entity {
@@ -66,6 +69,12 @@ impl Related<super::code_repository::Entity> for Entity {
 impl Related<super::api_cache::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::ApiCache.def()
+    }
+}
+
+impl Related<super::instance_credential::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::InstanceCredentials.def()
     }
 }
 

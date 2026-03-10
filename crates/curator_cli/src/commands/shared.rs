@@ -33,6 +33,8 @@ use sea_orm::DatabaseConnection;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
 use crate::config::Config;
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+use crate::credentials::{self, LocatedCredential, StoredCredential};
 use crate::progress::ProgressReporter;
 use crate::shutdown::{SHUTDOWN_FLAG, is_shutdown_requested};
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
@@ -40,7 +42,7 @@ use crate::{CommonSyncOptions, StarredSyncOptions};
 
 /// Buffer time (in seconds) before token expiry to trigger refresh.
 /// We refresh 5 minutes early to avoid race conditions.
-#[cfg(feature = "gitea")]
+#[cfg(any(feature = "gitlab", feature = "gitea"))]
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
 // Re-export types from the library for convenience
@@ -766,10 +768,29 @@ impl SyncRunner {
 ///
 /// The valid access token, or an error if no token is configured or refresh fails.
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+#[allow(dead_code)]
 pub async fn get_token_for_instance(
     instance: &InstanceModel,
     config: &Config,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    get_token_for_instance_with_db(instance, config, None).await
+}
+
+/// Get the token for an instance using the configured credential backend.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+pub async fn get_token_for_instance_with_db(
+    instance: &InstanceModel,
+    config: &Config,
+    db: Option<&DatabaseConnection>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(token) = read_instance_env_token(instance) {
+        return Ok(token);
+    }
+
+    if let Some(located) = credentials::load_credential(instance, config, db).await? {
+        return resolve_located_credential(instance, config, db, located).await;
+    }
+
     match instance.platform_type {
         #[cfg(feature = "github")]
         PlatformType::GitHub => config.github_token().ok_or_else(|| {
@@ -780,20 +801,12 @@ pub async fn get_token_for_instance(
             .into()
         }),
         #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => config.gitlab_token().ok_or_else(|| {
-            format!(
-                "No GitLab token configured. Run 'curator login {}' or set CURATOR_GITLAB_TOKEN.",
-                instance.name
-            )
-            .into()
-        }),
+        PlatformType::GitLab => get_legacy_gitlab_token_with_refresh(instance, config).await,
         #[cfg(feature = "gitea")]
         PlatformType::Gitea => {
             if instance.is_codeberg() {
-                // Check if we need to refresh the Codeberg OAuth token
                 get_codeberg_token_with_refresh(config).await
             } else {
-                // Self-hosted Gitea uses PAT (no refresh needed)
                 config.gitea_token().ok_or_else(|| {
                     format!(
                         "No Gitea token configured for '{}'. Run 'curator login {}' or set CURATOR_GITEA_TOKEN.",
@@ -817,6 +830,115 @@ pub async fn get_token_for_instance(
         } else {
             Err(e)
         }
+    })
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+fn read_instance_env_token(instance: &InstanceModel) -> Option<String> {
+    let key = format!(
+        "CURATOR_INSTANCE_{}_TOKEN",
+        normalize_instance_env_name(&instance.name)
+    );
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+fn normalize_instance_env_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+async fn resolve_located_credential(
+    instance: &InstanceModel,
+    config: &Config,
+    db: Option<&DatabaseConnection>,
+    located: LocatedCredential,
+) -> Result<String, Box<dyn std::error::Error>> {
+    #[cfg(any(feature = "gitlab", feature = "gitea"))]
+    if let Some(refreshed) = maybe_refresh_credential(instance, &located, db).await? {
+        credentials::update_credential(instance, &located.source, &refreshed, db).await?;
+        return Ok(refreshed.access_token);
+    }
+
+    let _ = config;
+    Ok(located.credential.access_token)
+}
+
+#[cfg(any(feature = "gitlab", feature = "gitea"))]
+async fn maybe_refresh_credential(
+    instance: &InstanceModel,
+    located: &LocatedCredential,
+    db: Option<&DatabaseConnection>,
+) -> Result<Option<StoredCredential>, Box<dyn std::error::Error>> {
+    use curator::oauth::token_is_expired;
+
+    let _ = db;
+    let Some(refresh_token) = located.credential.refresh_token.as_deref() else {
+        return Ok(None);
+    };
+
+    if !token_is_expired(
+        located.credential.token_expires_at,
+        TOKEN_REFRESH_BUFFER_SECS,
+    ) {
+        return Ok(None);
+    }
+
+    match instance.platform_type {
+        #[cfg(feature = "gitlab")]
+        PlatformType::GitLab => {
+            use curator::gitlab::oauth::{refresh_access_token, token_expires_at};
+
+            let client_id = resolve_client_id(instance).ok_or_else(|| {
+                format!(
+                    "GitLab instance '{}' needs an OAuth client id to refresh stored OAuth credentials.",
+                    instance.name
+                )
+            })?;
+
+            let refreshed = refresh_access_token(&instance.host, client_id, refresh_token).await?;
+            let expires_at = token_expires_at(&refreshed);
+            Ok(Some(StoredCredential {
+                access_token: refreshed.access_token,
+                refresh_token: refreshed.refresh_token,
+                token_expires_at: expires_at,
+                auth_kind: "oauth".to_string(),
+                token_type: Some(refreshed.token_type),
+            }))
+        }
+        #[cfg(feature = "gitea")]
+        PlatformType::Gitea if instance.is_codeberg() => {
+            use curator::gitea::oauth::{CodebergAuth, refresh_access_token, token_expires_at};
+
+            let refreshed = refresh_access_token(&CodebergAuth::new(), refresh_token).await?;
+            let expires_at = token_expires_at(&refreshed);
+            Ok(Some(StoredCredential {
+                access_token: refreshed.access_token,
+                refresh_token: refreshed.refresh_token,
+                token_expires_at: expires_at,
+                auth_kind: "oauth".to_string(),
+                token_type: Some(refreshed.token_type),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(any(feature = "gitlab", feature = "gitea"))]
+fn resolve_client_id(instance: &InstanceModel) -> Option<&str> {
+    instance.oauth_client_id.as_deref().or_else(|| {
+        curator::entity::instance::well_known::by_name(&instance.name)
+            .and_then(|wk| wk.oauth_client_id)
     })
 }
 
@@ -937,6 +1059,65 @@ async fn get_codeberg_token_with_refresh(
     })
 }
 
+#[cfg(feature = "gitlab")]
+async fn get_legacy_gitlab_token_with_refresh(
+    instance: &InstanceModel,
+    config: &Config,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use curator::gitlab::oauth::{refresh_access_token, token_expires_at};
+    use curator::oauth::token_is_expired;
+
+    let current_token = config.gitlab_token();
+    let refresh_token = config.gitlab_refresh_token();
+    let expires_at = config.gitlab_token_expires_at();
+
+    if let Some(ref rt) = refresh_token
+        && token_is_expired(expires_at, TOKEN_REFRESH_BUFFER_SECS)
+    {
+        let client_id = resolve_client_id(instance).ok_or_else(|| {
+            format!(
+                "GitLab instance '{}' needs an OAuth client id to refresh legacy OAuth credentials.",
+                instance.name
+            )
+        })?;
+
+        match refresh_access_token(&instance.host, client_id, rt).await {
+            Ok(new_tokens) => {
+                let new_expires_at = token_expires_at(&new_tokens);
+                Config::save_gitlab_oauth_tokens(
+                    &new_tokens.access_token,
+                    new_tokens.refresh_token.as_deref(),
+                    new_expires_at,
+                )?;
+                return Ok(new_tokens.access_token);
+            }
+            Err(err) if current_token.is_some() => {
+                tracing::warn!(
+                    "Failed to refresh GitLab token for '{}': {}. Trying existing token...",
+                    instance.name,
+                    err
+                );
+            }
+            Err(err) => {
+                return Err(format!(
+                    "GitLab token expired and refresh failed: {}. Run 'curator login {}' to re-authenticate.",
+                    err,
+                    instance.name,
+                )
+                .into());
+            }
+        }
+    }
+
+    current_token.ok_or_else(|| {
+        format!(
+            "No GitLab token configured. Run 'curator login {}' or set CURATOR_GITLAB_TOKEN.",
+            instance.name
+        )
+        .into()
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)] // env_lock guards are intentionally held across awaits to serialise env-mutating tests
 mod tests {
@@ -945,12 +1126,13 @@ mod tests {
     use chrono::Utc;
     use curator::platform::{OrgInfo, PlatformError, PlatformRepo, RateLimitInfo, UserInfo};
     use curator::sync::{NamespaceSyncResultStreaming, SyncResult};
-    use sea_orm::Database;
+    use sea_orm::{ActiveModelTrait, Database, Set};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
+    use crate::credentials::CredentialSource;
     use crate::test_support::env_lock;
 
     #[derive(Clone)]
@@ -1556,6 +1738,145 @@ mod tests {
             .expect("token should resolve from config");
 
         assert_eq!(token, "token-from-config");
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn get_token_for_instance_reads_db_backed_credentials() {
+        let db = curator::db::connect_and_migrate(&format!(
+            "sqlite://{}?mode=rwc",
+            std::env::temp_dir()
+                .join(format!("curator-token-db-{}.db", Uuid::new_v4()))
+                .display()
+        ))
+        .await
+        .expect("db should migrate");
+
+        let instance = sample_instance("github-db", PlatformType::GitHub, "github.example.com");
+        curator::entity::instance::ActiveModel {
+            id: Set(instance.id),
+            name: Set(instance.name.clone()),
+            platform_type: Set(instance.platform_type),
+            host: Set(instance.host.clone()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set("auto".to_string()),
+            created_at: Set(instance.created_at),
+        }
+        .insert(&db)
+        .await
+        .expect("instance should insert");
+
+        curator::entity::instance_credential::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            instance_id: Set(instance.id),
+            backend: Set("db".to_string()),
+            auth_kind: Set("pat".to_string()),
+            access_token: Set(Some("token-from-db".to_string())),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            token_type: Set(None),
+            scopes: Set(None),
+            created_at: Set(Utc::now().fixed_offset()),
+            updated_at: Set(Utc::now().fixed_offset()),
+        }
+        .insert(&db)
+        .await
+        .expect("credential should insert");
+
+        let mut config = Config::default();
+        config.auth.credential_store = crate::config::CredentialStore::Db;
+
+        let token = get_token_for_instance_with_db(&instance, &config, Some(&db))
+            .await
+            .expect("db token should resolve");
+
+        assert_eq!(token, "token-from-db");
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn get_token_for_instance_prefers_instance_env_override() {
+        let _guard = env_lock().lock().await;
+        let instance = sample_instance("github-work", PlatformType::GitHub, "github.example.com");
+        unsafe {
+            std::env::set_var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN", "instance-env-token");
+        }
+
+        let token = get_token_for_instance(&instance, &Config::default())
+            .await
+            .expect("instance env token should resolve");
+
+        unsafe {
+            std::env::remove_var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN");
+        }
+
+        assert_eq!(token, "instance-env-token");
+    }
+
+    #[test]
+    fn normalize_instance_env_name_replaces_non_alnum_and_uppercases() {
+        assert_eq!(
+            normalize_instance_env_name("work-gitlab.prod"),
+            "WORK_GITLAB_PROD"
+        );
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[test]
+    fn resolve_client_id_uses_instance_then_well_known() {
+        let mut custom = sample_instance("gitlab", PlatformType::GitLab, "gitlab.com");
+        custom.oauth_client_id = Some("instance-client".to_string());
+        assert_eq!(resolve_client_id(&custom), Some("instance-client"));
+
+        let seeded = sample_instance("gitlab", PlatformType::GitLab, "gitlab.com");
+        assert!(resolve_client_id(&seeded).is_some());
+
+        let unknown = sample_instance("work-gitlab", PlatformType::GitLab, "gitlab.work");
+        assert_eq!(resolve_client_id(&unknown), None);
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn maybe_refresh_credential_returns_none_without_refresh_token() {
+        let instance = sample_instance("gitlab", PlatformType::GitLab, "gitlab.com");
+        let located = LocatedCredential {
+            credential: StoredCredential {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                token_expires_at: Some(1),
+                auth_kind: "oauth".to_string(),
+                token_type: None,
+            },
+            source: CredentialSource::Db,
+        };
+
+        assert!(
+            maybe_refresh_credential(&instance, &located, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn maybe_refresh_credential_errors_when_client_id_missing() {
+        let instance = sample_instance("work-gitlab", PlatformType::GitLab, "gitlab.work.test");
+        let located = LocatedCredential {
+            credential: StoredCredential {
+                access_token: "token".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                token_expires_at: Some(1),
+                auth_kind: "oauth".to_string(),
+                token_type: None,
+            },
+            source: CredentialSource::Db,
+        };
+
+        let err = maybe_refresh_credential(&instance, &located, None)
+            .await
+            .expect_err("missing client id should error");
+        assert!(err.to_string().contains("needs an OAuth client id"));
     }
 
     #[cfg(feature = "github")]

@@ -87,4 +87,23 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).expect("test output directory should be removable");
     }
+
+    #[test]
+    fn completion_script_supports_multiple_shells() {
+        let bash = String::from_utf8(completion_script(clap_complete::Shell::Bash)).unwrap();
+        let zsh = String::from_utf8(completion_script(clap_complete::Shell::Zsh)).unwrap();
+        assert!(bash.contains("curator"));
+        assert!(zsh.contains("curator"));
+    }
+
+    #[test]
+    fn handle_completions_writes_to_stdout_without_error() {
+        handle_completions(clap_complete::Shell::Bash)
+            .expect("completion generation should succeed");
+    }
+
+    #[test]
+    fn handle_man_without_output_writes_to_stdout_without_error() {
+        handle_man(None).expect("man output should succeed");
+    }
 }
