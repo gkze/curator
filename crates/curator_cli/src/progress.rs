@@ -99,3 +99,49 @@ impl Default for ProgressReporter {
         Self::new()
     }
 }
+
+#[cfg(all(test, any(feature = "github", feature = "gitlab", feature = "gitea")))]
+mod tests {
+    use super::*;
+    use curator::sync::SyncProgress;
+
+    #[test]
+    fn explicit_logging_and_interactive_constructors_work() {
+        let logging = ProgressReporter::logging();
+        logging.handle(SyncProgress::Warning {
+            message: "log".to_string(),
+        });
+        logging.clear();
+        logging.finish();
+
+        let interactive = ProgressReporter::interactive();
+        interactive.handle(SyncProgress::ModelsReady { count: 1 });
+        interactive.clear();
+        interactive.finish();
+    }
+
+    #[test]
+    fn as_callback_forwards_events() {
+        let reporter = Arc::new(ProgressReporter::logging());
+        let callback = reporter.as_callback();
+        callback(SyncProgress::Warning {
+            message: "callback".to_string(),
+        });
+    }
+
+    #[test]
+    fn finish_and_clear_are_noops_for_logging_reporter() {
+        let reporter = ProgressReporter::logging();
+        reporter.clear();
+        reporter.finish();
+        reporter.handle(SyncProgress::Warning {
+            message: "still works".to_string(),
+        });
+    }
+
+    #[test]
+    fn default_constructs_a_reporter() {
+        let reporter = ProgressReporter::default();
+        reporter.finish();
+    }
+}

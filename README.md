@@ -62,8 +62,10 @@ cargo install --path crates/curator_cli
 ### With Nix
 
 ```bash
-nix profile add github:gkze/curator
+nix profile install github:gkze/curator
 ```
+
+The flake is configured with the [`gkze` Cachix binary cache](https://gkze.cachix.org) as a substituter. Pass `--accept-flake-config` (or add `gkze.cachix.org` to your trusted substituters) to pull pre-built binaries instead of building from source.
 
 ## Configuration
 
@@ -111,6 +113,7 @@ All environment variables use the `CURATOR_` prefix:
 | Variable | Description |
 | ------------------------ | --------------------------------------------------- |
 | `CURATOR_DATABASE_URL` | Database connection string (default: see below) |
+| `CURATOR_INSTANCE_<NAME>_TOKEN` | Per-instance token override (blank/whitespace values are ignored) |
 | `CURATOR_GITHUB_TOKEN` | GitHub API token |
 | `CURATOR_GITLAB_HOST` | GitLab host (default: `gitlab.com`) |
 | `CURATOR_GITLAB_TOKEN` | GitLab API token |
@@ -123,6 +126,28 @@ All environment variables use the `CURATOR_` prefix:
 | `CURATOR_GITEA_TOKEN` | Gitea API token |
 
 The database URL defaults to `sqlite://~/.local/state/curator/curator.db?mode=rwc` on Linux (using the XDG state directory). On macOS, it defaults to `sqlite://~/Library/Application Support/curator/curator.db?mode=rwc`.
+
+Curator stores credentials per instance. By default it uses the system keychain when available and falls back to a separate auth file. You can choose a backend explicitly:
+
+```toml
+[auth]
+credential_store = "auto" # auto, keychain, file, db
+# file_path = "~/.config/curator/auth.toml"
+```
+
+`db` storage is supported for portability-focused setups, but it stores secrets in the curator database in plaintext-at-rest. Use it only when that tradeoff is acceptable; `keychain` or `auto` are the recommended defaults.
+
+You can inspect and manage auth state with:
+
+```bash
+curator auth status
+curator auth status github
+curator auth logout github
+curator auth migrate
+curator auth cleanup-legacy
+```
+
+`auth migrate` moves legacy global tokens (e.g. `[github].token`) into per-instance credential storage. When multiple instances share the same platform type, the migration uses host matching to route the credential to the correct instance. If the legacy config host doesn't match any single instance unambiguously, the migration is skipped for those instances to avoid misrouting credentials.
 
 ## Usage
 
@@ -169,7 +194,7 @@ If a well-known instance does not have a bundled client ID, `curator login` fall
 | `kde-gitlab` | `invent.kde.org` | GitLab | No | PAT/token | OAuth requires admin-provided client ID; user app creation may be disabled |
 | `kitware-gitlab` | `gitlab.kitware.com` | GitLab | Yes | Device OAuth, then token fallback | Built-in client ID |
 
-For GitHub Enterprise or self-hosted GitLab/Gitea, configure a PAT via `CURATOR_*_TOKEN`.
+For GitHub Enterprise or self-hosted GitLab/Gitea, configure a PAT via `curator login <instance>` or `CURATOR_INSTANCE_<NAME>_TOKEN`.
 
 ### Database Setup
 

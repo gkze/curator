@@ -177,3 +177,151 @@ impl Default for LoggingReporter {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logging_reporter_handles_all_sync_progress_variants() {
+        let reporter = LoggingReporter::new();
+
+        let events = vec![
+            SyncProgress::FetchingRepos {
+                namespace: "org/repo".to_string(),
+                total_repos: Some(10),
+                expected_pages: Some(2),
+            },
+            SyncProgress::FetchedPage {
+                namespace: "org/repo".to_string(),
+                page: 1,
+                count: 5,
+                total_so_far: 5,
+                expected_pages: Some(2),
+            },
+            SyncProgress::FetchComplete {
+                namespace: "org/repo".to_string(),
+                total: 10,
+            },
+            SyncProgress::FilteringByActivity {
+                namespace: "org/repo".to_string(),
+                days: 30,
+            },
+            SyncProgress::FilterComplete {
+                namespace: "org/repo".to_string(),
+                matched: 4,
+                total: 10,
+            },
+            SyncProgress::FilteredPage {
+                matched_so_far: 4,
+                processed_so_far: 10,
+            },
+            SyncProgress::StarringRepos {
+                count: 4,
+                concurrency: 2,
+                dry_run: false,
+            },
+            SyncProgress::StarredRepo {
+                owner: "org".to_string(),
+                name: "repo".to_string(),
+                already_starred: false,
+            },
+            SyncProgress::StarredRepo {
+                owner: "org".to_string(),
+                name: "repo2".to_string(),
+                already_starred: true,
+            },
+            SyncProgress::StarError {
+                owner: "org".to_string(),
+                name: "repo3".to_string(),
+                error: "boom".to_string(),
+            },
+            SyncProgress::StarringComplete {
+                starred: 1,
+                already_starred: 1,
+                errors: 1,
+            },
+            SyncProgress::ConvertingModels,
+            SyncProgress::ModelsReady { count: 3 },
+            SyncProgress::PersistingBatch {
+                count: 2,
+                final_batch: false,
+            },
+            SyncProgress::PersistingBatch {
+                count: 1,
+                final_batch: true,
+            },
+            SyncProgress::Persisted {
+                owner: "org".to_string(),
+                name: "repo".to_string(),
+            },
+            SyncProgress::PersistError {
+                owner: "org".to_string(),
+                name: "repo".to_string(),
+                error: "save failed".to_string(),
+            },
+            SyncProgress::SyncingNamespaces { count: 2 },
+            SyncProgress::SyncNamespacesComplete {
+                successful: 1,
+                failed: 1,
+            },
+            SyncProgress::Warning {
+                message: "careful".to_string(),
+            },
+            SyncProgress::RateLimitBackoff {
+                owner: "org".to_string(),
+                name: "repo".to_string(),
+                retry_after_ms: 1000,
+                attempt: 2,
+            },
+            SyncProgress::PruningRepos {
+                count: 3,
+                dry_run: false,
+            },
+            SyncProgress::PrunedRepo {
+                owner: "org".to_string(),
+                name: "repo".to_string(),
+            },
+            SyncProgress::PruneError {
+                owner: "org".to_string(),
+                name: "repo".to_string(),
+                error: "prune failed".to_string(),
+            },
+            SyncProgress::PruningComplete {
+                pruned: 1,
+                errors: 1,
+            },
+            SyncProgress::CacheHit {
+                namespace: "org/repo".to_string(),
+                cached_count: 4,
+            },
+            SyncProgress::PageFetchRetry {
+                page: 2,
+                retry_after_ms: 1000,
+                attempt: 1,
+            },
+        ];
+
+        for event in events {
+            reporter.handle(event);
+        }
+    }
+
+    #[test]
+    fn logging_reporter_default_constructs() {
+        let reporter = LoggingReporter;
+        reporter.handle(SyncProgress::Warning {
+            message: "default".to_string(),
+        });
+    }
+
+    #[test]
+    fn logging_reporter_handles_other_fallback_variant() {
+        let reporter = LoggingReporter::new();
+        reporter.handle(SyncProgress::PageFetchRetry {
+            page: 3,
+            retry_after_ms: 250,
+            attempt: 2,
+        });
+    }
+}

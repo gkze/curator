@@ -487,12 +487,54 @@ pub fn create_model_channel() -> (
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
 
-    use sea_orm::{DatabaseBackend, MockDatabase};
+    use chrono::Utc;
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult, RuntimeErr, Set};
     use tokio::sync::mpsc::error::TrySendError;
+    use uuid::Uuid;
+
+    use crate::entity::code_visibility::CodeVisibility;
 
     use super::*;
+
+    fn active_model(owner: &str, name: &str) -> CodeRepositoryActiveModel {
+        let now = Utc::now().fixed_offset();
+        CodeRepositoryActiveModel {
+            id: Set(Uuid::new_v4()),
+            instance_id: Set(Uuid::new_v4()),
+            platform_id: Set(i64::from(owner.len() as u32 + name.len() as u32)),
+            owner: Set(owner.to_string()),
+            name: Set(name.to_string()),
+            description: Set(None),
+            default_branch: Set("main".to_string()),
+            topics: Set(serde_json::json!([])),
+            primary_language: Set(None),
+            license_spdx: Set(None),
+            homepage: Set(None),
+            visibility: Set(CodeVisibility::Public),
+            is_fork: Set(false),
+            is_mirror: Set(false),
+            is_archived: Set(false),
+            is_template: Set(false),
+            is_empty: Set(false),
+            stars: Set(None),
+            forks: Set(None),
+            open_issues: Set(None),
+            watchers: Set(None),
+            size_kb: Set(None),
+            has_issues: Set(true),
+            has_wiki: Set(true),
+            has_pull_requests: Set(true),
+            created_at: Set(Some(now)),
+            updated_at: Set(Some(now)),
+            pushed_at: Set(Some(now)),
+            platform_metadata: Set(serde_json::json!({})),
+            synced_at: Set(now),
+            etag: Set(None),
+        }
+    }
 
     #[test]
     fn test_persist_task_result_default() {
@@ -684,5 +726,169 @@ mod tests {
         assert!(result.errors.is_empty());
         assert!(result.panic_info.is_none());
         assert_eq!(saved_counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_flush_batch_success_updates_counts_and_progress() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_results([MockExecResult {
+                rows_affected: 1,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+        let mut result = PersistTaskResult::default();
+        let saved_count = AtomicUsize::new(0);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_cb = Arc::clone(&events);
+        let callback: Arc<ProgressCallback> = Arc::new(Box::new(move |event| match event {
+            SyncProgress::PersistingBatch { count, final_batch } => {
+                events_for_cb
+                    .lock()
+                    .expect("events mutex should lock")
+                    .push(format!("batch:{count}:{final_batch}"));
+            }
+            SyncProgress::Persisted { owner, name } => {
+                events_for_cb
+                    .lock()
+                    .expect("events mutex should lock")
+                    .push(format!("persisted:{owner}/{name}"));
+            }
+            _ => {}
+        }) as ProgressCallback);
+
+        flush_batch(
+            &db,
+            vec![active_model("octo", "demo")],
+            true,
+            &mut result,
+            &saved_count,
+            &Some(callback),
+        )
+        .await;
+
+        assert_eq!(result.saved_count, 1);
+        assert!(result.errors.is_empty());
+        assert_eq!(saved_count.load(Ordering::Relaxed), 1);
+
+        let recorded = events.lock().expect("events mutex should lock");
+        assert!(recorded.iter().any(|event| event == "batch:1:true"));
+        assert!(recorded.iter().any(|event| event == "persisted:octo/demo"));
+    }
+
+    #[tokio::test]
+    async fn test_flush_batch_error_records_failures_and_progress() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_exec_errors([DbErr::Query(RuntimeErr::Internal("boom".to_string()))])
+            .into_connection();
+        let mut result = PersistTaskResult::default();
+        let saved_count = AtomicUsize::new(0);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_cb = Arc::clone(&events);
+        let callback: Arc<ProgressCallback> = Arc::new(Box::new(move |event| {
+            if let SyncProgress::PersistError { owner, name, error } = event {
+                events_for_cb
+                    .lock()
+                    .expect("events mutex should lock")
+                    .push(format!("error:{owner}/{name}:{error}"));
+            }
+        }) as ProgressCallback);
+
+        flush_batch(
+            &db,
+            vec![active_model("octo", "broken")],
+            false,
+            &mut result,
+            &saved_count,
+            &Some(callback),
+        )
+        .await;
+
+        assert_eq!(result.saved_count, 0);
+        assert_eq!(saved_count.load(Ordering::Relaxed), 0);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].0, "octo");
+        assert_eq!(result.errors[0].1, "broken");
+
+        let recorded = events.lock().expect("events mutex should lock");
+        assert!(
+            recorded
+                .iter()
+                .any(|event| event.contains("error:octo/broken:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_persist_task_flushes_when_channel_closes() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_exec_results([MockExecResult {
+                    rows_affected: 1,
+                    last_insert_id: 0,
+                }])
+                .into_connection(),
+        );
+        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(4);
+
+        let (handle, saved_counter) = spawn_persist_task(db, rx, None, None);
+        tx.send(active_model("octo", "close-flush"))
+            .await
+            .expect("model should send");
+        drop(tx);
+
+        let result = await_persist_task(handle).await;
+
+        assert_eq!(result.saved_count, 1);
+        assert!(result.errors.is_empty());
+        assert_eq!(saved_counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_persist_task_flushes_partial_batch_after_timeout() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_exec_results([MockExecResult {
+                    rows_affected: 1,
+                    last_insert_id: 0,
+                }])
+                .into_connection(),
+        );
+        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(4);
+
+        let (handle, saved_counter) = spawn_persist_task(db, rx, None, None);
+        tx.send(active_model("octo", "timeout-flush"))
+            .await
+            .expect("model should send");
+        tokio::time::sleep(PERSIST_FLUSH_TIMEOUT + Duration::from_millis(100)).await;
+        drop(tx);
+
+        let result = await_persist_task(handle).await;
+
+        assert_eq!(result.saved_count, 1);
+        assert!(result.errors.is_empty());
+        assert_eq!(saved_counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_persist_task_accumulates_errors_from_failed_flush() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_exec_errors([DbErr::Query(RuntimeErr::Internal("boom".to_string()))])
+                .into_connection(),
+        );
+        let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(4);
+
+        let (handle, saved_counter) = spawn_persist_task(db, rx, None, None);
+        tx.send(active_model("octo", "fail-flush"))
+            .await
+            .expect("model should send");
+        drop(tx);
+
+        let result = await_persist_task(handle).await;
+
+        assert_eq!(result.saved_count, 0);
+        assert_eq!(saved_counter.load(Ordering::Relaxed), 0);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].0, "octo");
+        assert_eq!(result.errors[0].1, "fail-flush");
     }
 }

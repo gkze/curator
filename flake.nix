@@ -1,6 +1,11 @@
 {
   description = "Curator";
 
+  nixConfig = {
+    extra-substituters = [ "https://gkze.cachix.org" ];
+    extra-trusted-public-keys = [ "gkze.cachix.org-1:vO2wq3fAFvRL1TA7R02JnU/R5iKGhoHMLGYbnzPRJjI=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-compat.url = "https://flakehub.com/f/edolstra/flake-compat/1.tar.gz";
@@ -30,7 +35,9 @@
       flake = false;
     };
     gitlab-swagger-spec = {
-      url = "https://gitlab.com/gitlab-org/gitlab/-/raw/18-9-stable-ee/doc/api/openapi/openapi_v2.yaml";
+      # Pin to an immutable commit URL so flake checks don't break when the
+      # moving stable branch updates in place.
+      url = "https://gitlab.com/gitlab-org/gitlab/-/raw/54ad755d436bf21a4cfc2c1bb401571d03574ef1/doc/api/openapi/openapi_v2.yaml";
       flake = false;
     };
   };
@@ -171,6 +178,11 @@
             c.commonArgs
             // {
               inherit (c) cargoArtifacts;
+              # Some CLI tests mutate process environment (HOME/XDG_CONFIG_HOME,
+              # token env vars). nextest covers the suite independently, but the
+              # package build's plain cargo test phase needs serialized threads to
+              # avoid cross-test environment races in the sandbox.
+              cargoTestExtraArgs = "-- --test-threads=1";
               nativeBuildInputs = c.commonArgs.nativeBuildInputs ++ [ pkgs.installShellFiles ];
               postInstall = ''
                 installShellCompletion --cmd curator \
@@ -262,7 +274,6 @@
                 rustToolchain
                 yq-go
               ]
-              ++ [ (mkSwagger2openapi pkgs) ]
               ++ mkBuildInputs pkgs;
 
             env = [

@@ -7,6 +7,7 @@ use console::Term;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use url::Url;
 
+use curator::discovery::DiscoveryResult;
 use curator::discovery::{CrawlOptions, DiscoveryProgress, RepoLink, discover_repo_links};
 use curator::{
     Instance, InstanceModel, PlatformType, db,
@@ -16,8 +17,8 @@ use curator::{
 use crate::CommonSyncOptions;
 use crate::DiscoverOptions;
 use crate::commands::shared::{
-    SyncKind, SyncRunner, active_within_duration, build_rate_limiter, display_final_rate_limit,
-    get_token_for_instance, resolve_common_sync_options,
+    ResolvedCommonSyncOptions, SyncKind, SyncRunner, active_within_duration, build_rate_limiter,
+    display_final_rate_limit, get_token_for_instance_with_db, resolve_common_sync_options,
 };
 use crate::config::Config;
 use crate::progress::ProgressReporter;
@@ -31,45 +32,15 @@ pub async fn handle_discover(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_url = Url::parse(&url).map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
 
-    let crawl_options = CrawlOptions {
-        max_depth: discover_opts.max_depth,
-        max_pages: discover_opts.max_pages,
-        concurrency: discover_opts.crawl_concurrency,
-        same_host: !discover_opts.allow_external,
-        include_subdomains: discover_opts.include_subdomains,
-        use_sitemaps: !discover_opts.no_sitemaps,
-        ..CrawlOptions::default()
-    };
+    let crawl_options = build_crawl_options(&discover_opts);
 
     let reporter = Arc::new(ProgressReporter::new());
     let progress_cb = {
         let reporter = Arc::clone(&reporter);
         let expected_pages = crawl_options.max_pages.min(u32::MAX as usize) as u32;
-        move |event: DiscoveryProgress| match event {
-            DiscoveryProgress::Started { max_pages, .. } => {
-                reporter.handle(curator::sync::SyncProgress::FetchingRepos {
-                    namespace: "discovery".to_string(),
-                    total_repos: Some(max_pages),
-                    expected_pages: Some(expected_pages),
-                });
-            }
-            DiscoveryProgress::PageFetched { fetched } => {
-                reporter.handle(curator::sync::SyncProgress::FetchedPage {
-                    namespace: "discovery".to_string(),
-                    page: fetched as u32,
-                    count: 1,
-                    total_so_far: fetched,
-                    expected_pages: Some(expected_pages),
-                });
-            }
-            DiscoveryProgress::Error { message } => {
-                reporter.handle(curator::sync::SyncProgress::Warning { message });
-            }
-            DiscoveryProgress::Finished { pages_fetched, .. } => {
-                reporter.handle(curator::sync::SyncProgress::FetchComplete {
-                    namespace: "discovery".to_string(),
-                    total: pages_fetched,
-                });
+        move |event: DiscoveryProgress| {
+            if let Some(progress) = discovery_progress_to_sync_progress(event, expected_pages) {
+                reporter.handle(progress);
             }
         }
     };
@@ -81,12 +52,10 @@ pub async fn handle_discover(
     let is_tty = Term::stdout().is_term();
 
     if is_tty {
-        println!(
-            "Discovery complete: visited {} pages (fetched {}), found {} repo links",
-            discovery.pages_visited,
-            discovery.pages_fetched,
-            discovery.repo_links.len()
-        );
+        println!("{}", discovery_complete_line(&discovery));
+        if let Some(line) = discovery_warning_line(&discovery) {
+            println!("{line}");
+        }
     } else {
         tracing::info!(
             pages_visited = discovery.pages_visited,
@@ -94,15 +63,7 @@ pub async fn handle_discover(
             repo_links = discovery.repo_links.len(),
             "Discovery complete"
         );
-    }
-
-    if !discovery.errors.is_empty() {
-        if is_tty {
-            println!(
-                "Discovery warnings: {} fetch errors",
-                discovery.errors.len()
-            );
-        } else {
+        if !discovery.errors.is_empty() {
             tracing::warn!(errors = discovery.errors.len(), "Discovery warnings");
         }
     }
@@ -133,9 +94,7 @@ pub async fn handle_discover(
         } else {
             tracing::warn!("Skipped hosts (no configured instance)");
         }
-        let mut skipped: Vec<_> = skipped_hosts.into_iter().collect();
-        skipped.sort_by(|a, b| a.0.cmp(&b.0));
-        for (host, count) in skipped {
+        for (host, count) in skipped_host_lines(&skipped_hosts) {
             if is_tty {
                 println!("  - {} ({} repos)", host, count);
             } else {
@@ -187,6 +146,99 @@ pub async fn handle_discover(
     Ok(())
 }
 
+fn discovery_complete_line(discovery: &DiscoveryResult) -> String {
+    format!(
+        "Discovery complete: visited {} pages (fetched {}), found {} repo links",
+        discovery.pages_visited,
+        discovery.pages_fetched,
+        discovery.repo_links.len()
+    )
+}
+
+fn discovery_warning_line(discovery: &DiscoveryResult) -> Option<String> {
+    (!discovery.errors.is_empty()).then(|| {
+        format!(
+            "Discovery warnings: {} fetch errors",
+            discovery.errors.len()
+        )
+    })
+}
+
+fn skipped_host_lines(skipped_hosts: &SkippedHosts) -> Vec<(String, usize)> {
+    let mut skipped: Vec<_> = skipped_hosts.iter().map(|(h, c)| (h.clone(), *c)).collect();
+    skipped.sort_by(|a, b| a.0.cmp(&b.0));
+    skipped
+}
+
+fn build_discovery_runner(
+    db_conn: Arc<DatabaseConnection>,
+    options: SyncOptions,
+    no_rate_limit: bool,
+    active_within_days: u64,
+) -> SyncRunner {
+    SyncRunner::new(db_conn, options, no_rate_limit, active_within_days)
+}
+
+fn build_discovery_sync_options_from_common(
+    sync_opts: &CommonSyncOptions,
+    config: &Config,
+) -> Result<(SyncOptions, ResolvedCommonSyncOptions), Box<dyn std::error::Error>> {
+    let resolved = resolve_common_sync_options(sync_opts, config);
+    let options = build_discovery_sync_options(
+        resolved.active_within_days,
+        resolved.star,
+        sync_opts.dry_run,
+        resolved.concurrency,
+        resolved.strategy,
+    )?;
+    Ok((options, resolved))
+}
+
+fn build_crawl_options(discover_opts: &DiscoverOptions) -> CrawlOptions {
+    CrawlOptions {
+        max_depth: discover_opts.max_depth,
+        max_pages: discover_opts.max_pages,
+        concurrency: discover_opts.crawl_concurrency,
+        same_host: !discover_opts.allow_external,
+        include_subdomains: discover_opts.include_subdomains,
+        use_sitemaps: !discover_opts.no_sitemaps,
+        ..CrawlOptions::default()
+    }
+}
+
+fn discovery_progress_to_sync_progress(
+    event: DiscoveryProgress,
+    expected_pages: u32,
+) -> Option<curator::sync::SyncProgress> {
+    match event {
+        DiscoveryProgress::Started { max_pages, .. } => {
+            Some(curator::sync::SyncProgress::FetchingRepos {
+                namespace: "discovery".to_string(),
+                total_repos: Some(max_pages),
+                expected_pages: Some(expected_pages),
+            })
+        }
+        DiscoveryProgress::PageFetched { fetched } => {
+            Some(curator::sync::SyncProgress::FetchedPage {
+                namespace: "discovery".to_string(),
+                page: fetched as u32,
+                count: 1,
+                total_so_far: fetched,
+                expected_pages: Some(expected_pages),
+            })
+        }
+        DiscoveryProgress::Error { message } => {
+            Some(curator::sync::SyncProgress::Warning { message })
+        }
+        DiscoveryProgress::Finished { pages_fetched, .. } => {
+            Some(curator::sync::SyncProgress::FetchComplete {
+                namespace: "discovery".to_string(),
+                total: pages_fetched,
+            })
+        }
+    }
+}
+
 async fn load_instances(
     db: &DatabaseConnection,
 ) -> Result<
@@ -217,20 +269,10 @@ async fn sync_instance_repos(
     config: &Config,
     db_conn: Arc<DatabaseConnection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let token = get_token_for_instance(instance, config).await?;
-    let resolved = resolve_common_sync_options(&sync_opts, config);
+    let token = get_token_for_instance_with_db(instance, config, Some(db_conn.as_ref())).await?;
+    let (options, resolved) = build_discovery_sync_options_from_common(&sync_opts, config)?;
 
-    let options = SyncOptions {
-        active_within: active_within_duration(resolved.active_within_days)?,
-        star: resolved.star,
-        dry_run: sync_opts.dry_run,
-        concurrency: resolved.concurrency,
-        platform_options: PlatformOptions::default(),
-        prune: false,
-        strategy: resolved.strategy,
-    };
-
-    let runner = SyncRunner::new(
+    let runner = build_discovery_runner(
         Arc::clone(&db_conn),
         options.clone(),
         resolved.no_rate_limit,
@@ -311,6 +353,24 @@ async fn sync_instance_repos(
     Ok(())
 }
 
+fn build_discovery_sync_options(
+    active_within_days: u64,
+    star: bool,
+    dry_run: bool,
+    concurrency: usize,
+    strategy: curator::sync::SyncStrategy,
+) -> Result<SyncOptions, Box<dyn std::error::Error>> {
+    Ok(SyncOptions {
+        active_within: active_within_duration(active_within_days)?,
+        star,
+        dry_run,
+        concurrency,
+        platform_options: PlatformOptions::default(),
+        prune: false,
+        strategy,
+    })
+}
+
 async fn run_discovery_sync_for_client<C: curator::PlatformClient + Clone + 'static>(
     runner: &SyncRunner,
     client: &C,
@@ -366,8 +426,12 @@ fn map_repos_to_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use chrono::Utc;
+    use curator::platform::{OrgInfo, PlatformError, PlatformRepo, RateLimitInfo, UserInfo};
     use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseBackend, Set, Statement};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     fn sqlite_test_url(label: &str) -> String {
         let path = std::env::temp_dir().join(format!(
@@ -391,6 +455,157 @@ mod tests {
             name: name.to_string(),
             original_url: format!("https://{host}/{owner}/{name}"),
             canonical_url: format!("https://{host}/{owner}/{name}"),
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestClient;
+
+    #[async_trait]
+    impl curator::PlatformClient for TestClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> uuid::Uuid {
+            uuid::Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> Result<RateLimitInfo, PlatformError> {
+            Ok(RateLimitInfo {
+                limit: 5000,
+                remaining: 4999,
+                reset_at: Utc::now(),
+                retry_after: None,
+            })
+        }
+
+        async fn get_org_info(&self, org: &str) -> Result<OrgInfo, PlatformError> {
+            Ok(OrgInfo {
+                name: org.to_string(),
+                public_repos: 0,
+                description: None,
+            })
+        }
+
+        async fn get_authenticated_user(&self) -> Result<UserInfo, PlatformError> {
+            Ok(UserInfo {
+                username: "tester".to_string(),
+                name: Some("Tester".to_string()),
+                email: None,
+                bio: None,
+                public_repos: 0,
+                followers: 0,
+            })
+        }
+
+        async fn get_repo(
+            &self,
+            owner: &str,
+            name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> Result<PlatformRepo, PlatformError> {
+            Ok(sample_platform_repo(owner, name))
+        }
+
+        async fn list_org_repos(
+            &self,
+            org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<Vec<PlatformRepo>, PlatformError> {
+            Ok(vec![sample_platform_repo(org, "repo")])
+        }
+
+        async fn list_user_repos(
+            &self,
+            username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<Vec<PlatformRepo>, PlatformError> {
+            Ok(vec![sample_platform_repo(username, "repo")])
+        }
+
+        async fn is_repo_starred(&self, _owner: &str, _name: &str) -> Result<bool, PlatformError> {
+            Ok(false)
+        }
+
+        async fn star_repo(&self, _owner: &str, _name: &str) -> Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        async fn unstar_repo(&self, _owner: &str, _name: &str) -> Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<Vec<PlatformRepo>, PlatformError> {
+            Ok(vec![sample_platform_repo("starred", "repo")])
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<usize, PlatformError> {
+            repo_tx
+                .send(sample_platform_repo("starred", "repo"))
+                .await
+                .map_err(|_| PlatformError::internal("channel closed"))?;
+            Ok(1)
+        }
+    }
+
+    fn sample_platform_repo(owner: &str, name: &str) -> PlatformRepo {
+        PlatformRepo {
+            platform_id: 1,
+            owner: owner.to_string(),
+            name: name.to_string(),
+            description: None,
+            default_branch: "main".to_string(),
+            visibility: curator::CodeVisibility::Public,
+            is_fork: false,
+            is_archived: false,
+            stars: None,
+            forks: None,
+            language: None,
+            topics: vec![],
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            pushed_at: Some(Utc::now()),
+            license: None,
+            homepage: None,
+            size_kb: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn sample_instance(name: &str, platform_type: PlatformType, host: &str) -> InstanceModel {
+        InstanceModel {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            platform_type,
+            host: host.to_string(),
+            oauth_client_id: None,
+            oauth_flow: "auto".to_string(),
+            created_at: Utc::now().fixed_offset(),
         }
     }
 
@@ -698,5 +913,298 @@ mod tests {
                 || message.contains("connection"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn load_instances_returns_empty_maps_when_instances_table_is_empty() {
+        let db = setup_db("load-instances-empty").await;
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM instances".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let (instances_by_host, instances_by_id) = load_instances(&db).await.unwrap();
+        assert!(instances_by_host.is_empty());
+        assert!(instances_by_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_discovery_sync_for_client_succeeds_for_repo_list() {
+        let db = Arc::new(setup_db("run-discovery-sync").await);
+        let runner = SyncRunner::new(
+            Arc::clone(&db),
+            SyncOptions {
+                active_within: active_within_duration(30).expect("duration should resolve"),
+                star: true,
+                dry_run: true,
+                concurrency: 2,
+                platform_options: PlatformOptions::default(),
+                prune: false,
+                strategy: curator::sync::SyncStrategy::Full,
+            },
+            false,
+            30,
+        );
+        let instance = InstanceModel {
+            id: uuid::Uuid::new_v4(),
+            name: "github".to_string(),
+            platform_type: PlatformType::GitHub,
+            host: "github.com".to_string(),
+            oauth_client_id: None,
+            oauth_flow: "auto".to_string(),
+            created_at: Utc::now().fixed_offset(),
+        };
+
+        run_discovery_sync_for_client(
+            &runner,
+            &TestClient,
+            &instance,
+            &[("owner".to_string(), "repo".to_string())],
+            false,
+            false,
+        )
+        .await
+        .expect("discovery sync helper should succeed");
+    }
+
+    #[test]
+    fn normalize_host_handles_www_and_case() {
+        assert_eq!(normalize_host(" WWW.GitHub.com. "), "github.com");
+        assert_eq!(normalize_host("forge.example.com"), "forge.example.com");
+    }
+
+    #[test]
+    fn build_crawl_options_maps_flags_to_crawler_options() {
+        let opts = DiscoverOptions {
+            max_depth: 3,
+            max_pages: 25,
+            crawl_concurrency: 7,
+            allow_external: true,
+            include_subdomains: true,
+            no_sitemaps: true,
+        };
+
+        let crawl = build_crawl_options(&opts);
+        assert_eq!(crawl.max_depth, 3);
+        assert_eq!(crawl.max_pages, 25);
+        assert_eq!(crawl.concurrency, 7);
+        assert!(!crawl.same_host);
+        assert!(crawl.include_subdomains);
+        assert!(!crawl.use_sitemaps);
+    }
+
+    #[test]
+    fn discovery_progress_to_sync_progress_maps_variants() {
+        assert!(matches!(
+            discovery_progress_to_sync_progress(
+                DiscoveryProgress::Started {
+                    seed_urls: 1,
+                    max_pages: 12,
+                    max_depth: 2,
+                },
+                12,
+            ),
+            Some(curator::sync::SyncProgress::FetchingRepos {
+                total_repos: Some(12),
+                ..
+            })
+        ));
+        assert!(matches!(
+            discovery_progress_to_sync_progress(DiscoveryProgress::PageFetched { fetched: 2 }, 12),
+            Some(curator::sync::SyncProgress::FetchedPage { page: 2, .. })
+        ));
+        assert!(matches!(
+            discovery_progress_to_sync_progress(
+                DiscoveryProgress::Error {
+                    message: "oops".into()
+                },
+                12,
+            ),
+            Some(curator::sync::SyncProgress::Warning { .. })
+        ));
+        assert!(matches!(
+            discovery_progress_to_sync_progress(
+                DiscoveryProgress::Finished {
+                    pages_visited: 3,
+                    pages_fetched: 2,
+                    repo_links: 1,
+                    errors: 0,
+                },
+                12,
+            ),
+            Some(curator::sync::SyncProgress::FetchComplete { total: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn build_crawl_options_defaults_same_host_when_external_disabled() {
+        let opts = DiscoverOptions {
+            max_depth: 1,
+            max_pages: 2,
+            crawl_concurrency: 3,
+            allow_external: false,
+            include_subdomains: false,
+            no_sitemaps: false,
+        };
+
+        let crawl = build_crawl_options(&opts);
+        assert!(crawl.same_host);
+        assert!(!crawl.include_subdomains);
+        assert!(crawl.use_sitemaps);
+    }
+
+    #[test]
+    fn discovery_output_helpers_format_expected_messages() {
+        let discovery = curator::discovery::DiscoveryResult {
+            start_url: Url::parse("https://example.com").unwrap(),
+            seed_urls: vec![],
+            pages_visited: 5,
+            pages_fetched: 4,
+            repo_links: vec![repo_link("github.com", "owner", "repo")],
+            errors: vec!["oops".to_string(), "retry".to_string()],
+        };
+
+        assert!(discovery_complete_line(&discovery).contains("visited 5 pages"));
+        assert_eq!(
+            discovery_warning_line(&discovery).as_deref(),
+            Some("Discovery warnings: 2 fetch errors")
+        );
+        let none = curator::discovery::DiscoveryResult {
+            errors: vec![],
+            ..discovery
+        };
+        assert!(discovery_warning_line(&none).is_none());
+    }
+
+    #[test]
+    fn skipped_host_lines_sort_hosts() {
+        let skipped = HashMap::from([
+            ("z.example".to_string(), 2_usize),
+            ("a.example".to_string(), 1_usize),
+        ]);
+        assert_eq!(
+            skipped_host_lines(&skipped),
+            vec![("a.example".to_string(), 1), ("z.example".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn build_discovery_sync_options_maps_fields_and_errors_on_large_duration() {
+        let options = build_discovery_sync_options(
+            30,
+            true,
+            true,
+            4,
+            curator::sync::SyncStrategy::Incremental,
+        )
+        .unwrap();
+        assert!(options.star);
+        assert!(options.dry_run);
+        assert_eq!(options.concurrency, 4);
+        assert_eq!(options.strategy, curator::sync::SyncStrategy::Incremental);
+
+        let err = build_discovery_sync_options(
+            (i64::MAX as u64) + 1,
+            true,
+            false,
+            1,
+            curator::sync::SyncStrategy::Full,
+        )
+        .expect_err("oversized duration should fail");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn build_discovery_sync_options_from_common_uses_config_resolution() {
+        let mut config = crate::config::Config::default();
+        config.sync.active_within_days = 21;
+        config.sync.concurrency = 9;
+        config.sync.star = false;
+        config.sync.no_rate_limit = true;
+
+        let sync_opts = crate::CommonSyncOptions {
+            active_within_days: None,
+            no_star: false,
+            dry_run: true,
+            concurrency: None,
+            no_rate_limit: false,
+            incremental: true,
+        };
+
+        let (options, resolved) =
+            build_discovery_sync_options_from_common(&sync_opts, &config).unwrap();
+        assert_eq!(resolved.active_within_days, 21);
+        assert_eq!(resolved.concurrency, 9);
+        assert!(!resolved.star);
+        assert!(resolved.no_rate_limit);
+        assert_eq!(resolved.strategy, curator::sync::SyncStrategy::Incremental);
+        assert_eq!(options.concurrency, 9);
+        assert!(options.dry_run);
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn sync_instance_repos_enters_gitlab_branch_before_client_setup_fails() {
+        let _guard = crate::test_support::env_lock().lock().await;
+        let db = Arc::new(setup_db("discover-gitlab-branch").await);
+        let instance = sample_instance("work-gitlab", PlatformType::GitLab, "bad host");
+        unsafe {
+            std::env::set_var("CURATOR_INSTANCE_WORK_GITLAB_TOKEN", "token");
+        }
+
+        let err = sync_instance_repos(
+            &instance,
+            &[("group".to_string(), "repo".to_string())],
+            crate::CommonSyncOptions {
+                active_within_days: Some(30),
+                no_star: false,
+                dry_run: true,
+                concurrency: Some(2),
+                no_rate_limit: true,
+                incremental: false,
+            },
+            &crate::config::Config::default(),
+            db,
+        )
+        .await
+        .expect_err("gitlab branch should fail with invalid host");
+
+        unsafe {
+            std::env::remove_var("CURATOR_INSTANCE_WORK_GITLAB_TOKEN");
+        }
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_discovery_runner_constructs_runner() {
+        let db = Arc::new(setup_db("build-discovery-runner").await);
+        let options =
+            build_discovery_sync_options(14, true, true, 3, curator::sync::SyncStrategy::Full)
+                .unwrap();
+        let _runner = build_discovery_runner(db, options, true, 14);
+    }
+
+    #[test]
+    fn map_repos_to_instances_dedupes_within_instance_but_not_across_instances() {
+        let github_id = uuid::Uuid::new_v4();
+        let ghe_id = uuid::Uuid::new_v4();
+        let instances_by_host = HashMap::from([
+            ("github.com".to_string(), github_id),
+            ("ghe.example.com".to_string(), ghe_id),
+        ]);
+
+        let repos = vec![
+            repo_link("github.com", "owner", "repo"),
+            repo_link("github.com", "owner", "repo"),
+            repo_link("ghe.example.com", "owner", "repo"),
+        ];
+
+        let (mapped, skipped) = map_repos_to_instances(&repos, &instances_by_host);
+
+        assert!(skipped.is_empty());
+        assert_eq!(mapped.get(&github_id).unwrap().len(), 1);
+        assert_eq!(mapped.get(&ghe_id).unwrap().len(), 1);
     }
 }

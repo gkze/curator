@@ -1111,4 +1111,150 @@ mod tests {
                 .is_finished()
         );
     }
+
+    #[test]
+    fn star_and_prune_messages_cover_all_branch_variants() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::StarringRepos {
+            count: 2,
+            concurrency: 1,
+            dry_run: false,
+        });
+        reporter.handle(SyncProgress::StarredRepo {
+            owner: "o".to_string(),
+            name: "n".to_string(),
+            already_starred: false,
+        });
+        reporter.handle(SyncProgress::StarredRepo {
+            owner: "o".to_string(),
+            name: "n2".to_string(),
+            already_starred: true,
+        });
+        reporter.handle(SyncProgress::StarError {
+            owner: "o".to_string(),
+            name: "n3".to_string(),
+            error: "boom".to_string(),
+        });
+        reporter.handle(SyncProgress::RateLimitBackoff {
+            owner: "o".to_string(),
+            name: "n4".to_string(),
+            retry_after_ms: 1500,
+            attempt: 2,
+        });
+        reporter.handle(SyncProgress::StarringComplete {
+            starred: 1,
+            already_starred: 1,
+            errors: 1,
+        });
+
+        reporter.handle(SyncProgress::PruningRepos {
+            count: 2,
+            dry_run: true,
+        });
+        reporter.handle(SyncProgress::PruneError {
+            owner: "o".to_string(),
+            name: "stale".to_string(),
+            error: "deny".to_string(),
+        });
+        reporter.handle(SyncProgress::PruningComplete {
+            pruned: 1,
+            errors: 1,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(state.star_bar.as_ref().expect("star bar").is_finished());
+        assert_eq!(
+            state.star_bar.as_ref().unwrap().message().to_string(),
+            "✓ 1 starred, 1 skipped, 1 errors"
+        );
+        assert!(state.prune_bar.as_ref().expect("prune bar").is_finished());
+        assert_eq!(
+            state.prune_bar.as_ref().unwrap().message().to_string(),
+            "✓ 1 pruned, 1 errors"
+        );
+    }
+
+    #[test]
+    fn save_bar_paths_cover_models_ready_and_namespace_completion() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::ModelsReady { count: 2 });
+        reporter.handle(SyncProgress::Persisted {
+            owner: "o".to_string(),
+            name: "repo".to_string(),
+        });
+        reporter.handle(SyncProgress::SyncNamespacesComplete {
+            successful: 2,
+            failed: 1,
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let save_bar = state.save_bar.as_ref().expect("save bar should exist");
+        assert!(save_bar.is_finished());
+        assert_eq!(save_bar.length(), Some(2));
+        assert_eq!(save_bar.message().to_string(), "✓ 2 orgs done, 1 failed");
+    }
+
+    #[test]
+    fn warning_and_cache_hit_paths_cover_additional_branches() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::Warning {
+            message: "careful".to_string(),
+        });
+        reporter.handle(SyncProgress::CacheHit {
+            namespace: "cached-org".to_string(),
+            cached_count: 3,
+        });
+        reporter.handle(SyncProgress::FetchedPage {
+            namespace: "cached-org".to_string(),
+            page: 2,
+            count: 5,
+            total_so_far: 5,
+            expected_pages: Some(3),
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        let fetch = state
+            .fetch_bars
+            .get("cached-org")
+            .expect("cache hit state should exist");
+        assert!(fetch.done);
+        assert_eq!(fetch.bar.message().to_string(), "✓ 3 repos (cached)");
+    }
+
+    #[test]
+    fn save_and_prune_progress_cover_error_messages() {
+        let reporter = InteractiveReporter::hidden();
+
+        reporter.handle(SyncProgress::PersistingBatch {
+            count: 2,
+            final_batch: true,
+        });
+        reporter.handle(SyncProgress::PersistError {
+            owner: "o".to_string(),
+            name: "r".to_string(),
+            error: "db".to_string(),
+        });
+        reporter.handle(SyncProgress::PruningRepos {
+            count: 1,
+            dry_run: false,
+        });
+        reporter.handle(SyncProgress::PruneError {
+            owner: "o".to_string(),
+            name: "old".to_string(),
+            error: "api".to_string(),
+        });
+
+        let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            state.save_bar.as_ref().unwrap().message().to_string(),
+            "✗ o/r: db"
+        );
+        assert_eq!(
+            state.prune_bar.as_ref().unwrap().message().to_string(),
+            "✗ o/old: api"
+        );
+    }
 }

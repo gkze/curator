@@ -15,6 +15,11 @@
 //! [database]
 //! url = "sqlite://~/.local/state/curator/curator.db"  # optional, this is the default
 //!
+//! [auth]
+//! credential_store = "auto" # auto, keychain, file, or db
+//! file_path = "~/.config/curator/auth.toml" # optional file backend path
+//! # db stores secrets in the curator database in plaintext-at-rest
+//!
 //! [github]
 //! token = "ghp_..."  # or use CURATOR_GITHUB_TOKEN env var
 //!
@@ -51,6 +56,8 @@ use url::Url;
 pub struct Config {
     /// Database configuration.
     pub database: DatabaseConfig,
+    /// Authentication backend configuration.
+    pub auth: AuthConfig,
     /// GitHub configuration.
     pub github: GitHubConfig,
     /// GitLab configuration.
@@ -61,6 +68,27 @@ pub struct Config {
     pub gitea: GiteaConfig,
     /// Default sync options.
     pub sync: SyncConfig,
+}
+
+/// Authentication configuration.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// How per-instance credentials are persisted.
+    pub credential_store: CredentialStore,
+    /// Optional path for the file credential backend.
+    pub file_path: Option<String>,
+}
+
+/// Supported credential storage backends.
+#[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialStore {
+    #[default]
+    Auto,
+    Keychain,
+    File,
+    Db,
 }
 
 /// Database configuration.
@@ -224,6 +252,20 @@ impl Config {
         })
     }
 
+    /// Get the configured credential store mode.
+    pub fn credential_store(&self) -> CredentialStore {
+        self.auth.credential_store
+    }
+
+    /// Get the auth file path for the file credential backend.
+    pub fn auth_file_path(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.auth.file_path {
+            return Some(PathBuf::from(path));
+        }
+
+        Self::default_config_path().and_then(|path| path.parent().map(|p| p.join("auth.toml")))
+    }
+
     /// Get the GitHub token.
     #[cfg(feature = "github")]
     pub fn github_token(&self) -> Option<String> {
@@ -334,6 +376,7 @@ impl Config {
     /// If a config file already exists, it updates only the `[github]` section,
     /// preserving formatting, comments, and other settings.
     #[cfg(feature = "github")]
+    #[allow(dead_code)]
     pub fn save_github_token(token: &str) -> io::Result<PathBuf> {
         save_toml_section_tokens("github", |doc| {
             doc["github"]["token"] = toml_edit::value(token);
@@ -391,10 +434,34 @@ impl Config {
     /// Creates the config file and parent directories if they don't exist.
     /// Updates only the `[gitea]` section while preserving other config content.
     #[cfg(feature = "gitea")]
+    #[allow(dead_code)]
     pub fn save_gitea_token(host: &str, token: &str) -> io::Result<PathBuf> {
         save_toml_section_tokens("gitea", |doc| {
             doc["gitea"]["host"] = toml_edit::value(host);
             doc["gitea"]["token"] = toml_edit::value(token);
+        })
+    }
+
+    /// Clear legacy platform-global credential keys from the config file.
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    pub fn clear_legacy_tokens(section: &str) -> io::Result<Option<PathBuf>> {
+        edit_config_doc(|doc| {
+            if !doc.contains_key(section) {
+                return Ok(false);
+            }
+
+            let Some(table) = doc[section].as_table_mut() else {
+                return Ok(false);
+            };
+
+            let mut changed = false;
+            for key in ["token", "refresh_token", "token_expires_at"] {
+                if table.remove(key).is_some() {
+                    changed = true;
+                }
+            }
+
+            Ok(changed)
         })
     }
 }
@@ -418,6 +485,21 @@ fn save_toml_section_tokens(
     section: &str,
     update: impl FnOnce(&mut toml_edit::DocumentMut),
 ) -> io::Result<PathBuf> {
+    edit_config_doc(|doc| {
+        if !doc.contains_key(section) {
+            doc[section] = toml_edit::table();
+        }
+
+        update(doc);
+        Ok(true)
+    })?
+    .ok_or_else(|| io::Error::other("failed to persist config update"))
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+fn edit_config_doc(
+    update: impl FnOnce(&mut toml_edit::DocumentMut) -> io::Result<bool>,
+) -> io::Result<Option<PathBuf>> {
     let config_path = Config::default_config_path().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -439,31 +521,75 @@ fn save_toml_section_tokens(
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid TOML: {}", e)))?;
 
-    if !doc.contains_key(section) {
-        doc[section] = toml_edit::table();
+    if !update(&mut doc)? {
+        return Ok(None);
     }
-
-    update(&mut doc);
 
     fs::write(&config_path, doc.to_string())?;
 
-    // Restrict permissions to owner-only (0600) since file contains tokens
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
     }
 
-    Ok(config_path)
+    Ok(Some(config_path))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::fs;
+
+    struct TempConfigEnv {
+        temp_dir: PathBuf,
+        previous_home: Option<OsString>,
+        previous_xdg_config_home: Option<OsString>,
+    }
+
+    impl TempConfigEnv {
+        fn new(label: &str) -> Self {
+            let temp_dir = std::env::temp_dir().join(format!(
+                "curator-config-tests-{}-{}",
+                label,
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&temp_dir).unwrap();
+            let previous_home = std::env::var_os("HOME");
+            let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+            unsafe {
+                std::env::set_var("HOME", &temp_dir);
+                std::env::set_var("XDG_CONFIG_HOME", &temp_dir);
+            }
+            Self {
+                temp_dir,
+                previous_home,
+                previous_xdg_config_home,
+            }
+        }
+    }
+
+    impl Drop for TempConfigEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous_home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.previous_xdg_config_home {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.temp_dir);
+        }
+    }
 
     #[test]
     fn test_default_config() {
         let config = Config::default();
+        assert_eq!(config.auth.credential_store, CredentialStore::Auto);
         assert_eq!(config.sync.active_within_days, 60);
         assert_eq!(config.sync.concurrency, 20);
         assert!(config.sync.star);
@@ -492,6 +618,9 @@ mod tests {
             [database]
             url = "sqlite:///tmp/test.db"
 
+            [auth]
+            credential_store = "db"
+
             [github]
             token = "ghp_test123"
 
@@ -512,6 +641,7 @@ mod tests {
             config.database.url,
             Some("sqlite:///tmp/test.db".to_string())
         );
+        assert_eq!(config.auth.credential_store, CredentialStore::Db);
         assert_eq!(config.github.token, Some("ghp_test123".to_string()));
         assert_eq!(config.sync.active_within_days, 90);
         assert_eq!(config.sync.concurrency, 10);
@@ -557,6 +687,10 @@ mod tests {
             [database]
             url = "sqlite:///tmp/test.db"
 
+            [auth]
+            credential_store = "file"
+            file_path = "/tmp/curator-auth.toml"
+
             [github]
             token = "ghp_test123"
 
@@ -583,6 +717,11 @@ mod tests {
         assert_eq!(
             config.database.url,
             Some("sqlite:///tmp/test.db".to_string())
+        );
+        assert_eq!(config.auth.credential_store, CredentialStore::File);
+        assert_eq!(
+            config.auth.file_path,
+            Some("/tmp/curator-auth.toml".to_string())
         );
         assert_eq!(config.github.token, Some("ghp_test123".to_string()));
         assert_eq!(config.codeberg.token, Some("codeberg_token".to_string()));
@@ -838,5 +977,20 @@ mod tests {
         // This should succeed despite unknown_field
         let config: Config = settings.try_deserialize().unwrap();
         assert_eq!(config.sync.active_within_days, 60);
+    }
+
+    #[test]
+    #[cfg(feature = "gitlab")]
+    fn test_clear_legacy_tokens_removes_token_keys_only() {
+        let _env = TempConfigEnv::new("clear-legacy");
+        let path = Config::save_gitlab_oauth_tokens("access", Some("refresh"), Some(42)).unwrap();
+
+        Config::clear_legacy_tokens("gitlab").unwrap();
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(contents.contains("[gitlab]"));
+        assert!(!contents.contains("access"));
+        assert!(!contents.contains("refresh"));
+        assert!(!contents.contains("42"));
     }
 }

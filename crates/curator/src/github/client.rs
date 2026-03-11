@@ -2372,6 +2372,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_rate_limit_succeeds_when_remaining_positive() {
+        let server = OctoServer::spawn(HashMap::from([(
+            "/rate_limit".to_string(),
+            VecDeque::from([PlannedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: rate_limit_json(1, 123),
+            }]),
+        )]));
+
+        let octocrab = Octocrab::builder()
+            .base_uri(&server.base_url)
+            .expect("base uri should parse")
+            .build()
+            .expect("octocrab should build");
+
+        check_rate_limit(&octocrab)
+            .await
+            .expect("remaining > 0 should succeed");
+        assert!(server.is_drained());
+    }
+
+    #[tokio::test]
     async fn get_rate_limit_reads_core_resource() {
         let server = OctoServer::spawn(HashMap::from([(
             "/rate_limit".to_string(),
@@ -2393,6 +2416,78 @@ mod tests {
             .expect("get_rate_limit should succeed");
         assert_eq!(info.remaining, 7);
         assert!(server.is_drained());
+    }
+
+    #[tokio::test]
+    async fn get_rate_limits_reads_full_response() {
+        let server = OctoServer::spawn(HashMap::from([(
+            "/rate_limit".to_string(),
+            VecDeque::from([PlannedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: rate_limit_json(11, 1706400000),
+            }]),
+        )]));
+
+        let octocrab = Octocrab::builder()
+            .base_uri(&server.base_url)
+            .expect("base uri should parse")
+            .build()
+            .expect("octocrab should build");
+
+        let info = get_rate_limits(&octocrab)
+            .await
+            .expect("get_rate_limits should succeed");
+        assert_eq!(info.resources.core.remaining, 11);
+        assert!(server.is_drained());
+    }
+
+    #[test]
+    fn extract_etag_and_page_helpers_cover_edge_cases() {
+        let headers: HttpHeaders = vec![("ETag".to_string(), "W/\"weak\"".to_string())];
+        assert_eq!(extract_etag(&headers), Some("W/\"weak\"".to_string()));
+
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?foo=1&page=7&bar=2"),
+            Some(7)
+        );
+        assert_eq!(
+            extract_page_from_url("https://api.github.com/repos?foo=1"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn from_octocrab_uses_default_empty_token() {
+        let octocrab = Octocrab::builder().build().expect("octocrab should build");
+        let client = GitHubClient::from_octocrab(octocrab, Uuid::nil());
+        assert_eq!(client.token(), "");
+        assert_eq!(client.instance_id(), Uuid::nil());
+    }
+
+    #[tokio::test]
+    async fn from_octocrab_with_transport_trims_base_url() {
+        let octocrab = Octocrab::builder().build().expect("octocrab should build");
+        let transport = Arc::new(MockTransport::new()) as Arc<dyn HttpTransport>;
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::nil(),
+            transport,
+            "https://api.github.example///",
+        );
+        assert_eq!(client.api_base_url.as_str(), "https://api.github.example");
+    }
+
+    #[tokio::test]
+    async fn wait_for_rate_limit_and_update_rate_limit_cover_limiter_paths() {
+        let limiter = AdaptiveRateLimiter::new(10);
+        let client = GitHubClient::new("token", Uuid::new_v4(), Some(limiter)).unwrap();
+        client.wait_for_rate_limit().await;
+        client.update_rate_limit(&vec![
+            ("x-ratelimit-limit".to_string(), "10".to_string()),
+            ("x-ratelimit-remaining".to_string(), "9".to_string()),
+            ("x-ratelimit-reset".to_string(), "1".to_string()),
+        ]);
     }
 
     #[tokio::test]
@@ -2419,6 +2514,96 @@ mod tests {
         assert_eq!(org.public_repos, 12);
         assert_eq!(org.description.as_deref(), Some("hi"));
         assert!(server.is_drained());
+    }
+
+    #[tokio::test]
+    async fn get_org_info_uses_fallbacks_when_fields_missing() {
+        let server = OctoServer::spawn(HashMap::from([(
+            "/orgs/acme".to_string(),
+            VecDeque::from([PlannedResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: r#"{}"#.to_string(),
+            }]),
+        )]));
+
+        let octocrab = Octocrab::builder()
+            .base_uri(&server.base_url)
+            .expect("base uri should parse")
+            .build()
+            .expect("octocrab should build");
+
+        let org = get_org_info(&octocrab, "acme")
+            .await
+            .expect("fallback org info should succeed");
+        assert_eq!(org.name, "acme");
+        assert_eq!(org.public_repos, 0);
+        assert!(org.description.is_none());
+        assert!(server.is_drained());
+    }
+
+    #[test]
+    fn parse_rate_limit_headers_accepts_mixed_case_header_names() {
+        let info = GitHubClient::parse_rate_limit_headers(&vec![
+            ("X-RateLimit-Limit".to_string(), "10".to_string()),
+            ("X-RateLimit-Remaining".to_string(), "7".to_string()),
+            ("X-RateLimit-Reset".to_string(), "1".to_string()),
+        ])
+        .expect("mixed case headers should parse");
+
+        assert_eq!(info.limit, 10);
+        assert_eq!(info.remaining, 7);
+    }
+
+    #[tokio::test]
+    async fn list_org_repos_cached_uses_sequential_wrapper() {
+        let server = OctoServer::spawn(HashMap::from([
+            (
+                "/rate_limit".to_string(),
+                VecDeque::from([PlannedResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: rate_limit_json(10, 1706400000),
+                }]),
+            ),
+            (
+                "/orgs/acme".to_string(),
+                VecDeque::from([PlannedResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: r#"{"login":"acme","public_repos":1}"#.to_string(),
+                }]),
+            ),
+        ]));
+        let transport = MockTransport::new();
+        let page1 = format!("{TEST_BASE_URL}/orgs/acme/repos?per_page=100&page=1");
+        push_response(
+            &transport,
+            &page1,
+            200,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            serde_json::to_string(&vec![repo_json(1, "repo")]).unwrap(),
+        );
+
+        let octocrab = Octocrab::builder()
+            .base_uri(&server.base_url)
+            .expect("base uri should parse")
+            .build()
+            .expect("octocrab should build");
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            Arc::new(transport.clone()),
+            TEST_BASE_URL,
+        );
+
+        let (repos, stats) = client
+            .list_org_repos_cached("acme", None, None)
+            .await
+            .unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(stats.pages_fetched, 1);
+        assert_eq!(transport.requests().len(), 1);
     }
 
     #[tokio::test]
@@ -2616,5 +2801,219 @@ mod tests {
         assert_eq!(stats.pages_fetched, 1);
 
         assert!(server.is_drained());
+    }
+
+    #[tokio::test]
+    async fn platform_client_repo_listing_wrappers_delegate_to_cached_helpers() {
+        let server = OctoServer::spawn(HashMap::from([
+            (
+                "/rate_limit".to_string(),
+                VecDeque::from([
+                    PlannedResponse {
+                        status: 200,
+                        headers: vec![("content-type".to_string(), "application/json".to_string())],
+                        body: rate_limit_json(10, 1706400000),
+                    },
+                    PlannedResponse {
+                        status: 200,
+                        headers: vec![("content-type".to_string(), "application/json".to_string())],
+                        body: rate_limit_json(10, 1706400000),
+                    },
+                ]),
+            ),
+            (
+                "/orgs/acme".to_string(),
+                VecDeque::from([PlannedResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: r#"{"login":"acme","public_repos":1}"#.to_string(),
+                }]),
+            ),
+            (
+                "/users/octo".to_string(),
+                VecDeque::from([PlannedResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: r#"{"login":"octo","public_repos":1}"#.to_string(),
+                }]),
+            ),
+        ]));
+
+        let octocrab = Octocrab::builder()
+            .base_uri(&server.base_url)
+            .expect("base uri should parse")
+            .build()
+            .expect("octocrab should build");
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        push_response(
+            &transport,
+            &format!("{TEST_BASE_URL}/orgs/acme/repos?per_page=100&page=1"),
+            200,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            serde_json::to_string(&vec![repo_json(21, "org-wrapper")]).expect("org repo json"),
+        );
+        let repos = PlatformClient::list_org_repos(&client, "acme", None, None)
+            .await
+            .expect("org wrapper should succeed");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].platform_id, 21);
+
+        push_response(
+            &transport,
+            &format!("{TEST_BASE_URL}/users/octo/repos?per_page=100&page=1"),
+            200,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            serde_json::to_string(&vec![repo_json(22, "user-wrapper")]).expect("user repo json"),
+        );
+        let repos = PlatformClient::list_user_repos(&client, "octo", None, None)
+            .await
+            .expect("user wrapper should succeed");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].platform_id, 22);
+
+        assert!(server.is_drained());
+    }
+
+    #[tokio::test]
+    async fn platform_client_starred_and_star_wrappers_cover_direct_paths() {
+        let server = OctoServer::spawn(HashMap::from([
+            (
+                "/user/starred".to_string(),
+                VecDeque::from([
+                    PlannedResponse {
+                        status: 200,
+                        headers: vec![("content-type".to_string(), "application/json".to_string())],
+                        body: serde_json::to_string(&vec![repo_json(30, "starred-wrapper")])
+                            .expect("starred repo json"),
+                    },
+                    PlannedResponse {
+                        status: 200,
+                        headers: vec![("content-type".to_string(), "application/json".to_string())],
+                        body: serde_json::to_string(&vec![repo_json(31, "starred-stream")])
+                            .expect("starred stream json"),
+                    },
+                ]),
+            ),
+            (
+                "/user/starred/owner/already".to_string(),
+                VecDeque::from([PlannedResponse {
+                    status: 204,
+                    headers: Vec::new(),
+                    body: String::new(),
+                }]),
+            ),
+            (
+                "/user/starred/owner/new".to_string(),
+                VecDeque::from([
+                    PlannedResponse {
+                        status: 404,
+                        headers: Vec::new(),
+                        body: String::new(),
+                    },
+                    PlannedResponse {
+                        status: 204,
+                        headers: Vec::new(),
+                        body: String::new(),
+                    },
+                ]),
+            ),
+            (
+                "/user/starred/owner/retry".to_string(),
+                VecDeque::from([
+                    PlannedResponse {
+                        status: 404,
+                        headers: Vec::new(),
+                        body: String::new(),
+                    },
+                    PlannedResponse {
+                        status: 204,
+                        headers: Vec::new(),
+                        body: String::new(),
+                    },
+                ]),
+            ),
+            (
+                "/user/starred/owner/old".to_string(),
+                VecDeque::from([
+                    PlannedResponse {
+                        status: 204,
+                        headers: Vec::new(),
+                        body: String::new(),
+                    },
+                    PlannedResponse {
+                        status: 204,
+                        headers: Vec::new(),
+                        body: String::new(),
+                    },
+                ]),
+            ),
+        ]));
+
+        let octocrab = Octocrab::builder()
+            .base_uri(&server.base_url)
+            .expect("base uri should parse")
+            .build()
+            .expect("octocrab should build");
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let repos = PlatformClient::list_starred_repos(&client, None, 1, true, None)
+            .await
+            .expect("starred wrapper should succeed");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].platform_id, 30);
+
+        push_response(
+            &transport,
+            &format!("{TEST_BASE_URL}/user/starred?per_page=100&page=1"),
+            200,
+            vec![("content-type".to_string(), "application/json".to_string())],
+            serde_json::to_string(&vec![repo_json(31, "starred-stream")])
+                .expect("starred stream json"),
+        );
+        let (tx, mut rx) = mpsc::channel(4);
+        let count = PlatformClient::list_starred_repos_streaming(&client, tx, None, 1, true, None)
+            .await
+            .expect("starred streaming wrapper should succeed");
+        assert_eq!(count, 1);
+        assert_eq!(rx.recv().await.expect("streamed repo").platform_id, 31);
+
+        assert!(
+            PlatformClient::is_repo_starred(&client, "owner", "already")
+                .await
+                .expect("starred status should succeed")
+        );
+
+        assert!(
+            PlatformClient::star_repo(&client, "owner", "new")
+                .await
+                .expect("star repo wrapper should succeed")
+        );
+
+        assert!(
+            PlatformClient::star_repo_with_retry(&client, "owner", "retry", None)
+                .await
+                .expect("star repo with retry wrapper should succeed")
+        );
+
+        assert!(
+            PlatformClient::unstar_repo(&client, "owner", "old")
+                .await
+                .expect("unstar repo wrapper should succeed")
+        );
     }
 }

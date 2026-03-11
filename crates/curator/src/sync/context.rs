@@ -463,16 +463,43 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::Utc;
+    #[cfg(feature = "github")]
+    use octocrab::Octocrab;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use uuid::Uuid;
 
     use crate::entity::platform_type::PlatformType;
+    #[cfg(feature = "github")]
+    use crate::github::GitHubClient;
     use crate::platform::{OrgInfo, PlatformRepo, RateLimitInfo, UserInfo};
+    #[cfg(feature = "github")]
+    use crate::{HttpTransport, MockTransport};
 
     use super::*;
 
     #[derive(Clone)]
     struct TestPlatformClient;
+
+    #[derive(Clone)]
+    struct SuccessPlatformClient;
+
+    #[cfg(feature = "github")]
+    fn github_test_client() -> GitHubClient {
+        let base_url = "http://127.0.0.1:1";
+        let octocrab = Octocrab::builder()
+            .base_uri(base_url)
+            .expect("base url should parse")
+            .build()
+            .expect("octocrab should build");
+        let transport: Arc<dyn HttpTransport> = Arc::new(MockTransport::new());
+
+        GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport,
+            base_url,
+        )
+    }
 
     #[async_trait]
     impl PlatformClient for TestPlatformClient {
@@ -580,6 +607,156 @@ mod tests {
             _on_progress: Option<&crate::platform::ProgressCallback>,
         ) -> std::result::Result<usize, PlatformError> {
             Err(PlatformError::internal("unused in tests"))
+        }
+    }
+
+    #[async_trait]
+    impl PlatformClient for SuccessPlatformClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> std::result::Result<RateLimitInfo, PlatformError> {
+            Ok(RateLimitInfo {
+                limit: 5000,
+                remaining: 4999,
+                reset_at: Utc::now(),
+                retry_after: None,
+            })
+        }
+
+        async fn get_org_info(&self, org: &str) -> std::result::Result<OrgInfo, PlatformError> {
+            Ok(OrgInfo {
+                name: org.to_string(),
+                public_repos: 1,
+                description: None,
+            })
+        }
+
+        async fn get_authenticated_user(&self) -> std::result::Result<UserInfo, PlatformError> {
+            Ok(UserInfo {
+                username: "octo".to_string(),
+                name: Some("Octo".to_string()),
+                email: None,
+                bio: None,
+                public_repos: 1,
+                followers: 0,
+            })
+        }
+
+        async fn get_repo(
+            &self,
+            owner: &str,
+            name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> std::result::Result<PlatformRepo, PlatformError> {
+            Ok(success_repo(owner, name))
+        }
+
+        async fn list_org_repos(
+            &self,
+            org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<Vec<PlatformRepo>, PlatformError> {
+            Ok(vec![success_repo(org, "org-repo")])
+        }
+
+        async fn list_user_repos(
+            &self,
+            username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<Vec<PlatformRepo>, PlatformError> {
+            Ok(vec![success_repo(username, "user-repo")])
+        }
+
+        async fn is_repo_starred(
+            &self,
+            _owner: &str,
+            _name: &str,
+        ) -> std::result::Result<bool, PlatformError> {
+            Ok(false)
+        }
+
+        async fn star_repo(
+            &self,
+            _owner: &str,
+            _name: &str,
+        ) -> std::result::Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        async fn unstar_repo(
+            &self,
+            _owner: &str,
+            _name: &str,
+        ) -> std::result::Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<Vec<PlatformRepo>, PlatformError> {
+            Ok(vec![success_repo("octo", "starred-repo")])
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> std::result::Result<usize, PlatformError> {
+            repo_tx
+                .send(success_repo("octo", "starred-repo"))
+                .await
+                .map_err(|err| PlatformError::internal(err.to_string()))?;
+            Ok(1)
+        }
+    }
+
+    fn success_repo(owner: &str, name: &str) -> PlatformRepo {
+        use crate::entity::code_visibility::CodeVisibility;
+
+        PlatformRepo {
+            platform_id: 42,
+            owner: owner.to_string(),
+            name: name.to_string(),
+            description: Some("test repo".to_string()),
+            default_branch: "main".to_string(),
+            visibility: CodeVisibility::Public,
+            is_fork: false,
+            is_archived: false,
+            stars: Some(5),
+            forks: Some(1),
+            language: Some("Rust".to_string()),
+            topics: vec!["coverage".to_string()],
+            created_at: None,
+            updated_at: Some(Utc::now()),
+            pushed_at: Some(Utc::now()),
+            license: None,
+            homepage: None,
+            size_kb: Some(10),
+            metadata: serde_json::json!({}),
         }
     }
 
@@ -1031,5 +1208,259 @@ mod tests {
         assert_eq!(user_persist.saved_count, 0);
         assert!(user_persist.errors.is_empty());
         assert!(user_persist.panic_info.is_none());
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn test_github_client_specializes_context_methods_on_error_paths() {
+        let ctx = SyncContext::builder()
+            .client(github_test_client())
+            .options(SyncOptions {
+                dry_run: true,
+                star: false,
+                prune: false,
+                ..SyncOptions::default()
+            })
+            .build()
+            .expect("github dry-run context should build");
+
+        assert_eq!(ctx.client().platform_type(), PlatformType::GitHub);
+        assert!(ctx.database().is_none());
+
+        let namespace_err = ctx
+            .sync_namespace("acme")
+            .await
+            .expect_err("missing mock responses should fail org sync");
+        assert!(!namespace_err.to_string().is_empty());
+
+        let namespace_stream_err = ctx
+            .sync_namespace_streaming("acme")
+            .await
+            .expect_err("missing mock responses should fail org streaming sync");
+        assert!(!namespace_stream_err.to_string().is_empty());
+
+        let user_stream_err = ctx
+            .sync_user_streaming("octo")
+            .await
+            .expect_err("missing mock responses should fail user streaming sync");
+        assert!(!user_stream_err.to_string().is_empty());
+
+        let starred_err = ctx
+            .sync_starred_streaming(true)
+            .await
+            .expect_err("missing mock responses should fail starred sync");
+        assert!(!starred_err.to_string().is_empty());
+
+        let namespaces = vec!["acme".to_string(), "beta".to_string()];
+        let (namespace_results, namespace_persist) =
+            ctx.sync_namespaces_streaming(&namespaces).await;
+        assert_eq!(namespace_results.len(), 2);
+        assert!(
+            namespace_results
+                .iter()
+                .all(|result| result.error.is_some())
+        );
+        assert_eq!(namespace_persist.saved_count, 0);
+
+        let users = vec!["octo".to_string(), "hubot".to_string()];
+        let (user_results, user_persist) = ctx.sync_users_streaming(&users).await;
+        assert_eq!(user_results.len(), 2);
+        assert!(user_results.iter().all(|result| result.error.is_some()));
+        assert_eq!(user_persist.saved_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_public_sync_methods_succeed_with_success_client() {
+        let ctx = SyncContext {
+            client: SuccessPlatformClient,
+            options: SyncOptions {
+                dry_run: true,
+                star: false,
+                prune: false,
+                ..SyncOptions::default()
+            },
+            database: None,
+            progress: None,
+            shutdown_flag: None,
+        };
+
+        let (namespace, namespace_models) = ctx
+            .sync_namespace("acme")
+            .await
+            .expect("namespace sync should succeed");
+        assert_eq!(namespace.processed, 1);
+        assert_eq!(namespace.matched, 1);
+        assert_eq!(namespace_models.len(), 1);
+
+        let namespace_stream = ctx
+            .sync_namespace_streaming("acme")
+            .await
+            .expect("namespace streaming sync should succeed");
+        assert_eq!(namespace_stream.sync.processed, 1);
+
+        let user_stream = ctx
+            .sync_user_streaming("octo")
+            .await
+            .expect("user streaming sync should succeed");
+        assert_eq!(user_stream.sync.processed, 1);
+
+        let starred_stream = ctx
+            .sync_starred_streaming(true)
+            .await
+            .expect("starred streaming sync should succeed");
+        assert_eq!(starred_stream.sync.processed, 1);
+
+        let namespaces = vec!["acme".to_string(), "beta".to_string()];
+        let (namespace_results, namespace_persist) =
+            ctx.sync_namespaces_streaming(&namespaces).await;
+        assert_eq!(namespace_results.len(), 2);
+        assert!(
+            namespace_results
+                .iter()
+                .all(|result| result.error.is_none())
+        );
+        assert_eq!(namespace_persist.saved_count, 0);
+
+        let users = vec!["octo".to_string(), "hubot".to_string()];
+        let (user_results, user_persist) = ctx.sync_users_streaming(&users).await;
+        assert_eq!(user_results.len(), 2);
+        assert!(user_results.iter().all(|result| result.error.is_none()));
+        assert_eq!(user_persist.saved_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_test_and_success_platform_clients_cover_trait_methods() {
+        let test_client = TestPlatformClient;
+        assert_eq!(test_client.platform_type(), PlatformType::GitHub);
+        assert_eq!(test_client.instance_id(), Uuid::nil());
+        assert_eq!(
+            test_client
+                .get_rate_limit()
+                .await
+                .expect("rate limit")
+                .remaining,
+            5000
+        );
+        assert!(test_client.get_org_info("org").await.is_err());
+        assert!(test_client.get_authenticated_user().await.is_err());
+        assert!(test_client.get_repo("owner", "repo", None).await.is_err());
+        assert!(test_client.list_org_repos("org", None, None).await.is_err());
+        assert!(
+            test_client
+                .list_user_repos("user", None, None)
+                .await
+                .is_err()
+        );
+        assert!(test_client.is_repo_starred("owner", "repo").await.is_err());
+        assert!(test_client.star_repo("owner", "repo").await.is_err());
+        assert!(
+            test_client
+                .star_repo_with_retry("owner", "repo", None)
+                .await
+                .is_err()
+        );
+        assert!(test_client.unstar_repo("owner", "repo").await.is_err());
+        assert!(
+            test_client
+                .list_starred_repos(None, 1, false, None)
+                .await
+                .is_err()
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(
+            test_client
+                .list_starred_repos_streaming(tx, None, 1, false, None)
+                .await
+                .is_err()
+        );
+
+        let success_client = SuccessPlatformClient;
+        assert_eq!(success_client.platform_type(), PlatformType::GitHub);
+        assert_eq!(success_client.instance_id(), Uuid::nil());
+        assert_eq!(
+            success_client
+                .get_rate_limit()
+                .await
+                .expect("rate limit")
+                .remaining,
+            4999
+        );
+        assert_eq!(
+            success_client.get_org_info("acme").await.expect("org").name,
+            "acme"
+        );
+        assert_eq!(
+            success_client
+                .get_authenticated_user()
+                .await
+                .expect("user")
+                .username,
+            "octo"
+        );
+        assert_eq!(
+            success_client
+                .get_repo("owner", "repo", None)
+                .await
+                .expect("repo")
+                .full_name(),
+            "owner/repo"
+        );
+        assert_eq!(
+            success_client
+                .list_org_repos("acme", None, None)
+                .await
+                .expect("org repos")
+                .len(),
+            1
+        );
+        assert_eq!(
+            success_client
+                .list_user_repos("octo", None, None)
+                .await
+                .expect("user repos")
+                .len(),
+            1
+        );
+        assert!(
+            !success_client
+                .is_repo_starred("owner", "repo")
+                .await
+                .expect("starred status")
+        );
+        assert!(
+            success_client
+                .star_repo("owner", "repo")
+                .await
+                .expect("star repo")
+        );
+        assert!(
+            success_client
+                .star_repo_with_retry("owner", "repo", None)
+                .await
+                .expect("star repo with retry")
+        );
+        assert!(
+            success_client
+                .unstar_repo("owner", "repo")
+                .await
+                .expect("unstar repo")
+        );
+        assert_eq!(
+            success_client
+                .list_starred_repos(None, 1, false, None)
+                .await
+                .expect("starred repos")
+                .len(),
+            1
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        assert_eq!(
+            success_client
+                .list_starred_repos_streaming(tx, None, 1, false, None)
+                .await
+                .expect("starred repos streaming"),
+            1
+        );
+        assert_eq!(rx.recv().await.expect("streamed repo").name, "starred-repo");
     }
 }

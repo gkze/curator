@@ -575,4 +575,112 @@ mod tests {
         assert!(debug_str.contains("GitLabProject"));
         assert!(debug_str.contains("test"));
     }
+
+    #[test]
+    fn test_from_generated_project_applies_defaults() {
+        let generated: generated::ApiEntitiesProject = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "name": "proj",
+            "path": "proj",
+            "path_with_namespace": "group/proj",
+            "created_at": "2024-01-01T00:00:00Z",
+            "last_activity_at": "2024-01-02T00:00:00Z"
+        }))
+        .unwrap();
+
+        let project = GitLabProject::from(generated);
+        assert_eq!(project.id, 42);
+        assert_eq!(project.visibility, "private");
+        assert!(!project.archived);
+        assert_eq!(project.namespace.id, 0);
+    }
+
+    #[test]
+    fn test_from_generated_project_with_access_preserves_namespace_and_urls() {
+        let generated: generated::ApiEntitiesProjectWithAccess =
+            serde_json::from_value(serde_json::json!({
+                "id": 7,
+                "name": "proj",
+                "path": "proj",
+                "path_with_namespace": "group/proj",
+                "visibility": "public",
+                "created_at": "2024-01-01T00:00:00Z",
+                "last_activity_at": "2024-01-02T00:00:00Z",
+                "namespace": {
+                    "id": 9,
+                    "name": "group",
+                    "path": "group",
+                    "full_path": "group",
+                    "kind": "group"
+                },
+                "web_url": "https://gitlab.example/group/proj",
+                "ssh_url_to_repo": "git@gitlab.example:group/proj.git",
+                "http_url_to_repo": "https://gitlab.example/group/proj.git"
+            }))
+            .unwrap();
+
+        let project = GitLabProject::from(generated);
+        assert_eq!(project.namespace.id, 9);
+        assert_eq!(project.web_url, "https://gitlab.example/group/proj");
+        assert!(project.ssh_url_to_repo.is_some());
+        assert!(project.http_url_to_repo.is_some());
+    }
+
+    #[test]
+    fn test_from_generated_basic_project_details_sets_missing_fields_to_none() {
+        let generated: generated::ApiEntitiesBasicProjectDetails =
+            serde_json::from_value(serde_json::json!({
+                "id": 5,
+                "name": "proj",
+                "path": "proj",
+                "path_with_namespace": "group/proj",
+                "created_at": "2024-01-01T00:00:00Z",
+                "last_activity_at": "2024-01-02T00:00:00Z"
+            }))
+            .unwrap();
+
+        let project = GitLabProject::from(generated);
+        assert!(!project.archived);
+        assert!(project.forked_from_project.is_none());
+        assert!(project.issues_enabled.is_none());
+        assert!(project.wiki_enabled.is_none());
+        assert!(project.merge_requests_enabled.is_none());
+    }
+
+    #[test]
+    fn test_from_generated_namespace_and_user() {
+        let ns: generated::ApiEntitiesNamespaceBasic = serde_json::from_value(serde_json::json!({
+            "id": 99,
+            "name": "group",
+            "path": "group",
+            "full_path": "parent/group",
+            "kind": "group"
+        }))
+        .unwrap();
+        let converted_ns = GitLabNamespace::from(ns);
+        assert_eq!(converted_ns.full_path, "parent/group");
+
+        let user: generated::ApiEntitiesCurrentUser = serde_json::from_value(serde_json::json!({
+            "id": 123,
+            "username": "jane"
+        }))
+        .unwrap();
+        let converted_user = GitLabUser::from(user);
+        assert_eq!(converted_user.username, "jane");
+        assert_eq!(converted_user.followers, 0);
+    }
+
+    #[test]
+    fn test_from_generated_group_detail_handles_invalid_id() {
+        let group: generated::ApiEntitiesGroupDetail = serde_json::from_value(serde_json::json!({
+            "id": "not-a-number",
+            "name": "group",
+            "full_path": "group"
+        }))
+        .unwrap();
+
+        let converted = GitLabGroup::from(group);
+        assert_eq!(converted.id, 0);
+        assert_eq!(converted.visibility, "private");
+    }
 }

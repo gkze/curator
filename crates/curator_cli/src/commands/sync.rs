@@ -22,7 +22,7 @@ use crate::CommonSyncOptions;
 use crate::StarredSyncOptions;
 use crate::commands::shared::{
     SyncKind, SyncRunner, active_within_duration, build_rate_limiter, display_final_rate_limit,
-    find_instance_by_name, get_token_for_instance, resolve_common_sync_options,
+    find_instance_by_name, get_token_for_instance_with_db, resolve_common_sync_options,
     resolve_starred_sync_options,
 };
 use crate::config::Config;
@@ -241,6 +241,59 @@ fn resolve_starred_sync_settings(
     }
 }
 
+fn build_namespace_sync_options(
+    active_within_days: u64,
+    concurrency: usize,
+    star: bool,
+    dry_run: bool,
+    no_subgroups: bool,
+    strategy: SyncStrategy,
+) -> Result<SyncOptions, Box<dyn std::error::Error>> {
+    Ok(SyncOptions {
+        active_within: active_within_duration(active_within_days)?,
+        star,
+        dry_run,
+        concurrency,
+        platform_options: PlatformOptions {
+            include_subgroups: !no_subgroups,
+        },
+        prune: false,
+        strategy,
+    })
+}
+
+fn build_user_sync_options(
+    active_within_days: u64,
+    concurrency: usize,
+    star: bool,
+    dry_run: bool,
+    strategy: SyncStrategy,
+) -> Result<SyncOptions, Box<dyn std::error::Error>> {
+    Ok(SyncOptions {
+        active_within: active_within_duration(active_within_days)?,
+        star,
+        dry_run,
+        concurrency,
+        platform_options: PlatformOptions::default(),
+        prune: false,
+        strategy,
+    })
+}
+
+fn build_starred_sync_options(
+    settings: ResolvedStarredSyncSettings,
+) -> Result<SyncOptions, Box<dyn std::error::Error>> {
+    Ok(SyncOptions {
+        active_within: active_within_duration(settings.active_within_days)?,
+        star: false,
+        dry_run: settings.dry_run,
+        concurrency: settings.concurrency,
+        platform_options: PlatformOptions::default(),
+        prune: settings.prune,
+        strategy: SyncStrategy::Full,
+    })
+}
+
 fn stars_all_parallelism(requested_concurrency: usize, instance_count: usize) -> usize {
     if instance_count == 0 {
         return 0;
@@ -260,26 +313,23 @@ async fn sync_org(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db_conn = db::connect_and_migrate(database_url).await?;
     let instance = get_instance(&db_conn, instance_name).await?;
-    let token = get_token_for_instance(&instance, config).await?;
+    let token = get_token_for_instance_with_db(&instance, config, Some(&db_conn)).await?;
 
     let (active_within_days, concurrency, star, no_rate_limit, strategy) =
         merge_common_sync_options(&sync_opts, config);
 
     let db = Arc::new(db_conn);
 
-    let options = SyncOptions {
-        active_within: active_within_duration(active_within_days)?,
-        star,
-        dry_run: sync_opts.dry_run,
+    let options = build_namespace_sync_options(
+        active_within_days,
         concurrency,
-        platform_options: PlatformOptions {
-            include_subgroups: !no_subgroups,
-        },
-        prune: false,
+        star,
+        sync_opts.dry_run,
+        no_subgroups,
         strategy,
-    };
+    )?;
 
-    let runner = SyncRunner::new(
+    let runner = build_runner(
         Arc::clone(&db),
         options.clone(),
         no_rate_limit,
@@ -351,24 +401,22 @@ async fn sync_user(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db_conn = db::connect_and_migrate(database_url).await?;
     let instance = get_instance(&db_conn, instance_name).await?;
-    let token = get_token_for_instance(&instance, config).await?;
+    let token = get_token_for_instance_with_db(&instance, config, Some(&db_conn)).await?;
 
     let (active_within_days, concurrency, star, no_rate_limit, strategy) =
         merge_common_sync_options(&sync_opts, config);
 
     let db = Arc::new(db_conn);
 
-    let options = SyncOptions {
-        active_within: active_within_duration(active_within_days)?,
-        star,
-        dry_run: sync_opts.dry_run,
+    let options = build_user_sync_options(
+        active_within_days,
         concurrency,
-        platform_options: PlatformOptions::default(),
-        prune: false,
+        star,
+        sync_opts.dry_run,
         strategy,
-    };
+    )?;
 
-    let runner = SyncRunner::new(
+    let runner = build_runner(
         Arc::clone(&db),
         options.clone(),
         no_rate_limit,
@@ -481,7 +529,7 @@ async fn sync_stars_all(
             );
         }
 
-        match get_token_for_instance(&instance, config).await {
+        match get_token_for_instance_with_db(&instance, config, Some(db.as_ref())).await {
             Ok(token) => jobs.push((instance, token)),
             Err(err) => {
                 if is_tty {
@@ -493,7 +541,11 @@ async fn sync_stars_all(
                         "Failed to sync starred repositories for instance"
                     );
                 }
-                failures.push(format!("{} ({}) - {}", instance.name, instance.host, err));
+                failures.push(format_instance_failure(
+                    &instance.name,
+                    &instance.host,
+                    &err,
+                ));
             }
         }
     }
@@ -536,7 +588,7 @@ async fn sync_stars_all(
                             "Failed to sync starred repositories for instance"
                         );
                     }
-                    failures.push(format!("{} ({}) - {}", name, host, err));
+                    failures.push(format_instance_failure(&name, &host, &err));
                 }
                 Err(err) => {
                     let message = format!("Internal task error: {}", err);
@@ -563,13 +615,26 @@ async fn sync_stars_all(
     .into())
 }
 
+fn format_instance_failure(name: &str, host: &str, err: &dyn std::fmt::Display) -> String {
+    format!("{} ({}) - {}", name, host, err)
+}
+
+fn build_runner(
+    db: Arc<DatabaseConnection>,
+    options: SyncOptions,
+    no_rate_limit: bool,
+    active_within_days: u64,
+) -> SyncRunner {
+    SyncRunner::new(db, options, no_rate_limit, active_within_days)
+}
+
 async fn sync_stars_for_instance(
     db: &Arc<DatabaseConnection>,
     instance: &InstanceModel,
     sync_opts: &StarredSyncOptions,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let token = get_token_for_instance(instance, config).await?;
+    let token = get_token_for_instance_with_db(instance, config, Some(db.as_ref())).await?;
     let settings = resolve_starred_sync_settings(sync_opts, config);
 
     sync_stars_for_instance_with_token(db, instance, &token, settings).await
@@ -581,17 +646,9 @@ async fn sync_stars_for_instance_with_token(
     token: &str,
     settings: ResolvedStarredSyncSettings,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let options = SyncOptions {
-        active_within: active_within_duration(settings.active_within_days)?,
-        star: false, // Stars sync doesn't star, it just fetches what's starred
-        dry_run: settings.dry_run,
-        concurrency: settings.concurrency,
-        platform_options: PlatformOptions::default(),
-        prune: settings.prune,
-        strategy: SyncStrategy::Full, // Starred sync always does full fetch
-    };
+    let options = build_starred_sync_options(settings)?;
 
-    let runner = SyncRunner::new(
+    let runner = build_runner(
         Arc::clone(db),
         options,
         settings.no_rate_limit,
@@ -705,13 +762,179 @@ async fn display_rate_limit<C: curator::PlatformClient>(client: &C, is_tty: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use chrono::Utc;
+    use curator::platform::{OrgInfo, PlatformError, PlatformRepo, RateLimitInfo, UserInfo};
     use sea_orm::{
         ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, Set, Statement,
     };
+    use tokio::sync::mpsc;
     use uuid::Uuid;
 
     use crate::test_support::env_lock;
+
+    #[derive(Clone)]
+    struct TestClient {
+        rate_limit_error: Option<String>,
+    }
+
+    #[async_trait]
+    impl curator::PlatformClient for TestClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> Result<RateLimitInfo, PlatformError> {
+            if let Some(message) = &self.rate_limit_error {
+                Err(PlatformError::internal(message.clone()))
+            } else {
+                Ok(RateLimitInfo {
+                    limit: 5000,
+                    remaining: 4999,
+                    reset_at: Utc::now(),
+                    retry_after: None,
+                })
+            }
+        }
+
+        async fn get_org_info(&self, org: &str) -> Result<OrgInfo, PlatformError> {
+            Ok(OrgInfo {
+                name: org.to_string(),
+                public_repos: 0,
+                description: None,
+            })
+        }
+
+        async fn get_authenticated_user(&self) -> Result<UserInfo, PlatformError> {
+            Ok(UserInfo {
+                username: "tester".to_string(),
+                name: Some("Tester".to_string()),
+                email: None,
+                bio: None,
+                public_repos: 0,
+                followers: 0,
+            })
+        }
+
+        async fn get_repo(
+            &self,
+            owner: &str,
+            name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> Result<PlatformRepo, PlatformError> {
+            Ok(sample_platform_repo(owner, name))
+        }
+
+        async fn list_org_repos(
+            &self,
+            org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<Vec<PlatformRepo>, PlatformError> {
+            Ok(vec![sample_platform_repo(org, "repo")])
+        }
+
+        async fn list_user_repos(
+            &self,
+            username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<Vec<PlatformRepo>, PlatformError> {
+            Ok(vec![sample_platform_repo(username, "repo")])
+        }
+
+        async fn is_repo_starred(&self, _owner: &str, _name: &str) -> Result<bool, PlatformError> {
+            Ok(false)
+        }
+
+        async fn star_repo(&self, _owner: &str, _name: &str) -> Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        async fn unstar_repo(&self, _owner: &str, _name: &str) -> Result<bool, PlatformError> {
+            Ok(true)
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<Vec<PlatformRepo>, PlatformError> {
+            Ok(vec![sample_platform_repo("starred", "repo")])
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&curator::platform::ProgressCallback>,
+        ) -> Result<usize, PlatformError> {
+            repo_tx
+                .send(sample_platform_repo("starred", "repo"))
+                .await
+                .map_err(|_| PlatformError::internal("channel closed"))?;
+            Ok(1)
+        }
+    }
+
+    fn sample_platform_repo(owner: &str, name: &str) -> PlatformRepo {
+        PlatformRepo {
+            platform_id: 1,
+            owner: owner.to_string(),
+            name: name.to_string(),
+            description: None,
+            default_branch: "main".to_string(),
+            visibility: curator::CodeVisibility::Public,
+            is_fork: false,
+            is_archived: false,
+            stars: None,
+            forks: None,
+            language: None,
+            topics: vec![],
+            created_at: Some(Utc::now()),
+            updated_at: Some(Utc::now()),
+            pushed_at: Some(Utc::now()),
+            license: None,
+            homepage: None,
+            size_kb: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    async fn sample_runner(label: &str, dry_run: bool) -> SyncRunner {
+        let db = Arc::new(setup_db(label).await);
+        SyncRunner::new(
+            db,
+            SyncOptions {
+                active_within: active_within_duration(30).expect("duration should resolve"),
+                star: true,
+                dry_run,
+                concurrency: 2,
+                platform_options: PlatformOptions::default(),
+                prune: true,
+                strategy: SyncStrategy::Full,
+            },
+            false,
+            30,
+        )
+    }
 
     fn sample_common_sync_options() -> CommonSyncOptions {
         CommonSyncOptions {
@@ -1151,6 +1374,76 @@ mod tests {
         assert!(matches!(stars, SyncAction::Stars { .. }));
     }
 
+    #[test]
+    fn resolve_starred_sync_settings_includes_dry_run() {
+        let opts = StarredSyncOptions {
+            active_within_days: Some(8),
+            no_prune: true,
+            dry_run: true,
+            concurrency: Some(5),
+            no_rate_limit: true,
+        };
+
+        let settings = resolve_starred_sync_settings(&opts, &Config::default());
+        assert_eq!(settings.active_within_days, 8);
+        assert_eq!(settings.concurrency, 5);
+        assert!(!settings.prune);
+        assert!(settings.no_rate_limit);
+        assert!(settings.dry_run);
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn run_namespace_sync_for_client_handles_single_and_multiple_names() {
+        let runner = sample_runner("namespace-runner", true).await;
+        let client = TestClient {
+            rate_limit_error: None,
+        };
+
+        run_namespace_sync_for_client(&runner, &client, &["rust-lang".to_string()], false, false)
+            .await
+            .expect("single namespace sync should succeed");
+        run_namespace_sync_for_client(
+            &runner,
+            &client,
+            &["rust-lang".to_string(), "tokio-rs".to_string()],
+            false,
+            false,
+        )
+        .await
+        .expect("multi namespace sync should succeed");
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn run_user_and_starred_sync_helpers_succeed() {
+        let runner = sample_runner("user-starred-runner", true).await;
+        let client = TestClient {
+            rate_limit_error: None,
+        };
+
+        run_user_sync_for_client(&runner, &client, &["octocat".to_string()], false, false)
+            .await
+            .expect("user sync should succeed");
+        run_starred_sync_for_client(&runner, &client, true, false, false)
+            .await
+            .expect("starred sync should succeed");
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn display_rate_limit_handles_success_and_error() {
+        let ok_client = TestClient {
+            rate_limit_error: None,
+        };
+        display_rate_limit(&ok_client, false).await;
+
+        let err_client = TestClient {
+            rate_limit_error: Some("rate limit unavailable".to_string()),
+        };
+        display_rate_limit(&err_client, false).await;
+    }
+
     #[tokio::test]
     async fn handle_sync_org_returns_instance_not_found_before_auth() {
         let database_url = sqlite_test_url("handle-sync-org-missing-instance");
@@ -1381,5 +1674,207 @@ mod tests {
             !err.to_string().is_empty(),
             "expected a concrete database error message"
         );
+    }
+
+    #[test]
+    fn sample_sync_option_builders_cover_defaults() {
+        let common = sample_common_sync_options();
+        assert!(!common.no_star);
+        assert!(!common.dry_run);
+        assert!(!common.no_rate_limit);
+        assert!(!common.incremental);
+
+        let starred = sample_starred_sync_options();
+        assert!(!starred.no_prune);
+        assert!(!starred.dry_run);
+        assert!(!starred.no_rate_limit);
+    }
+
+    #[test]
+    fn parallelism_helper_handles_zero_and_large_values() {
+        assert_eq!(stars_all_parallelism(0, 10), 1);
+        assert_eq!(stars_all_parallelism(10, 3), 3);
+        assert_eq!(stars_all_parallelism(2, 3), 2);
+    }
+
+    #[test]
+    fn build_sync_options_helpers_map_fields_correctly() {
+        let namespace =
+            build_namespace_sync_options(30, 4, true, true, true, SyncStrategy::Incremental)
+                .expect("namespace options should build");
+        assert!(namespace.dry_run);
+        assert_eq!(namespace.concurrency, 4);
+        assert!(!namespace.platform_options.include_subgroups);
+        assert_eq!(namespace.strategy, SyncStrategy::Incremental);
+
+        let user = build_user_sync_options(14, 2, false, false, SyncStrategy::Full)
+            .expect("user options should build");
+        assert!(!user.star);
+        assert_eq!(user.concurrency, 2);
+        assert_eq!(
+            user.platform_options.include_subgroups,
+            PlatformOptions::default().include_subgroups
+        );
+
+        let settings = ResolvedStarredSyncSettings {
+            active_within_days: 10,
+            concurrency: 5,
+            prune: true,
+            no_rate_limit: false,
+            dry_run: true,
+        };
+        let starred = build_starred_sync_options(settings).expect("starred options should build");
+        assert!(!starred.star);
+        assert!(starred.prune);
+        assert!(starred.dry_run);
+        assert_eq!(starred.strategy, SyncStrategy::Full);
+    }
+
+    #[test]
+    fn build_sync_options_helpers_propagate_large_duration_errors() {
+        let err = build_namespace_sync_options(
+            (i64::MAX as u64) + 1,
+            1,
+            true,
+            false,
+            false,
+            SyncStrategy::Full,
+        )
+        .expect_err("oversized duration should fail");
+        assert!(!err.to_string().is_empty());
+
+        let err =
+            build_user_sync_options((i64::MAX as u64) + 1, 1, true, false, SyncStrategy::Full)
+                .expect_err("oversized duration should fail");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn format_instance_failure_includes_name_host_and_error() {
+        let failure = format_instance_failure("github", "github.com", &"boom");
+        assert_eq!(failure, "github (github.com) - boom");
+    }
+
+    #[tokio::test]
+    async fn build_runner_constructs_sync_runner() {
+        let db = Arc::new(setup_db("build-runner").await);
+        let options = build_user_sync_options(7, 3, true, true, SyncStrategy::Full).unwrap();
+        let _runner = build_runner(db, options, true, 7);
+    }
+
+    #[tokio::test]
+    async fn get_instances_returns_empty_after_clearing_seeded_rows() {
+        let db = setup_db("get-instances-empty").await;
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM instances".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let instances = get_instances(&db).await.unwrap();
+        assert!(instances.is_empty());
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn sync_org_enters_gitlab_branch_before_failing_client_setup() {
+        let _guard = env_lock().lock().await;
+        let database_url = sqlite_test_url("sync-org-gitlab-branch");
+        let db = curator::db::connect_and_migrate(&database_url)
+            .await
+            .unwrap();
+        let instance = sample_instance("work-gitlab", PlatformType::GitLab, "bad host");
+        curator::entity::instance::ActiveModel {
+            id: Set(instance.id),
+            name: Set(instance.name.clone()),
+            platform_type: Set(instance.platform_type),
+            host: Set(instance.host.clone()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set(instance.oauth_flow.clone()),
+            created_at: Set(instance.created_at),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        unsafe {
+            std::env::set_var("CURATOR_INSTANCE_WORK_GITLAB_TOKEN", "token");
+        }
+
+        let err = sync_org(
+            "work-gitlab",
+            &["group".to_string()],
+            false,
+            sample_common_sync_options(),
+            &Config::default(),
+            &database_url,
+        )
+        .await
+        .expect_err("gitlab sync should fail for invalid host");
+
+        unsafe {
+            std::env::remove_var("CURATOR_INSTANCE_WORK_GITLAB_TOKEN");
+        }
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[cfg(feature = "gitea")]
+    #[tokio::test]
+    async fn sync_user_enters_gitea_branch_before_failing_client_setup() {
+        let _guard = env_lock().lock().await;
+        let database_url = sqlite_test_url("sync-user-gitea-branch");
+        let db = curator::db::connect_and_migrate(&database_url)
+            .await
+            .unwrap();
+        let instance = sample_instance("forgejo", PlatformType::Gitea, "bad host");
+        curator::entity::instance::ActiveModel {
+            id: Set(instance.id),
+            name: Set(instance.name.clone()),
+            platform_type: Set(instance.platform_type),
+            host: Set(instance.host.clone()),
+            oauth_client_id: Set(None),
+            oauth_flow: Set(instance.oauth_flow.clone()),
+            created_at: Set(instance.created_at),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        unsafe {
+            std::env::set_var("CURATOR_INSTANCE_FORGEJO_TOKEN", "token");
+        }
+
+        let err = sync_user(
+            "forgejo",
+            &["octocat".to_string()],
+            sample_common_sync_options(),
+            &Config::default(),
+            &database_url,
+        )
+        .await
+        .expect_err("gitea sync should fail for invalid host");
+
+        unsafe {
+            std::env::remove_var("CURATOR_INSTANCE_FORGEJO_TOKEN");
+        }
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[cfg(feature = "gitlab")]
+    #[tokio::test]
+    async fn sync_stars_for_instance_with_token_enters_gitlab_branch() {
+        let db = Arc::new(setup_db("stars-gitlab-branch").await);
+        let instance = sample_instance("gitlab-stars", PlatformType::GitLab, "bad host");
+        let settings = ResolvedStarredSyncSettings {
+            active_within_days: 10,
+            concurrency: 2,
+            prune: false,
+            no_rate_limit: true,
+            dry_run: true,
+        };
+
+        let err = sync_stars_for_instance_with_token(&db, &instance, "token", settings)
+            .await
+            .expect_err("gitlab stars sync should fail for invalid host");
+        assert!(!err.to_string().is_empty());
     }
 }

@@ -1,6 +1,13 @@
 ---
 name: Setup Nix
-description: Install Nix with Determinate Systems installer and Magic Nix Cache
+description: Install Nix with Determinate Systems installer and Magic Nix Cache +
+  Cachix
+
+inputs:
+  cachix-push:
+    description: Whether to enable pushing to the gkze Cachix cache
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -14,3 +21,11 @@ runs:
         # Magic Nix Cache uses the GitHub API (and GHA cache) under the hood.
         # If it runs unauthenticated, it can quickly hit rate limits in CI.
         GITHUB_TOKEN: ${{ github.token }}
+
+    - name: Setup Cachix
+      uses: cachix/cachix-action@v16
+      with:
+        name: gkze
+        authToken: ${{ inputs.cachix-push == 'true' && env.CACHIX_AUTH_TOKEN || ''
+          }}
+        skipPush: ${{ inputs.cachix-push != 'true' }}

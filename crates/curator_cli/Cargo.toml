@@ -45,9 +45,11 @@ directories = "6"
 open = "5.3"
 arboard = "3.6"
 toml_edit = "0.25"
+toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 url = "2.5"
 rpassword = "7"
+keyring = "3"
 
 [dev-dependencies]
 async-trait = "0.1"

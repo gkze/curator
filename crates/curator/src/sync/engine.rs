@@ -1218,7 +1218,9 @@ mod tests {
     use crate::sync::StarringStats;
     use async_trait::async_trait;
     use chrono::Duration;
+    use sea_orm::sea_query::Value;
     use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1387,6 +1389,9 @@ mod tests {
         user_concurrency: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone, Default)]
+    struct SuccessClient;
+
     #[async_trait]
     impl PlatformClient for ConcurrencyRecordingClient {
         fn platform_type(&self) -> PlatformType {
@@ -1499,6 +1504,154 @@ mod tests {
         ) -> PlatformResult<usize> {
             panic!("unused in tests")
         }
+    }
+
+    #[async_trait]
+    impl PlatformClient for SuccessClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> PlatformResult<RateLimitInfo> {
+            Ok(RateLimitInfo {
+                limit: 5000,
+                remaining: 5000,
+                reset_at: Utc::now(),
+                retry_after: None,
+            })
+        }
+
+        async fn get_org_info(&self, org: &str) -> PlatformResult<OrgInfo> {
+            Ok(OrgInfo {
+                name: org.to_string(),
+                public_repos: 1,
+                description: None,
+            })
+        }
+
+        async fn get_authenticated_user(&self) -> PlatformResult<UserInfo> {
+            Ok(UserInfo {
+                username: "octo".to_string(),
+                name: Some("Octo".to_string()),
+                email: None,
+                bio: None,
+                public_repos: 1,
+                followers: 0,
+            })
+        }
+
+        async fn get_repo(
+            &self,
+            owner: &str,
+            name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> PlatformResult<PlatformRepo> {
+            Ok(mock_repo_with_owner(owner, name, 1))
+        }
+
+        async fn list_org_repos(
+            &self,
+            org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            if org == "bad-org" {
+                Err(PlatformError::internal("org sync failed"))
+            } else {
+                Ok(vec![mock_repo_with_owner(org, "repo", 1)])
+            }
+        }
+
+        async fn list_user_repos(
+            &self,
+            username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            if username == "bad-user" {
+                Err(PlatformError::internal("user sync failed"))
+            } else {
+                Ok(vec![mock_repo_with_owner(username, "repo", 1)])
+            }
+        }
+
+        async fn is_repo_starred(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            Ok(false)
+        }
+
+        async fn star_repo(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            Ok(true)
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<bool> {
+            Ok(true)
+        }
+
+        async fn unstar_repo(&self, _owner: &str, _name: &str) -> PlatformResult<bool> {
+            Ok(true)
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<Vec<PlatformRepo>> {
+            Ok(vec![mock_repo_with_owner("octo", "starred", 1)])
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&crate::platform::ProgressCallback>,
+        ) -> PlatformResult<usize> {
+            repo_tx
+                .send(mock_repo_with_owner("octo", "starred", 1))
+                .await
+                .map_err(|err| PlatformError::internal(err.to_string()))?;
+            Ok(1)
+        }
+    }
+
+    fn sync_info_row(
+        platform_id: i64,
+        name: &str,
+        updated_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+        pushed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+        synced_at: chrono::DateTime<chrono::FixedOffset>,
+    ) -> BTreeMap<String, Value> {
+        let mut row = BTreeMap::new();
+        row.insert("0".to_string(), Value::BigInt(Some(platform_id)));
+        row.insert(
+            "1".to_string(),
+            Value::String(Some(Box::new(name.to_string()))),
+        );
+        row.insert(
+            "2".to_string(),
+            Value::ChronoDateTimeWithTimeZone(updated_at.map(Box::new)),
+        );
+        row.insert(
+            "3".to_string(),
+            Value::ChronoDateTimeWithTimeZone(pushed_at.map(Box::new)),
+        );
+        row.insert(
+            "4".to_string(),
+            Value::ChronoDateTimeWithTimeZone(Some(Box::new(synced_at))),
+        );
+        row
     }
 
     #[async_trait]
@@ -2688,5 +2841,458 @@ mod tests {
         assert_eq!(result.processed, 1);
         assert_eq!(result.matched, 1);
         assert_eq!(models.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_incremental_filter_returns_original_when_sync_info_empty() {
+        let repos = vec![mock_repo("one", 1), mock_repo("two", 2)];
+        let filtered = apply_incremental_filter(repos.clone(), &[]);
+
+        assert_eq!(filtered.len(), repos.len());
+        assert_eq!(filtered[0].name, "one");
+        assert_eq!(filtered[1].name, "two");
+    }
+
+    #[tokio::test]
+    async fn test_maybe_filter_incremental_helpers_cover_short_circuits_and_db_queries() {
+        let client = SuccessClient;
+        let repos = vec![mock_repo_with_owner("acme", "repo", 1)];
+
+        let full = maybe_filter_incremental_for_owner(
+            &client,
+            "acme",
+            &SyncOptions::default(),
+            None,
+            repos.clone(),
+        )
+        .await
+        .expect("full sync should return repos unchanged");
+        assert_eq!(full.len(), 1);
+
+        let no_db = maybe_filter_incremental_for_owner(
+            &client,
+            "acme",
+            &SyncOptions {
+                strategy: SyncStrategy::Incremental,
+                ..SyncOptions::default()
+            },
+            None,
+            repos.clone(),
+        )
+        .await
+        .expect("incremental sync without db should keep repos");
+        assert_eq!(no_db.len(), 1);
+
+        let empty_owners = maybe_filter_incremental_for_owners(
+            &client,
+            &[],
+            &SyncOptions {
+                strategy: SyncStrategy::Incremental,
+                ..SyncOptions::default()
+            },
+            None,
+            repos.clone(),
+        )
+        .await
+        .expect("empty owner list should keep repos");
+        assert_eq!(empty_owners.len(), 1);
+
+        let synced_at = Utc::now().fixed_offset();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![sync_info_row(
+                123,
+                "repo",
+                Some((Utc::now() - Duration::days(5)).fixed_offset()),
+                Some((Utc::now() - Duration::days(5)).fixed_offset()),
+                synced_at,
+            )]])
+            .append_query_results([vec![sync_info_row(
+                123,
+                "repo",
+                Some((Utc::now() - Duration::days(5)).fixed_offset()),
+                Some((Utc::now() - Duration::days(5)).fixed_offset()),
+                synced_at,
+            )]])
+            .into_connection();
+
+        let filtered = maybe_filter_incremental_for_owner(
+            &client,
+            "acme",
+            &SyncOptions {
+                strategy: SyncStrategy::Incremental,
+                ..SyncOptions::default()
+            },
+            Some(&db),
+            repos.clone(),
+        )
+        .await
+        .expect("db-backed incremental owner filter should succeed");
+        assert!(filtered.is_empty());
+
+        let owner_names = vec!["acme".to_string()];
+        let filtered = maybe_filter_incremental_for_owners(
+            &client,
+            &owner_names,
+            &SyncOptions {
+                strategy: SyncStrategy::Incremental,
+                ..SyncOptions::default()
+            },
+            Some(&db),
+            repos,
+        )
+        .await
+        .expect("db-backed incremental owners filter should succeed");
+        assert!(filtered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sync_namespace_and_user_streaming_success_paths() {
+        let client = SuccessClient;
+        let options = SyncOptions {
+            star: false,
+            dry_run: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result = sync_namespace_streaming(&client, "acme", &options, None, model_tx, None)
+            .await
+            .expect("namespace streaming should succeed");
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.matched, 1);
+        assert_eq!(result.saved, 1);
+        assert!(model_rx.recv().await.is_some());
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result = sync_user_streaming(&client, "octo", &options, None, model_tx, None)
+            .await
+            .expect("user streaming should succeed");
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.matched, 1);
+        assert_eq!(result.saved, 1);
+        assert!(model_rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sync_namespaces_and_users_streaming_collect_successes_and_errors() {
+        let client = SuccessClient;
+        let options = SyncOptions {
+            star: false,
+            dry_run: false,
+            active_within: Duration::days(30),
+            concurrency: 8,
+            ..SyncOptions::default()
+        };
+
+        let namespaces = vec!["acme".to_string(), "bad-org".to_string()];
+        let results = sync_namespaces(&client, &namespaces, &options, None, None).await;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|result| result.error.is_none()));
+        assert!(results.iter().any(|result| result.error.is_some()));
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let results =
+            sync_namespaces_streaming(&client, &namespaces, &options, None, model_tx, None).await;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|result| result.error.is_none()));
+        assert!(results.iter().any(|result| result.error.is_some()));
+        assert!(model_rx.recv().await.is_some());
+
+        let usernames = vec!["octo".to_string(), "bad-user".to_string()];
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let results =
+            sync_users_streaming(&client, &usernames, &options, None, model_tx, None).await;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|result| result.error.is_none()));
+        assert!(results.iter().any(|result| result.error.is_some()));
+        assert!(model_rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_client_helpers_and_trait_methods_cover_remaining_test_impls() {
+        let test_client = TestClient::default();
+        test_client.set_starred_repos(vec![mock_repo("recent", 1)]);
+        test_client.set_star_result("org", "repo", Ok(true));
+        test_client.set_repo_result("org", "repo", Ok(mock_repo_with_owner("org", "repo", 1)));
+        test_client.set_unstar_result("org", "repo", Ok(true));
+        assert_eq!(test_client.star_calls_len(), 0);
+        assert!(test_client.unstar_calls().is_empty());
+        assert_eq!(
+            test_client
+                .get_repo("org", "repo", None)
+                .await
+                .expect("repo result should be returned")
+                .full_name(),
+            "org/repo"
+        );
+        let (repo_tx, mut repo_rx) = mpsc::channel(2);
+        assert_eq!(
+            test_client
+                .list_starred_repos_streaming(repo_tx, None, 1, false, None)
+                .await
+                .expect("starred streaming should succeed"),
+            1
+        );
+        assert!(repo_rx.recv().await.is_some());
+        assert!(
+            test_client
+                .star_repo_with_retry("org", "repo", None)
+                .await
+                .unwrap()
+        );
+        assert!(test_client.unstar_repo("org", "repo").await.unwrap());
+        assert_eq!(test_client.star_calls_len(), 1);
+        assert_eq!(test_client.unstar_calls(), vec!["org/repo".to_string()]);
+
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_eq!(concurrency_client.platform_type(), PlatformType::GitHub);
+        assert_eq!(concurrency_client.instance_id(), Uuid::nil());
+        assert_eq!(
+            concurrency_client
+                .list_org_repos_with_concurrency("org", None, 7, None)
+                .await
+                .expect("org repos should succeed")
+                .len(),
+            1
+        );
+        assert_eq!(
+            concurrency_client
+                .list_user_repos_with_concurrency("user", None, 9, None)
+                .await
+                .expect("user repos should succeed")
+                .len(),
+            1
+        );
+
+        let panic_client = PanicRepoClient;
+        assert_eq!(panic_client.platform_type(), PlatformType::GitHub);
+        assert_eq!(panic_client.instance_id(), Uuid::nil());
+
+        async fn assert_panics<F, Fut>(f: F)
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let err = tokio::spawn(async move { f().await })
+                .await
+                .expect_err("task should panic");
+            assert!(err.is_panic());
+        }
+
+        assert_panics(|| async move {
+            let _ = panic_client.get_rate_limit().await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let _ = panic_client.get_org_info("org").await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let _ = panic_client.get_authenticated_user().await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let _ = panic_client.list_org_repos("org", None, None).await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let _ = panic_client.list_user_repos("user", None, None).await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let _ = panic_client.is_repo_starred("org", "repo").await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let _ = panic_client.star_repo("org", "repo").await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let _ = panic_client.star_repo_with_retry("org", "repo", None).await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let _ = panic_client.unstar_repo("org", "repo").await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let _ = panic_client.list_starred_repos(None, 1, false, None).await;
+        })
+        .await;
+        let panic_client = PanicRepoClient;
+        assert_panics(|| async move {
+            let (tx, _rx) = mpsc::channel(1);
+            let _ = panic_client
+                .list_starred_repos_streaming(tx, None, 1, false, None)
+                .await;
+        })
+        .await;
+
+        let success_client = SuccessClient;
+        assert_eq!(success_client.platform_type(), PlatformType::GitHub);
+        assert_eq!(success_client.instance_id(), Uuid::nil());
+        assert_eq!(
+            success_client.get_rate_limit().await.unwrap().remaining,
+            5000
+        );
+        assert_eq!(
+            success_client.get_org_info("acme").await.unwrap().name,
+            "acme"
+        );
+        assert_eq!(
+            success_client
+                .get_authenticated_user()
+                .await
+                .unwrap()
+                .username,
+            "octo"
+        );
+        assert_eq!(
+            success_client
+                .get_repo("org", "repo", None)
+                .await
+                .unwrap()
+                .full_name(),
+            "org/repo"
+        );
+        assert_eq!(
+            success_client
+                .list_org_repos("org", None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            success_client
+                .list_user_repos("user", None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!success_client.is_repo_starred("org", "repo").await.unwrap());
+        assert!(success_client.star_repo("org", "repo").await.unwrap());
+        assert!(
+            success_client
+                .star_repo_with_retry("org", "repo", None)
+                .await
+                .unwrap()
+        );
+        assert!(success_client.unstar_repo("org", "repo").await.unwrap());
+        assert_eq!(
+            success_client
+                .list_starred_repos(None, 1, false, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        assert_eq!(
+            success_client
+                .list_starred_repos_streaming(tx, None, 1, false, None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(rx.recv().await.is_some());
+
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        async fn assert_concurrency_client_panics<F, Fut>(f: F)
+        where
+            F: FnOnce() -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let err = tokio::spawn(async move { f().await })
+                .await
+                .expect_err("task should panic");
+            assert!(err.is_panic());
+        }
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client.get_rate_limit().await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client.get_org_info("org").await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client.get_authenticated_user().await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client.get_repo("org", "repo", None).await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client.list_org_repos("org", None, None).await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client.list_user_repos("user", None, None).await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client.is_repo_starred("org", "repo").await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client.star_repo("org", "repo").await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client
+                .star_repo_with_retry("org", "repo", None)
+                .await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client.unstar_repo("org", "repo").await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let _ = concurrency_client
+                .list_starred_repos(None, 1, false, None)
+                .await;
+        })
+        .await;
+        let concurrency_client = ConcurrencyRecordingClient::default();
+        assert_concurrency_client_panics(|| async move {
+            let (tx, _rx) = mpsc::channel(1);
+            let _ = concurrency_client
+                .list_starred_repos_streaming(tx, None, 1, false, None)
+                .await;
+        })
+        .await;
+
+        let ns_error = NamespaceSyncResult::semaphore_error("name".to_string());
+        assert!(ns_error.error.is_some());
+        let ns_panic = NamespaceSyncResult::panic_error("boom".to_string());
+        assert!(ns_panic.error.unwrap().contains("boom"));
+        let streaming_error = NamespaceSyncResultStreaming::semaphore_error("name".to_string());
+        assert!(streaming_error.error.is_some());
+        let streaming_panic = NamespaceSyncResultStreaming::panic_error("boom".to_string());
+        assert!(streaming_panic.error.unwrap().contains("boom"));
     }
 }

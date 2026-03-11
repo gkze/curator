@@ -1866,6 +1866,16 @@ mod tests {
         assert_platform_client::<GitLabClient>();
     }
 
+    #[tokio::test]
+    async fn test_new_rejects_invalid_header_token() {
+        let err = GitLabClient::new("gitlab.example.com", "bad\nheader", Uuid::new_v4(), None)
+            .await
+            .err()
+            .expect("invalid header token should fail");
+
+        assert!(matches!(err, GitLabError::Auth(_)));
+    }
+
     #[test]
     fn test_parse_rate_limit_headers() {
         let headers: HttpHeaders = vec![
@@ -2206,6 +2216,245 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_default_headers_and_url_encoding_helpers() {
+        let transport: Arc<dyn HttpTransport> = Arc::new(MockTransport::new());
+        let client = test_client(TEST_BASE_URL, Uuid::nil(), transport);
+
+        let headers = client.default_headers();
+        assert_eq!(
+            crate::header_get(&headers, "PRIVATE-TOKEN"),
+            Some("test-token")
+        );
+        assert_eq!(
+            crate::header_get(&headers, "Accept"),
+            Some("application/json")
+        );
+        assert_eq!(crate::header_get(&headers, "User-Agent"), Some("curator"));
+
+        assert_eq!(
+            GitLabClient::url_encode_component("team/sub group"),
+            "team%2Fsub%20group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_group_info_falls_back_to_zero_repo_count_when_probe_fails() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+
+        let encoded = GitLabClient::url_encode_component("team/sub group");
+        let group_url = format!("{TEST_BASE_URL}/api/v4/groups/{encoded}");
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &group_url,
+            200,
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            r#"{"id":1,"name":"Sub Group","full_path":"team/sub group","description":"desc","visibility":"private"}"#,
+        );
+        let count_url = format!(
+            "{TEST_BASE_URL}/api/v4/groups/{encoded}/projects?per_page=1&page=1&include_subgroups=false"
+        );
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &count_url,
+            500,
+            Vec::new(),
+            "boom",
+        );
+
+        let info = client.get_group_info("team/sub group").await.unwrap();
+        assert_eq!(info.name, "Sub Group");
+        assert_eq!(info.description.as_deref(), Some("desc"));
+        assert_eq!(info.public_repos, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_group_project_count_reads_x_total_and_handles_failures() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+        let encoded = GitLabClient::url_encode_component("acme/team");
+        let url = format!(
+            "{TEST_BASE_URL}/api/v4/groups/{encoded}/projects?per_page=1&page=1&include_subgroups=false"
+        );
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![("x-total".to_string(), "42".to_string())],
+            "[]",
+        );
+        assert_eq!(client.get_group_project_count(&encoded).await, 42);
+
+        push_response(&transport, HttpMethod::Get, &url, 500, Vec::new(), "boom");
+        assert_eq!(client.get_group_project_count(&encoded).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_project_by_path_success_not_found_and_deserialize_error() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+        let encoded = GitLabClient::url_encode_component("owner/repo");
+        let url = format!("{TEST_BASE_URL}/api/v4/projects/{encoded}");
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            &project_json("owner/repo").to_string(),
+        );
+        let project = client.get_project_by_path("owner/repo").await.unwrap();
+        assert_eq!(project.path_with_namespace, "owner/repo");
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            404,
+            Vec::new(),
+            "missing",
+        );
+        assert!(matches!(
+            client.get_project_by_path("owner/repo").await,
+            Err(GitLabError::ProjectNotFound(_))
+        ));
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            "{not-json}",
+        );
+        assert!(matches!(
+            client.get_project_by_path("owner/repo").await,
+            Err(GitLabError::Deserialize(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_user_info_and_rate_limit_fallbacks() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+        let url = format!("{TEST_BASE_URL}/api/v4/user");
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("ratelimit-limit".to_string(), "99".to_string()),
+                ("ratelimit-remaining".to_string(), "88".to_string()),
+                ("ratelimit-reset".to_string(), "1".to_string()),
+            ],
+            r#"{"id":1,"username":"jane"}"#,
+        );
+        let user = client.get_user_info().await.unwrap();
+        assert_eq!(user.username, "jane");
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![
+                ("ratelimit-limit".to_string(), "33".to_string()),
+                ("ratelimit-remaining".to_string(), "22".to_string()),
+                ("ratelimit-reset".to_string(), "1".to_string()),
+            ],
+            "{}",
+        );
+        let rate = GitLabClient::get_rate_limit(&client).await;
+        assert_eq!(rate.limit, 33);
+        assert_eq!(rate.remaining, 22);
+
+        let fallback_transport = MockTransport::new();
+        let fallback_arc: Arc<dyn HttpTransport> = Arc::new(fallback_transport.clone());
+        let fallback_client = test_client(TEST_BASE_URL, Uuid::new_v4(), fallback_arc);
+        let fallback = GitLabClient::get_rate_limit(&fallback_client).await;
+        assert_eq!(fallback.limit, 2000);
+        assert_eq!(fallback.remaining, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_id_success_and_deserialize_error() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+        let url = format!("{TEST_BASE_URL}/api/v4/users?username=octo%2Bcat");
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            r#"[{"id":42}]"#,
+        );
+        assert_eq!(client.resolve_user_id("octo+cat").await.unwrap(), 42);
+
+        push_response(
+            &transport,
+            HttpMethod::Get,
+            &url,
+            200,
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            "{bad json}",
+        );
+        assert!(matches!(
+            client.resolve_user_id("octo+cat").await,
+            Err(GitLabError::Deserialize(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_star_and_unstar_project_status_branches() {
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport.clone());
+        let client = test_client(TEST_BASE_URL, Uuid::new_v4(), transport_arc);
+        let star_url = format!("{TEST_BASE_URL}/api/v4/projects/7/star");
+        let unstar_url = format!("{TEST_BASE_URL}/api/v4/projects/7/unstar");
+
+        push_response(&transport, HttpMethod::Post, &star_url, 304, Vec::new(), "");
+        assert!(!client.star_project(7).await.unwrap());
+
+        push_response(&transport, HttpMethod::Post, &star_url, 201, Vec::new(), "");
+        assert!(client.star_project(7).await.unwrap());
+
+        push_response(
+            &transport,
+            HttpMethod::Post,
+            &unstar_url,
+            304,
+            Vec::new(),
+            "",
+        );
+        assert!(!client.unstar_project(7).await.unwrap());
+
+        push_response(
+            &transport,
+            HttpMethod::Post,
+            &unstar_url,
+            200,
+            Vec::new(),
+            "",
+        );
+        assert!(client.unstar_project(7).await.unwrap());
     }
 
     #[tokio::test]

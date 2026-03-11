@@ -78,4 +78,12 @@ mod tests {
             )
         );
     }
+
+    #[tokio::test]
+    async fn handle_migrate_propagates_connection_errors() {
+        let err = handle_migrate(MigrateAction::Status, "not-a-valid-db-url")
+            .await
+            .expect_err("invalid db url should fail");
+        assert!(!err.to_string().is_empty());
+    }
 }

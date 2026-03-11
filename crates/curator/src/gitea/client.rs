@@ -1508,6 +1508,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_conditional_success_returns_fetched_data() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        let body = serde_json::to_string(&vec![repo_json(1)]).unwrap();
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred?page=1&limit=50"),
+            response(
+                200,
+                vec![("Content-Type", "application/json"), ("etag", "abc")],
+                body,
+            ),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport),
+        );
+
+        let result = client
+            .get_conditional::<Vec<GiteaRepo>>("/user/starred?page=1&limit=50", None)
+            .await
+            .expect("request should succeed");
+
+        match result {
+            platform::FetchResult::Fetched { data, etag, .. } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(etag.as_deref(), Some("abc"));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_client_reuses_constructor() {
+        let client = create_client("https://forge.test/", "token", Uuid::nil())
+            .expect("client creation should succeed");
+        assert_eq!(client.host(), "https://forge.test");
+        assert_eq!(client.get_instance_id(), Uuid::nil());
+    }
+
+    #[tokio::test]
+    async fn test_get_user_info_reads_authenticated_user() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user"),
+            response(
+                200,
+                vec![("Content-Type", "application/json")],
+                r#"{"id":1,"login":"octocat","email":"octo@example.com"}"#,
+            ),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport),
+        );
+
+        let user = client.get_user_info().await.unwrap();
+        assert_eq!(user.login, "octocat");
+        assert_eq!(user.email.as_deref(), Some("octo@example.com"));
+    }
+
+    #[tokio::test]
     async fn test_list_org_repos_paginates_until_partial_page() {
         let first_page = serde_json::to_string(&vec![repo_json(1); PAGE_SIZE as usize])
             .expect("first page should serialize");
@@ -1552,6 +1624,40 @@ mod tests {
             requests[1].url,
             format!("{host}/api/v1/orgs/acme/repos?page=2&limit=50")
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_user_repos_internal_with_concurrency_paginates() {
+        let first_page = serde_json::to_string(&vec![repo_json(1); PAGE_SIZE as usize]).unwrap();
+        let second_page = serde_json::to_string(&vec![repo_json(2)]).unwrap();
+
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/users/octocat/repos?page=1&limit=50"),
+            response(200, vec![("Content-Type", "application/json")], first_page),
+        );
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/users/octocat/repos?page=2&limit=50"),
+            response(200, vec![("Content-Type", "application/json")], second_page),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport.clone()),
+        );
+
+        let repos = client
+            .list_user_repos_internal_with_concurrency("octocat", 1)
+            .await
+            .unwrap();
+        assert_eq!(repos.len(), PAGE_SIZE as usize + 1);
+        assert_eq!(transport.requests().len(), 2);
     }
 
     #[tokio::test]
@@ -1773,5 +1879,85 @@ mod tests {
             requests[0].url,
             format!("{host}/api/v1/user/starred/owner/repo")
         );
+    }
+
+    #[tokio::test]
+    async fn test_is_repo_starred_false_for_not_found() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred/owner/repo"),
+            response(404, vec![], "missing"),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport),
+        );
+
+        let is_starred = client.is_repo_starred("owner", "repo").await.unwrap();
+        assert!(!is_starred);
+    }
+
+    #[tokio::test]
+    async fn test_star_repo_puts_when_not_already_starred() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred/owner/repo"),
+            response(404, vec![], "missing"),
+        );
+        transport.push_response(
+            HttpMethod::Put,
+            format!("{host}/api/v1/user/starred/owner/repo"),
+            response(204, vec![], ""),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport.clone()),
+        );
+
+        assert!(client.star_repo("owner", "repo").await.unwrap());
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method.as_str(), "PUT");
+    }
+
+    #[tokio::test]
+    async fn test_unstar_repo_internal_deletes_when_starred() {
+        let transport = MockTransport::new();
+        let host = "https://forge.test";
+        transport.push_response(
+            HttpMethod::Get,
+            format!("{host}/api/v1/user/starred/owner/repo"),
+            response(204, vec![], ""),
+        );
+        transport.push_response(
+            HttpMethod::Delete,
+            format!("{host}/api/v1/user/starred/owner/repo"),
+            response(204, vec![], ""),
+        );
+
+        let client = GiteaClient::new_with_transport(
+            host,
+            "token",
+            Uuid::new_v4(),
+            None,
+            Arc::new(transport.clone()),
+        );
+
+        assert!(client.unstar_repo_internal("owner", "repo").await.unwrap());
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method.as_str(), "DELETE");
     }
 }

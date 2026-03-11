@@ -13,6 +13,10 @@ pub use super::instance::{
     ActiveModel as InstanceActiveModel, Column as InstanceColumn, Entity as Instance,
     Model as InstanceModel, well_known,
 };
+pub use super::instance_credential::{
+    ActiveModel as InstanceCredentialActiveModel, Column as InstanceCredentialColumn,
+    Entity as InstanceCredential, Model as InstanceCredentialModel,
+};
 pub use super::platform_metadata::{
     GitHubMetadata, GitLabMetadata, GiteaMetadata, PlatformMetadata,
 };

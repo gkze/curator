@@ -56,3 +56,26 @@ pub(crate) fn setup_shutdown_handler() {
         std::process::exit(130);
     });
 }
+
+#[cfg(all(test, any(feature = "github", feature = "gitlab", feature = "gitea")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_flag_round_trip() {
+        SHUTDOWN_FLAG.store(false, Ordering::Release);
+        assert!(!is_shutdown_requested());
+        request_shutdown();
+        assert!(is_shutdown_requested());
+        SHUTDOWN_FLAG.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn setup_shutdown_handler_spawns_without_panicking() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            setup_shutdown_handler();
+            tokio::task::yield_now().await;
+        });
+    }
+}

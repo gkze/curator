@@ -199,6 +199,8 @@ const ERROR_HTML: &str = include_str!("callback_error.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::Query, response::IntoResponse};
+    use tokio::sync::Mutex;
 
     #[test]
     fn test_redirect_uri() {
@@ -263,5 +265,62 @@ mod tests {
         };
         let result = process_callback("expected_state", params);
         assert!(matches!(result, Err(OAuthError::Parse(_))));
+    }
+
+    #[test]
+    fn test_process_callback_provider_error_uses_description_or_code() {
+        let described = CallbackParams {
+            code: None,
+            state: Some("expected_state".into()),
+            error: Some("server_error".into()),
+            error_description: Some("provider said no".into()),
+        };
+        let err = process_callback("expected_state", described).unwrap_err();
+        assert!(matches!(err, OAuthError::Provider { .. }));
+        assert!(err.to_string().contains("provider said no"));
+
+        let undescribed = CallbackParams {
+            code: None,
+            state: Some("expected_state".into()),
+            error: Some("temporarily_unavailable".into()),
+            error_description: None,
+        };
+        let err = process_callback("expected_state", undescribed).unwrap_err();
+        assert!(err.to_string().contains("temporarily_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_callback_returns_success_html_and_sends_code() {
+        let (tx, rx) = oneshot::channel();
+        let state = Arc::new(Mutex::new(CallbackState {
+            expected_state: "state".to_string(),
+            tx: Some(tx),
+        }));
+
+        let response = handle_callback(
+            State(state),
+            Query(CallbackParams {
+                code: Some("code123".into()),
+                state: Some("state".into()),
+                error: None,
+                error_description: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let code = rx.await.unwrap().unwrap();
+        assert_eq!(code, "code123");
+    }
+
+    #[tokio::test]
+    async fn test_callback_server_timeout_expires() {
+        let server = CallbackServer::new(0, "state");
+        let err = server
+            .wait_for_code(Duration::from_millis(10))
+            .await
+            .expect_err("timeout should expire");
+        assert!(matches!(err, OAuthError::Expired));
     }
 }

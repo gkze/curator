@@ -280,3 +280,210 @@ pub trait PlatformClient: Send + Sync {
         on_progress: Option<&ProgressCallback>,
     ) -> Result<usize>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::PlatformError;
+
+    #[derive(Clone)]
+    struct TestClient;
+
+    #[async_trait]
+    impl PlatformClient for TestClient {
+        fn platform_type(&self) -> PlatformType {
+            PlatformType::GitHub
+        }
+
+        fn instance_id(&self) -> Uuid {
+            Uuid::nil()
+        }
+
+        async fn get_rate_limit(&self) -> Result<RateLimitInfo> {
+            Ok(RateLimitInfo {
+                limit: 10,
+                remaining: 9,
+                reset_at: Utc::now(),
+                retry_after: None,
+            })
+        }
+
+        async fn get_org_info(&self, org: &str) -> Result<OrgInfo> {
+            Ok(OrgInfo {
+                name: org.to_string(),
+                public_repos: 1,
+                description: None,
+            })
+        }
+
+        async fn get_authenticated_user(&self) -> Result<UserInfo> {
+            Ok(UserInfo {
+                username: "tester".to_string(),
+                name: None,
+                email: None,
+                bio: None,
+                public_repos: 1,
+                followers: 2,
+            })
+        }
+
+        async fn get_repo(
+            &self,
+            owner: &str,
+            name: &str,
+            _db: Option<&DatabaseConnection>,
+        ) -> Result<PlatformRepo> {
+            Ok(sample_repo(owner, name))
+        }
+
+        async fn list_org_repos(
+            &self,
+            org: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&ProgressCallback>,
+        ) -> Result<Vec<PlatformRepo>> {
+            Ok(vec![sample_repo(org, "repo")])
+        }
+
+        async fn list_user_repos(
+            &self,
+            username: &str,
+            _db: Option<&DatabaseConnection>,
+            _on_progress: Option<&ProgressCallback>,
+        ) -> Result<Vec<PlatformRepo>> {
+            Ok(vec![sample_repo(username, "repo")])
+        }
+
+        async fn is_repo_starred(&self, _owner: &str, _name: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn star_repo(&self, _owner: &str, _name: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn star_repo_with_retry(
+            &self,
+            _owner: &str,
+            _name: &str,
+            _on_progress: Option<&ProgressCallback>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn unstar_repo(&self, _owner: &str, _name: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_starred_repos(
+            &self,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&ProgressCallback>,
+        ) -> Result<Vec<PlatformRepo>> {
+            Ok(vec![sample_repo("starred", "repo")])
+        }
+
+        async fn list_starred_repos_streaming(
+            &self,
+            repo_tx: mpsc::Sender<PlatformRepo>,
+            _db: Option<&DatabaseConnection>,
+            _concurrency: usize,
+            _skip_rate_checks: bool,
+            _on_progress: Option<&ProgressCallback>,
+        ) -> Result<usize> {
+            repo_tx
+                .send(sample_repo("starred", "repo"))
+                .await
+                .map_err(|_| PlatformError::internal("channel closed"))?;
+            Ok(1)
+        }
+    }
+
+    fn sample_repo(owner: &str, name: &str) -> PlatformRepo {
+        PlatformRepo {
+            platform_id: 1,
+            owner: owner.to_string(),
+            name: name.to_string(),
+            description: None,
+            default_branch: "main".to_string(),
+            visibility: CodeVisibility::Public,
+            is_fork: false,
+            is_archived: false,
+            stars: None,
+            forks: None,
+            language: None,
+            topics: vec![],
+            created_at: None,
+            updated_at: None,
+            pushed_at: None,
+            license: None,
+            homepage: None,
+            size_kb: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn platform_repo_full_name_concatenates_owner_and_name() {
+        assert_eq!(sample_repo("owner", "repo").full_name(), "owner/repo");
+    }
+
+    #[tokio::test]
+    async fn default_concurrency_helpers_delegate_to_base_methods() {
+        let client = TestClient;
+        let org_repos = client
+            .list_org_repos_with_concurrency("org", None, 99, None)
+            .await
+            .unwrap();
+        let user_repos = client
+            .list_user_repos_with_concurrency("user", None, 42, None)
+            .await
+            .unwrap();
+
+        assert_eq!(org_repos[0].full_name(), "org/repo");
+        assert_eq!(user_repos[0].full_name(), "user/repo");
+    }
+
+    #[tokio::test]
+    async fn test_client_methods_return_expected_shapes() {
+        let client = TestClient;
+
+        let rate = client.get_rate_limit().await.unwrap();
+        assert_eq!(rate.limit, 10);
+
+        let org = client.get_org_info("org").await.unwrap();
+        assert_eq!(org.name, "org");
+
+        let user = client.get_authenticated_user().await.unwrap();
+        assert_eq!(user.username, "tester");
+
+        let repo = client.get_repo("owner", "repo", None).await.unwrap();
+        assert_eq!(repo.full_name(), "owner/repo");
+
+        assert!(!client.is_repo_starred("owner", "repo").await.unwrap());
+        assert!(client.star_repo("owner", "repo").await.unwrap());
+        assert!(
+            client
+                .star_repo_with_retry("owner", "repo", None)
+                .await
+                .unwrap()
+        );
+        assert!(client.unstar_repo("owner", "repo").await.unwrap());
+
+        let starred = client
+            .list_starred_repos(None, 1, false, None)
+            .await
+            .unwrap();
+        assert_eq!(starred.len(), 1);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let sent = client
+            .list_starred_repos_streaming(tx, None, 1, false, None)
+            .await
+            .unwrap();
+        assert_eq!(sent, 1);
+        assert_eq!(rx.recv().await.unwrap().full_name(), "starred/repo");
+    }
+}
