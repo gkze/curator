@@ -57,7 +57,7 @@ pub(crate) fn setup_shutdown_handler() {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "github", feature = "gitlab", feature = "gitea")))]
 mod tests {
     use super::*;
 

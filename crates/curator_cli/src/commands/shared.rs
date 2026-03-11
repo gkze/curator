@@ -35,7 +35,9 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use crate::config::Config;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::credentials::{self, LocatedCredential, StoredCredential};
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::progress::ProgressReporter;
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::shutdown::{SHUTDOWN_FLAG, is_shutdown_requested};
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::{CommonSyncOptions, StarredSyncOptions};
@@ -1119,7 +1121,7 @@ async fn get_legacy_gitlab_token_with_refresh(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "github", feature = "gitlab", feature = "gitea")))]
 #[allow(clippy::await_holding_lock)] // env_lock guards are intentionally held across awaits to serialise env-mutating tests
 mod tests {
     use super::*;

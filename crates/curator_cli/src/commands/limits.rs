@@ -1,28 +1,14 @@
-use clap::ValueEnum;
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use sea_orm::DatabaseConnection;
 #[cfg(feature = "github")]
 use uuid::Uuid;
 
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use curator::PlatformType;
 
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+use super::OutputFormat;
 use crate::commands::shared::find_instance_by_name;
 #[cfg(feature = "github")]
 use crate::commands::shared::get_token_for_instance_with_db;
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::config::Config;
-
-/// Output format for rate limit display.
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
-pub(crate) enum OutputFormat {
-    /// Display as a formatted table (default)
-    #[default]
-    Table,
-    /// Display as JSON
-    Json,
-}
 
 /// Handle the unified limits command.
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]

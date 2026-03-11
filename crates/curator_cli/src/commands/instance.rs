@@ -18,8 +18,9 @@ use curator::{
     entity::instance::well_known,
 };
 
-use super::limits::OutputFormat;
+use super::OutputFormat;
 use crate::config::Config;
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::credentials::{CredentialSource, CredentialStatus, credential_status};
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -501,7 +502,7 @@ async fn show_instance(
     db: &DatabaseConnection,
     name: &str,
     output: OutputFormat,
-    config: &Config,
+    #[allow(unused_variables)] config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Find the instance
     let instance = Instance::find()
@@ -515,25 +516,47 @@ async fn show_instance(
         .filter(CodeRepositoryColumn::InstanceId.eq(instance.id))
         .count(db)
         .await?;
-    let auth_status = credential_status(&instance, config, Some(db)).await?;
 
-    let details = build_instance_details(&instance, repo_count, &auth_status);
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    {
+        let auth_status = credential_status(&instance, config, Some(db)).await?;
+        let details = build_instance_details(&instance, repo_count, &auth_status);
 
-    match output {
-        OutputFormat::Table => {
-            let mut table = Table::new(details);
-            table.with(Style::rounded());
-            println!("{}", table);
+        match output {
+            OutputFormat::Table => {
+                let mut table = Table::new(details);
+                table.with(Style::rounded());
+                println!("{}", table);
+            }
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&build_instance_json(
+                        instance,
+                        repo_count,
+                        auth_status,
+                    ))?
+                );
+            }
         }
-        OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&build_instance_json(
-                    instance,
-                    repo_count,
-                    auth_status
-                ))?
-            );
+    }
+
+    #[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
+    {
+        let details = build_instance_details_basic(&instance, repo_count);
+
+        match output {
+            OutputFormat::Table => {
+                let mut table = Table::new(details);
+                table.with(Style::rounded());
+                println!("{}", table);
+            }
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&build_instance_json_basic(instance, repo_count))?
+                );
+            }
         }
     }
 
@@ -549,6 +572,7 @@ struct InstanceDetail {
     value: String,
 }
 
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 #[allow(dead_code)]
 #[derive(serde::Serialize)]
 struct InstanceJson {
@@ -564,6 +588,69 @@ struct InstanceJson {
     legacy_fallback: Option<String>,
 }
 
+#[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
+#[allow(dead_code)]
+#[derive(serde::Serialize)]
+struct InstanceJsonBasic {
+    #[serde(flatten)]
+    instance: InstanceModel,
+    base_url: String,
+    api_url: String,
+    repository_count: u64,
+}
+
+#[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
+fn build_instance_details_basic(instance: &InstanceModel, repo_count: u64) -> Vec<InstanceDetail> {
+    vec![
+        InstanceDetail {
+            property: "Name".to_string(),
+            value: instance.name.clone(),
+        },
+        InstanceDetail {
+            property: "Platform Type".to_string(),
+            value: instance.platform_type.to_string(),
+        },
+        InstanceDetail {
+            property: "Host".to_string(),
+            value: instance.host.clone(),
+        },
+        InstanceDetail {
+            property: "Base URL".to_string(),
+            value: instance.base_url(),
+        },
+        InstanceDetail {
+            property: "API URL".to_string(),
+            value: instance.api_url(),
+        },
+        InstanceDetail {
+            property: "Repositories".to_string(),
+            value: repo_count.to_string(),
+        },
+        InstanceDetail {
+            property: "Created".to_string(),
+            value: instance
+                .created_at
+                .format("%Y-%m-%d %H:%M:%S %Z")
+                .to_string(),
+        },
+        InstanceDetail {
+            property: "ID".to_string(),
+            value: instance.id.to_string(),
+        },
+    ]
+}
+
+#[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
+fn build_instance_json_basic(instance: InstanceModel, repo_count: u64) -> InstanceJsonBasic {
+    InstanceJsonBasic {
+        base_url: instance.base_url(),
+        api_url: instance.api_url(),
+        repository_count: repo_count,
+        instance,
+    }
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 fn build_instance_details(
     instance: &InstanceModel,
     repo_count: u64,
@@ -648,6 +735,7 @@ fn build_instance_details(
     ]
 }
 
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 fn build_instance_json(
     instance: InstanceModel,
     repo_count: u64,
@@ -666,6 +754,7 @@ fn build_instance_json(
     }
 }
 
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 fn format_instance_credential_status(source: Option<&CredentialSource>) -> String {
     match source {
         Some(CredentialSource::Keychain) => "configured (keychain)".to_string(),
@@ -1073,6 +1162,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[test]
     fn format_instance_credential_status_covers_all_sources() {
         assert_eq!(
@@ -1092,6 +1182,7 @@ mod tests {
         assert_eq!(format_instance_credential_status(None), "missing");
     }
 
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[test]
     fn build_instance_helpers_include_auth_fields() {
         let instance = InstanceModel {
@@ -1138,6 +1229,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[test]
     fn build_instance_helpers_cover_missing_auth_state() {
         let instance = InstanceModel {
@@ -1310,6 +1402,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[tokio::test]
     async fn list_instances_and_show_instance_succeed_for_json_output() {
         let db = setup_db("list-show-success").await;

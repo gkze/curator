@@ -16,7 +16,7 @@ use console::Term;
 use tracing_subscriber::EnvFilter;
 
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-use crate::commands::limits::OutputFormat;
+use crate::commands::OutputFormat;
 
 #[derive(Parser)]
 #[command(name = "curator")]
@@ -68,7 +68,7 @@ CONFIGURATION
 
 ENVIRONMENT VARIABLES
     CURATOR_DATABASE_URL      Database connection string (default: sqlite://~/.local/state/curator/curator.db?mode=rwc)
-    CURATOR_INSTANCE_<NAME>_TOKEN  Per-instance token override
+    CURATOR_INSTANCE_<NAME>_TOKEN  Per-instance token override (blank values ignored)
     CURATOR_GITHUB_TOKEN      GitHub personal access token (legacy global fallback)
     CURATOR_GITLAB_TOKEN      GitLab personal access token (legacy global fallback)
     CURATOR_GITEA_TOKEN       Gitea/Forgejo personal access token (legacy global fallback)

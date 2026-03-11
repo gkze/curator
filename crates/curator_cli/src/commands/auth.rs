@@ -14,7 +14,7 @@ use crate::credentials::{
     legacy_credential_for_instance, save_credential,
 };
 
-use super::limits::OutputFormat;
+use super::OutputFormat;
 
 #[derive(Subcommand)]
 pub enum AuthAction {
@@ -32,7 +32,10 @@ pub enum AuthAction {
         /// Instance name
         instance: String,
     },
-    /// Copy legacy platform-global config tokens into per-instance storage
+    /// Copy legacy platform-global config tokens into per-instance storage.
+    ///
+    /// Uses host matching to route credentials when multiple instances share
+    /// the same platform type. Skips ambiguous cases to avoid misrouting.
     Migrate {
         /// Output format
         #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]

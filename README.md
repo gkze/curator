@@ -62,8 +62,10 @@ cargo install --path crates/curator_cli
 ### With Nix
 
 ```bash
-nix profile add github:gkze/curator
+nix profile install github:gkze/curator
 ```
+
+The flake is configured with the [`gkze` Cachix binary cache](https://gkze.cachix.org) as a substituter. Pass `--accept-flake-config` (or add `gkze.cachix.org` to your trusted substituters) to pull pre-built binaries instead of building from source.
 
 ## Configuration
 
@@ -111,7 +113,7 @@ All environment variables use the `CURATOR_` prefix:
 | Variable | Description |
 | ------------------------ | --------------------------------------------------- |
 | `CURATOR_DATABASE_URL` | Database connection string (default: see below) |
-| `CURATOR_INSTANCE_<NAME>_TOKEN` | Per-instance token override |
+| `CURATOR_INSTANCE_<NAME>_TOKEN` | Per-instance token override (blank/whitespace values are ignored) |
 | `CURATOR_GITHUB_TOKEN` | GitHub API token |
 | `CURATOR_GITLAB_HOST` | GitLab host (default: `gitlab.com`) |
 | `CURATOR_GITLAB_TOKEN` | GitLab API token |
@@ -144,6 +146,8 @@ curator auth logout github
 curator auth migrate
 curator auth cleanup-legacy
 ```
+
+`auth migrate` moves legacy global tokens (e.g. `[github].token`) into per-instance credential storage. When multiple instances share the same platform type, the migration uses host matching to route the credential to the correct instance. If the legacy config host doesn't match any single instance unambiguously, the migration is skipped for those instances to avoid misrouting credentials.
 
 ## Usage
 

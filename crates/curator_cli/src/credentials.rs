@@ -212,6 +212,7 @@ pub(crate) fn legacy_credential_for_instance(
     config: &Config,
 ) -> Option<(StoredCredential, &'static str)> {
     match instance.platform_type {
+        #[cfg(feature = "github")]
         curator::PlatformType::GitHub => config.github_token().map(|token| {
             (
                 StoredCredential {
@@ -224,6 +225,7 @@ pub(crate) fn legacy_credential_for_instance(
                 "legacy github config",
             )
         }),
+        #[cfg(feature = "gitlab")]
         curator::PlatformType::GitLab => config.gitlab_token().map(|token| {
             (
                 StoredCredential {
@@ -241,6 +243,7 @@ pub(crate) fn legacy_credential_for_instance(
                 "legacy gitlab config",
             )
         }),
+        #[cfg(feature = "gitea")]
         curator::PlatformType::Gitea if instance.is_codeberg() => {
             config.codeberg_token().map(|token| {
                 (
@@ -260,6 +263,7 @@ pub(crate) fn legacy_credential_for_instance(
                 )
             })
         }
+        #[cfg(feature = "gitea")]
         curator::PlatformType::Gitea => config.gitea_token().map(|token| {
             (
                 StoredCredential {
@@ -272,6 +276,9 @@ pub(crate) fn legacy_credential_for_instance(
                 "legacy gitea config",
             )
         }),
+        // When a platform feature is disabled, no legacy credential is available
+        #[allow(unreachable_patterns)]
+        _ => None,
     }
 }
 
