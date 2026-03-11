@@ -27,3 +27,5 @@ tap = "gkze/homebrew-gkze"
 publish-jobs = ["homebrew"]
 # Use Nix for build setup (installs dependencies via Nix)
 github-build-setup = "../build-setup.yml"
+# Don't run the release workflow on PRs (avoids noisy skipped checks)
+pr-run-mode = "skip"
