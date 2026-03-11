@@ -738,15 +738,20 @@ mod tests {
         assert_eq!(loaded.access_token, "after");
     }
 
+    #[cfg(feature = "github")]
     #[test]
-    fn legacy_credential_for_instance_maps_platform_specific_sources() {
+    fn legacy_credential_for_instance_maps_github_source() {
         let github = sample_instance("github");
         let mut github_config = Config::default();
         github_config.github.token = Some("gh-token".to_string());
         let github_legacy = legacy_credential_for_instance(&github, &github_config).unwrap();
         assert_eq!(github_legacy.0.access_token, "gh-token");
         assert_eq!(github_legacy.1, "legacy github config");
+    }
 
+    #[cfg(feature = "gitlab")]
+    #[test]
+    fn legacy_credential_for_instance_maps_gitlab_source() {
         let mut gitlab = sample_instance("gitlab");
         gitlab.platform_type = curator::PlatformType::GitLab;
         let mut gitlab_config = Config::default();
@@ -755,7 +760,11 @@ mod tests {
         let gitlab_legacy = legacy_credential_for_instance(&gitlab, &gitlab_config).unwrap();
         assert_eq!(gitlab_legacy.0.auth_kind, "oauth");
         assert_eq!(gitlab_legacy.1, "legacy gitlab config");
+    }
 
+    #[cfg(feature = "gitea")]
+    #[test]
+    fn legacy_credential_for_instance_maps_codeberg_and_gitea_sources() {
         let mut codeberg = sample_instance("codeberg");
         codeberg.platform_type = curator::PlatformType::Gitea;
         codeberg.host = "codeberg.org".to_string();
