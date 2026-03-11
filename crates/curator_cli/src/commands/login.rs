@@ -1266,6 +1266,7 @@ mod tests {
     #[cfg(feature = "gitlab")]
     #[tokio::test]
     async fn handle_login_gitlab_auto_without_client_id_falls_back_to_pat() {
+        let _guard = env_lock().lock().await;
         let config_env = TempConfigEnv::new("gitlab-auto-pat");
         let db = setup_db("gitlab-auto-pat").await;
         let instance = sample_instance(
@@ -1305,6 +1306,12 @@ mod tests {
     #[cfg(feature = "github")]
     #[tokio::test]
     async fn login_github_returns_no_supported_method_for_non_github_device_only_instance() {
+        let _guard = env_lock().lock().await;
+        let original = std::env::var("CURATOR_GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+        }
+
         let db = setup_db("github-no-supported-method").await;
         let instance = sample_instance(
             "ghe-device-only",
@@ -1316,6 +1323,16 @@ mod tests {
         let err = login_github(&instance, &db, &Config::default(), false)
             .await
             .expect_err("non-github device-only instance should fail");
+
+        match original {
+            Some(token) => unsafe {
+                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+            },
+            None => unsafe {
+                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            },
+        }
+
         assert!(err.to_string().contains("No token provided for GitHub"));
     }
 
@@ -1445,6 +1462,12 @@ mod tests {
     #[cfg(feature = "github")]
     #[tokio::test]
     async fn login_github_token_only_without_token_errors() {
+        let _guard = env_lock().lock().await;
+        let original = std::env::var("CURATOR_GITHUB_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+        }
+
         let db = setup_db("github-token-missing").await;
         let instance = sample_instance(
             "github-token-missing",
@@ -1456,12 +1479,28 @@ mod tests {
         let err = login_github(&instance, &db, &Config::default(), false)
             .await
             .expect_err("github token-only flow without token should fail");
+
+        match original {
+            Some(token) => unsafe {
+                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+            },
+            None => unsafe {
+                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            },
+        }
+
         assert!(err.to_string().contains("No token provided for GitHub"));
     }
 
     #[cfg(feature = "gitlab")]
     #[tokio::test]
     async fn login_gitlab_token_only_without_token_errors() {
+        let _guard = env_lock().lock().await;
+        let original = std::env::var("CURATOR_GITLAB_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("CURATOR_GITLAB_TOKEN");
+        }
+
         let db = setup_db("gitlab-token-missing").await;
         let instance = sample_instance(
             "gitlab-token-missing",
@@ -1473,12 +1512,28 @@ mod tests {
         let err = login_gitlab(&instance, &db, &Config::default(), false)
             .await
             .expect_err("gitlab token-only flow without token should fail");
+
+        match original {
+            Some(token) => unsafe {
+                std::env::set_var("CURATOR_GITLAB_TOKEN", token);
+            },
+            None => unsafe {
+                std::env::remove_var("CURATOR_GITLAB_TOKEN");
+            },
+        }
+
         assert!(err.to_string().contains("No token provided for GitLab"));
     }
 
     #[cfg(feature = "gitea")]
     #[tokio::test]
     async fn login_gitea_token_only_without_token_errors() {
+        let _guard = env_lock().lock().await;
+        let original = std::env::var("CURATOR_GITEA_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("CURATOR_GITEA_TOKEN");
+        }
+
         let db = setup_db("gitea-token-missing").await;
         let instance = sample_instance(
             "gitea-token-missing",
@@ -1490,6 +1545,16 @@ mod tests {
         let err = login_gitea(&instance, &db, &Config::default(), false)
             .await
             .expect_err("gitea token-only flow without token should fail");
+
+        match original {
+            Some(token) => unsafe {
+                std::env::set_var("CURATOR_GITEA_TOKEN", token);
+            },
+            None => unsafe {
+                std::env::remove_var("CURATOR_GITEA_TOKEN");
+            },
+        }
+
         assert!(
             err.to_string()
                 .contains("No token provided for Gitea/Forgejo")

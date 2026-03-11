@@ -839,9 +839,10 @@ fn read_instance_env_token(instance: &InstanceModel) -> Option<String> {
         "CURATOR_INSTANCE_{}_TOKEN",
         normalize_instance_env_name(&instance.name)
     );
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
+    std::env::var(key).ok().and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
 }
 
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
@@ -1811,6 +1812,35 @@ mod tests {
         }
 
         assert_eq!(token, "instance-env-token");
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
+    async fn get_token_for_instance_ignores_blank_instance_env_override() {
+        let _guard = env_lock().lock().await;
+        let instance = sample_instance("github-work", PlatformType::GitHub, "github.example.com");
+        let original = std::env::var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN").ok();
+        unsafe {
+            std::env::set_var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN", "   ");
+        }
+
+        let mut config = Config::default();
+        config.github.token = Some("token-from-config".to_string());
+
+        let token = get_token_for_instance(&instance, &config)
+            .await
+            .expect("blank instance env token should be ignored");
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN", value);
+            },
+            None => unsafe {
+                std::env::remove_var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN");
+            },
+        }
+
+        assert_eq!(token, "token-from-config");
     }
 
     #[test]

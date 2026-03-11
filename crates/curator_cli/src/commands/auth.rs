@@ -160,6 +160,28 @@ async fn handle_logout(
     Ok(())
 }
 
+fn host_matched_instances(
+    instances: &[InstanceModel],
+    configured_host: Option<&str>,
+) -> Vec<InstanceModel> {
+    let Some(configured_host) = configured_host else {
+        return instances.to_vec();
+    };
+
+    let normalized_host = curator::oauth::normalize_host(configured_host);
+    let exact: Vec<_> = instances
+        .iter()
+        .filter(|instance| curator::oauth::normalize_host(&instance.host) == normalized_host)
+        .cloned()
+        .collect();
+
+    if exact.len() == 1 {
+        exact
+    } else {
+        instances.to_vec()
+    }
+}
+
 async fn handle_migrate(
     output: OutputFormat,
     db: &DatabaseConnection,
@@ -184,28 +206,79 @@ async fn handle_migrate(
         }
 
         if platform == PlatformType::Gitea {
-            for instance in matching {
-                if let Some((credential, source)) =
-                    legacy_credential_for_instance(&instance, config)
+            let codeberg: Vec<InstanceModel> = matching
+                .iter()
+                .filter(|instance| instance.is_codeberg())
+                .cloned()
+                .collect();
+            if let Some(template_instance) = codeberg.first()
+                && let Some((credential, source)) =
+                    legacy_credential_for_instance(template_instance, config)
+            {
+                let instance = template_instance;
+                if credential_status(instance, config, Some(db))
+                    .await?
+                    .active_source
+                    .is_some()
                 {
-                    if credential_status(&instance, config, Some(db))
-                        .await?
-                        .active_source
-                        .is_some()
-                    {
-                        rows.push(MigrationRow {
-                            platform: instance.platform_type.to_string(),
-                            instance: instance.name,
-                            result: "skipped (already has per-instance credential)".to_string(),
-                        });
-                    } else {
-                        let saved = save_credential(&instance, &credential, config, db).await?;
-                        rows.push(MigrationRow {
-                            platform: instance.platform_type.to_string(),
-                            instance: instance.name,
-                            result: format!("migrated from {source} to {}", saved.describe()),
-                        });
-                    }
+                    rows.push(MigrationRow {
+                        platform: instance.platform_type.to_string(),
+                        instance: instance.name.clone(),
+                        result: "skipped (already has per-instance credential)".to_string(),
+                    });
+                } else {
+                    let saved = save_credential(instance, &credential, config, db).await?;
+                    rows.push(MigrationRow {
+                        platform: instance.platform_type.to_string(),
+                        instance: instance.name.clone(),
+                        result: format!("migrated from {source} to {}", saved.describe()),
+                    });
+                }
+            }
+
+            let self_hosted: Vec<InstanceModel> = matching
+                .iter()
+                .filter(|instance| !instance.is_codeberg())
+                .cloned()
+                .collect();
+            let Some(template_instance) = self_hosted.first() else {
+                continue;
+            };
+            let Some((credential, source)) =
+                legacy_credential_for_instance(template_instance, config)
+            else {
+                continue;
+            };
+            let targeted = host_matched_instances(&self_hosted, config.gitea.host.as_deref());
+
+            if targeted.len() == 1 {
+                let instance = &targeted[0];
+                if credential_status(instance, config, Some(db))
+                    .await?
+                    .active_source
+                    .is_some()
+                {
+                    rows.push(MigrationRow {
+                        platform: instance.platform_type.to_string(),
+                        instance: instance.name.clone(),
+                        result: "skipped (already has per-instance credential)".to_string(),
+                    });
+                } else {
+                    let saved = save_credential(instance, &credential, config, db).await?;
+                    rows.push(MigrationRow {
+                        platform: instance.platform_type.to_string(),
+                        instance: instance.name.clone(),
+                        result: format!("migrated from {source} to {}", saved.describe()),
+                    });
+                }
+            } else {
+                for instance in targeted {
+                    rows.push(MigrationRow {
+                        platform: instance.platform_type.to_string(),
+                        instance: instance.name,
+                        result: "skipped (legacy credential is ambiguous across gitea instances)"
+                            .to_string(),
+                    });
                 }
             }
             continue;
@@ -220,19 +293,10 @@ async fn handle_migrate(
         };
 
         let targeted: Vec<InstanceModel> = match platform {
-            PlatformType::GitLab => {
-                let host = config.gitlab_host();
-                let exact: Vec<_> = matching
-                    .iter()
-                    .filter(|instance| instance.host == host)
-                    .cloned()
-                    .collect();
-                if exact.len() == 1 {
-                    exact
-                } else {
-                    matching.clone()
-                }
-            }
+            PlatformType::GitLab => host_matched_instances(
+                &matching,
+                config.gitlab.host.as_deref().or(Some("gitlab.com")),
+            ),
             _ => matching.clone(),
         };
 
@@ -730,6 +794,45 @@ mod tests {
 
         assert_eq!(codeberg_loaded.credential.access_token, "already-present");
         assert_eq!(gitea_loaded.credential.access_token, "legacy-gitea");
+    }
+
+    #[tokio::test]
+    async fn handle_migrate_gitea_branch_only_targets_matching_host() {
+        let env = TempConfigEnv::new("migrate-gitea-host-match");
+        let db = setup_db("migrate-gitea-host-match").await;
+        let first = sample_instance("forgejo-work", PlatformType::Gitea, "forgejo.work.test");
+        let second = sample_instance(
+            "forgejo-personal",
+            PlatformType::Gitea,
+            "forgejo.personal.test",
+        );
+        insert_instance(&db, &first).await;
+        insert_instance(&db, &second).await;
+
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(env.auth_path()),
+            },
+            gitea: crate::config::GiteaConfig {
+                host: Some("https://forgejo.work.test/".to_string()),
+                token: Some("legacy-gitea".to_string()),
+            },
+            ..Config::default()
+        };
+
+        handle_migrate(OutputFormat::Json, &db, &config)
+            .await
+            .unwrap();
+
+        let first_loaded = load_credential(&first, &config, Some(&db))
+            .await
+            .unwrap()
+            .unwrap();
+        let second_loaded = load_credential(&second, &config, Some(&db)).await.unwrap();
+
+        assert_eq!(first_loaded.credential.access_token, "legacy-gitea");
+        assert!(second_loaded.is_none());
     }
 
     #[tokio::test]

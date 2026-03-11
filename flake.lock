@@ -131,13 +131,13 @@
     "gitlab-swagger-spec": {
       "flake": false,
       "locked": {
-        "narHash": "sha256-5WARQNt9pplehBl9/CtUrib9mU8gru9dYB0Mg1BXWQQ=",
+        "narHash": "sha256-XUqnk4hjUjlQ4E6M4qJv84T+FE0qCzC1FW4x/sdMa3E=",
         "type": "file",
-        "url": "https://gitlab.com/gitlab-org/gitlab/-/raw/18-9-stable-ee/doc/api/openapi/openapi_v2.yaml"
+        "url": "https://gitlab.com/gitlab-org/gitlab/-/raw/54ad755d436bf21a4cfc2c1bb401571d03574ef1/doc/api/openapi/openapi_v2.yaml"
       },
       "original": {
         "type": "file",
-        "url": "https://gitlab.com/gitlab-org/gitlab/-/raw/18-9-stable-ee/doc/api/openapi/openapi_v2.yaml"
+        "url": "https://gitlab.com/gitlab-org/gitlab/-/raw/54ad755d436bf21a4cfc2c1bb401571d03574ef1/doc/api/openapi/openapi_v2.yaml"
       }
     },
     "nixpkgs": {
