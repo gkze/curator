@@ -540,6 +540,7 @@ fn edit_config_doc(
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::fs;
 
     struct TempConfigEnv {
         temp_dir: PathBuf,

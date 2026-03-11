@@ -100,7 +100,7 @@ impl Default for ProgressReporter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "github", feature = "gitlab", feature = "gitea")))]
 mod tests {
     use super::*;
     use curator::sync::SyncProgress;

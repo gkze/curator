@@ -15,7 +15,6 @@ use clap::{Parser, Subcommand};
 use console::Term;
 use tracing_subscriber::EnvFilter;
 
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::commands::OutputFormat;
 
 #[derive(Parser)]
@@ -1425,6 +1424,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[test]
     fn parses_limits_default_output() {
         let cli = Cli::try_parse_from(["curator", "limits", "github"]).unwrap();
@@ -1521,6 +1521,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[test]
     fn parses_limits_json_output() {
         let cli = Cli::try_parse_from(["curator", "limits", "github", "--output", "json"]).unwrap();

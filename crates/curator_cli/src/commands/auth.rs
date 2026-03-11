@@ -621,6 +621,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gitlab")]
     #[tokio::test]
     async fn handle_migrate_moves_unambiguous_legacy_credentials() {
         let env = TempConfigEnv::new("migrate");
@@ -653,6 +654,7 @@ mod tests {
         assert_eq!(loaded.unwrap().credential.access_token, "legacy-token");
     }
 
+    #[cfg(feature = "gitlab")]
     #[tokio::test]
     async fn handle_migrate_skips_ambiguous_legacy_credentials() {
         let env = TempConfigEnv::new("migrate-ambiguous");
@@ -695,6 +697,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "github")]
     #[tokio::test]
     async fn handle_cleanup_legacy_removes_global_config_after_per_instance_migration() {
         let _guard = crate::test_support::env_lock().lock().await;
@@ -743,6 +746,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gitea")]
     #[tokio::test]
     async fn handle_migrate_gitea_branch_skips_existing_and_migrates_missing() {
         let env = TempConfigEnv::new("migrate-gitea");
@@ -799,6 +803,7 @@ mod tests {
         assert_eq!(gitea_loaded.credential.access_token, "legacy-gitea");
     }
 
+    #[cfg(feature = "gitea")]
     #[tokio::test]
     async fn handle_migrate_gitea_branch_only_targets_matching_host() {
         let env = TempConfigEnv::new("migrate-gitea-host-match");
@@ -838,6 +843,7 @@ mod tests {
         assert!(second_loaded.is_none());
     }
 
+    #[cfg(feature = "github")]
     #[tokio::test]
     async fn handle_cleanup_legacy_skips_when_instance_credentials_are_missing() {
         let _guard = crate::test_support::env_lock().lock().await;

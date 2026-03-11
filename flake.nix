@@ -274,7 +274,6 @@
                 rustToolchain
                 yq-go
               ]
-              ++ [ (mkSwagger2openapi pkgs) ]
               ++ mkBuildInputs pkgs;
 
             env = [
