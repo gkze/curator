@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,7 +49,16 @@ pub(crate) struct CredentialStatus {
     pub auth_kind: Option<String>,
     pub token_expires_at: Option<u64>,
     pub has_legacy_fallback: bool,
-    pub legacy_source: Option<&'static str>,
+    pub legacy_source: Option<LegacyCredentialSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LegacyCredentialSource {
+    GitHub,
+    GitLab,
+    Codeberg,
+    Gitea,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -62,6 +72,32 @@ impl CredentialSource {
             Self::Keychain => "system keychain".to_string(),
             Self::File(path) => format!("file {}", path.display()),
             Self::Db => "database".to_string(),
+        }
+    }
+}
+
+impl fmt::Display for LegacyCredentialSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.display_name())
+    }
+}
+
+impl LegacyCredentialSource {
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::GitHub => "legacy github config",
+            Self::GitLab => "legacy gitlab config",
+            Self::Codeberg => "legacy codeberg config",
+            Self::Gitea => "legacy gitea config",
+        }
+    }
+
+    pub(crate) fn serialized_name(self) -> &'static str {
+        match self {
+            Self::GitHub => "legacy_github_config",
+            Self::GitLab => "legacy_gitlab_config",
+            Self::Codeberg => "legacy_codeberg_config",
+            Self::Gitea => "legacy_gitea_config",
         }
     }
 }
@@ -210,7 +246,7 @@ pub(crate) async fn credential_status(
 pub(crate) fn legacy_credential_for_instance(
     instance: &InstanceModel,
     config: &Config,
-) -> Option<(StoredCredential, &'static str)> {
+) -> Option<(StoredCredential, LegacyCredentialSource)> {
     match instance.platform_type {
         #[cfg(feature = "github")]
         curator::PlatformType::GitHub => config.github_token().map(|token| {
@@ -222,7 +258,7 @@ pub(crate) fn legacy_credential_for_instance(
                     auth_kind: "pat".to_string(),
                     token_type: None,
                 },
-                "legacy github config",
+                LegacyCredentialSource::GitHub,
             )
         }),
         #[cfg(feature = "gitlab")]
@@ -240,7 +276,7 @@ pub(crate) fn legacy_credential_for_instance(
                     .to_string(),
                     token_type: None,
                 },
-                "legacy gitlab config",
+                LegacyCredentialSource::GitLab,
             )
         }),
         #[cfg(feature = "gitea")]
@@ -259,7 +295,7 @@ pub(crate) fn legacy_credential_for_instance(
                         .to_string(),
                         token_type: None,
                     },
-                    "legacy codeberg config",
+                    LegacyCredentialSource::Codeberg,
                 )
             })
         }
@@ -273,7 +309,7 @@ pub(crate) fn legacy_credential_for_instance(
                     auth_kind: "pat".to_string(),
                     token_type: None,
                 },
-                "legacy gitea config",
+                LegacyCredentialSource::Gitea,
             )
         }),
         // When a platform feature is disabled, no legacy credential is available
@@ -746,7 +782,7 @@ mod tests {
         github_config.github.token = Some("gh-token".to_string());
         let github_legacy = legacy_credential_for_instance(&github, &github_config).unwrap();
         assert_eq!(github_legacy.0.access_token, "gh-token");
-        assert_eq!(github_legacy.1, "legacy github config");
+        assert_eq!(github_legacy.1, LegacyCredentialSource::GitHub);
     }
 
     #[cfg(feature = "gitlab")]
@@ -759,7 +795,7 @@ mod tests {
         gitlab_config.gitlab.refresh_token = Some("refresh".to_string());
         let gitlab_legacy = legacy_credential_for_instance(&gitlab, &gitlab_config).unwrap();
         assert_eq!(gitlab_legacy.0.auth_kind, "oauth");
-        assert_eq!(gitlab_legacy.1, "legacy gitlab config");
+        assert_eq!(gitlab_legacy.1, LegacyCredentialSource::GitLab);
     }
 
     #[cfg(feature = "gitea")]
@@ -771,13 +807,13 @@ mod tests {
         let mut codeberg_config = Config::default();
         codeberg_config.codeberg.token = Some("cb-token".to_string());
         let codeberg_legacy = legacy_credential_for_instance(&codeberg, &codeberg_config).unwrap();
-        assert_eq!(codeberg_legacy.1, "legacy codeberg config");
+        assert_eq!(codeberg_legacy.1, LegacyCredentialSource::Codeberg);
 
         let mut gitea = sample_instance("gitea");
         gitea.platform_type = curator::PlatformType::Gitea;
         let mut gitea_config = Config::default();
         gitea_config.gitea.token = Some("gt-token".to_string());
         let gitea_legacy = legacy_credential_for_instance(&gitea, &gitea_config).unwrap();
-        assert_eq!(gitea_legacy.1, "legacy gitea config");
+        assert_eq!(gitea_legacy.1, LegacyCredentialSource::Gitea);
     }
 }
