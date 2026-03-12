@@ -5,10 +5,13 @@ use sea_orm::{ColumnTrait, QueryFilter};
 use sea_orm::{DatabaseConnection, EntityTrait, QueryOrder};
 use tabled::{Table, Tabled, settings::Style};
 
+use curator::platform::{PlatformClient, short_error_message};
 use curator::{Instance, InstanceColumn, InstanceModel, PlatformType};
 
-use crate::commands::shared::find_instance_by_name;
+use crate::commands::shared::{find_instance_by_name, peek_token_for_instance_with_db};
 use crate::config::Config;
+#[cfg(test)]
+use crate::credentials::LegacyCredentialSource;
 use crate::credentials::{
     CredentialSource, CredentialStatus, credential_status, delete_credential,
     legacy_credential_for_instance, save_credential,
@@ -63,8 +66,18 @@ struct AuthStatusRow {
     auth_kind: String,
     #[tabled(rename = "Expires")]
     expires: String,
+    #[tabled(rename = "Live Valid")]
+    live_valid: String,
     #[tabled(rename = "Legacy Fallback")]
     legacy_fallback: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveAuthValidity {
+    Valid,
+    Invalid,
+    Error,
+    Missing,
 }
 
 #[derive(Debug, serde::Serialize, Tabled)]
@@ -118,11 +131,85 @@ async fn handle_status(
     let mut rows = Vec::with_capacity(instances.len());
     for instance in &instances {
         let status = credential_status(instance, config, Some(db)).await?;
-        rows.push(auth_status_row(instance, status));
+        let live_validity = live_auth_validity(instance, &status, config, db).await;
+        rows.push(auth_status_row(instance, status, live_validity));
     }
 
     render_rows(output, rows)?;
     Ok(())
+}
+
+async fn live_auth_validity(
+    instance: &InstanceModel,
+    status: &CredentialStatus,
+    config: &Config,
+    db: &DatabaseConnection,
+) -> LiveAuthValidity {
+    let token = match peek_token_for_instance_with_db(instance, config, Some(db)).await {
+        Ok(token) => token,
+        Err(_) => {
+            return if status.active_source.is_some() || status.has_legacy_fallback {
+                LiveAuthValidity::Error
+            } else {
+                LiveAuthValidity::Missing
+            };
+        }
+    };
+
+    let result = match instance.platform_type {
+        #[cfg(feature = "github")]
+        PlatformType::GitHub => {
+            let client = match curator::github::GitHubClient::new(&token, instance.id, None) {
+                Ok(client) => client,
+                Err(_) => return LiveAuthValidity::Error,
+            };
+            client.get_authenticated_user().await
+        }
+        #[cfg(feature = "gitlab")]
+        PlatformType::GitLab => {
+            let client =
+                match curator::gitlab::GitLabClient::new(&instance.host, &token, instance.id, None)
+                    .await
+                {
+                    Ok(client) => client,
+                    Err(_) => return LiveAuthValidity::Error,
+                };
+            client.get_authenticated_user().await
+        }
+        #[cfg(feature = "gitea")]
+        PlatformType::Gitea => {
+            let client = match curator::gitea::GiteaClient::new(
+                &instance.base_url(),
+                &token,
+                instance.id,
+                None,
+            ) {
+                Ok(client) => client,
+                Err(_) => return LiveAuthValidity::Error,
+            };
+            client.get_authenticated_user().await
+        }
+        #[cfg(not(feature = "github"))]
+        PlatformType::GitHub => return LiveAuthValidity::Error,
+        #[cfg(not(feature = "gitlab"))]
+        PlatformType::GitLab => return LiveAuthValidity::Error,
+        #[cfg(not(feature = "gitea"))]
+        PlatformType::Gitea => return LiveAuthValidity::Error,
+    };
+
+    match result {
+        Ok(_) => LiveAuthValidity::Valid,
+        Err(curator::platform::PlatformError::AuthRequired) => LiveAuthValidity::Invalid,
+        Err(err) => {
+            tracing::debug!(
+                instance = %instance.name,
+                host = %instance.host,
+                error = %short_error_message(&err),
+                "live auth validation failed"
+            );
+            LiveAuthValidity::Error
+        }
+    }
 }
 
 async fn handle_logout(
@@ -458,7 +545,11 @@ fn render_rows<T: serde::Serialize + Tabled>(
     Ok(())
 }
 
-fn auth_status_row(instance: &InstanceModel, status: CredentialStatus) -> AuthStatusRow {
+fn auth_status_row(
+    instance: &InstanceModel,
+    status: CredentialStatus,
+    live_validity: LiveAuthValidity,
+) -> AuthStatusRow {
     AuthStatusRow {
         instance: instance.name.clone(),
         platform: instance.platform_type.to_string(),
@@ -469,10 +560,20 @@ fn auth_status_row(instance: &InstanceModel, status: CredentialStatus) -> AuthSt
             .token_expires_at
             .map(|value| value.to_string())
             .unwrap_or_else(|| "-".to_string()),
+        live_valid: live_auth_validity_label(live_validity),
         legacy_fallback: status
             .legacy_source
-            .map(ToString::to_string)
+            .map(|source| source.display_name().to_string())
             .unwrap_or_else(|| "none".to_string()),
+    }
+}
+
+fn live_auth_validity_label(validity: LiveAuthValidity) -> String {
+    match validity {
+        LiveAuthValidity::Valid => "yes".to_string(),
+        LiveAuthValidity::Invalid => "no".to_string(),
+        LiveAuthValidity::Error => "error".to_string(),
+        LiveAuthValidity::Missing => "missing".to_string(),
     }
 }
 
@@ -904,8 +1005,9 @@ mod tests {
                 auth_kind: None,
                 token_expires_at: None,
                 has_legacy_fallback: true,
-                legacy_source: Some("legacy gitlab config"),
+                legacy_source: Some(LegacyCredentialSource::GitLab),
             },
+            LiveAuthValidity::Missing,
         );
 
         assert_eq!(row.instance, "gitlab");
@@ -914,6 +1016,7 @@ mod tests {
         assert_eq!(row.active_credential, "missing");
         assert_eq!(row.auth_kind, "-");
         assert_eq!(row.expires, "-");
+        assert_eq!(row.live_valid, "missing");
         assert_eq!(row.legacy_fallback, "legacy gitlab config");
     }
 
@@ -930,13 +1033,83 @@ mod tests {
                 has_legacy_fallback: false,
                 legacy_source: None,
             },
+            LiveAuthValidity::Valid,
         );
 
         assert_eq!(row.configured_store, "db");
         assert_eq!(row.active_credential, "db");
         assert_eq!(row.auth_kind, "oauth");
         assert_eq!(row.expires, "123");
+        assert_eq!(row.live_valid, "yes");
         assert_eq!(row.legacy_fallback, "none");
+    }
+
+    #[test]
+    fn live_auth_validity_label_formats_all_variants() {
+        assert_eq!(live_auth_validity_label(LiveAuthValidity::Valid), "yes");
+        assert_eq!(live_auth_validity_label(LiveAuthValidity::Invalid), "no");
+        assert_eq!(live_auth_validity_label(LiveAuthValidity::Error), "error");
+        assert_eq!(
+            live_auth_validity_label(LiveAuthValidity::Missing),
+            "missing"
+        );
+    }
+
+    #[test]
+    fn auth_status_row_formats_legacy_fallback_for_humans() {
+        let instance = sample_instance("gitlab", PlatformType::GitLab, "gitlab.example.com");
+        let row = auth_status_row(
+            &instance,
+            crate::credentials::CredentialStatus {
+                configured_store: crate::config::CredentialStore::File,
+                active_source: None,
+                auth_kind: None,
+                token_expires_at: None,
+                has_legacy_fallback: true,
+                legacy_source: Some(LegacyCredentialSource::GitLab),
+            },
+            LiveAuthValidity::Missing,
+        );
+
+        assert_eq!(row.legacy_fallback, "legacy gitlab config");
+    }
+
+    #[tokio::test]
+    async fn live_auth_validity_reports_missing_without_any_configured_token() {
+        let env = TempConfigEnv::new("status-missing-live-valid");
+        let db = setup_db("status-missing-live-valid").await;
+        let instance = sample_instance(
+            "github-missing-live-valid",
+            PlatformType::GitHub,
+            "github.missing.live.valid",
+        );
+        insert_instance(&db, &instance).await;
+
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(env.auth_path()),
+            },
+            ..Config::default()
+        };
+
+        assert_eq!(
+            live_auth_validity(
+                &instance,
+                &crate::credentials::CredentialStatus {
+                    configured_store: crate::config::CredentialStore::File,
+                    active_source: None,
+                    auth_kind: None,
+                    token_expires_at: None,
+                    has_legacy_fallback: false,
+                    legacy_source: None,
+                },
+                &config,
+                &db,
+            )
+            .await,
+            LiveAuthValidity::Missing
+        );
     }
 
     #[tokio::test]

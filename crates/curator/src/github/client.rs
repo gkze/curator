@@ -613,11 +613,18 @@ impl PlatformClient for GitHubClient {
 
     async fn get_authenticated_user(&self) -> platform::Result<UserInfo> {
         // GET /user
-        let user: serde_json::Value = self
-            .inner
-            .get("/user", None::<&()>)
-            .await
-            .map_err(|e| PlatformError::api(e.to_string()))?;
+        let user: serde_json::Value =
+            self.inner
+                .get("/user", None::<&()>)
+                .await
+                .map_err(|err| match &err {
+                    octocrab::Error::GitHub { source, .. }
+                        if matches!(source.status_code.as_u16(), 401 | 403) =>
+                    {
+                        PlatformError::AuthRequired
+                    }
+                    _ => PlatformError::api(err.to_string()),
+                })?;
 
         Ok(UserInfo {
             username: user
@@ -2644,6 +2651,43 @@ mod tests {
         assert_eq!(user.email.as_deref(), Some("octo@example.com"));
         assert_eq!(user.public_repos, 2);
         assert_eq!(user.followers, 9);
+        assert!(server.is_drained());
+    }
+
+    #[tokio::test]
+    async fn platform_client_get_authenticated_user_maps_auth_failures() {
+        let server = OctoServer::spawn(HashMap::from([(
+            "/user".to_string(),
+            VecDeque::from([PlannedResponse {
+                status: 401,
+                headers: vec![(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )],
+                body: r#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest"}"#
+                    .to_string(),
+            }]),
+        )]));
+
+        let octocrab = Octocrab::builder()
+            .base_uri(&server.base_url)
+            .expect("base uri should parse")
+            .build()
+            .expect("octocrab should build");
+
+        let transport = MockTransport::new();
+        let transport_arc: Arc<dyn HttpTransport> = Arc::new(transport);
+        let client = GitHubClient::from_octocrab_with_transport_and_base_url(
+            octocrab,
+            Uuid::new_v4(),
+            transport_arc,
+            TEST_BASE_URL,
+        );
+
+        let err = PlatformClient::get_authenticated_user(&client)
+            .await
+            .expect_err("401 should require auth");
+        assert!(matches!(err, PlatformError::AuthRequired));
         assert!(server.is_drained());
     }
 

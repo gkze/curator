@@ -835,6 +835,71 @@ pub async fn get_token_for_instance_with_db(
     })
 }
 
+/// Get the currently configured token for an instance without refreshing or saving state.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+pub async fn peek_token_for_instance_with_db(
+    instance: &InstanceModel,
+    config: &Config,
+    db: Option<&DatabaseConnection>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(token) = read_instance_env_token(instance) {
+        return Ok(token);
+    }
+
+    if let Some(located) = credentials::load_credential(instance, config, db).await? {
+        return Ok(located.credential.access_token);
+    }
+
+    match instance.platform_type {
+        #[cfg(feature = "github")]
+        PlatformType::GitHub => config.github_token().ok_or_else(|| {
+            format!(
+                "No GitHub token configured. Run 'curator login {}' or set CURATOR_GITHUB_TOKEN.",
+                instance.name
+            )
+            .into()
+        }),
+        #[cfg(feature = "gitlab")]
+        PlatformType::GitLab => config.gitlab_token().ok_or_else(|| {
+            format!(
+                "No GitLab token configured. Run 'curator login {}' or set CURATOR_GITLAB_TOKEN.",
+                instance.name
+            )
+            .into()
+        }),
+        #[cfg(feature = "gitea")]
+        PlatformType::Gitea => {
+            if instance.is_codeberg() {
+                config.codeberg_token().ok_or_else(|| {
+                    "No Codeberg token configured. Run 'curator login codeberg' or set CURATOR_CODEBERG_TOKEN."
+                        .into()
+                })
+            } else {
+                config.gitea_token().ok_or_else(|| {
+                    format!(
+                        "No Gitea token configured for '{}'. Run 'curator login {}' or set CURATOR_GITEA_TOKEN.",
+                        instance.name, instance.name
+                    )
+                    .into()
+                })
+            }
+        }
+        #[cfg(not(feature = "github"))]
+        PlatformType::GitHub => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
+        #[cfg(not(feature = "gitlab"))]
+        PlatformType::GitLab => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
+        #[cfg(not(feature = "gitea"))]
+        PlatformType::Gitea => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
+    }
+    .or_else(|e| {
+        if let Some(token) = read_netrc_token(&instance.host) {
+            Ok(token)
+        } else {
+            Err(e)
+        }
+    })
+}
+
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 fn read_instance_env_token(instance: &InstanceModel) -> Option<String> {
     let key = format!(

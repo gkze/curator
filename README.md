@@ -147,6 +147,8 @@ curator auth migrate
 curator auth cleanup-legacy
 ```
 
+`auth status` also performs a live authenticated user lookup for each resolved credential source and reports whether that auth is currently valid at invocation time.
+
 `auth migrate` moves legacy global tokens (e.g. `[github].token`) into per-instance credential storage. When multiple instances share the same platform type, the migration uses host matching to route the credential to the correct instance. If the legacy config host doesn't match any single instance unambiguously, the migration is skipped for those instances to avoid misrouting credentials.
 
 ## Usage
