@@ -20,19 +20,8 @@
 //! file_path = "~/.config/curator/auth.toml" # optional file backend path
 //! # db stores secrets in the curator database in plaintext-at-rest
 //!
-//! [github]
-//! token = "ghp_..."  # or use CURATOR_GITHUB_TOKEN env var
-//!
 //! [gitlab]
-//! host = "gitlab.com"  # or self-hosted instance
-//! token = "glpat-..."  # or use CURATOR_GITLAB_TOKEN env var
-//!
-//! [codeberg]
-//! token = "..."  # or use CURATOR_CODEBERG_TOKEN env var
-//!
-//! [gitea]
-//! host = "https://gitea.example.com"  # self-hosted Gitea/Forgejo instance
-//! token = "..."  # or use CURATOR_GITEA_TOKEN env var
+//! include_subgroups = true
 //!
 //! [sync]
 //! active_within_days = 60
@@ -42,8 +31,6 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-use std::{fs, io};
 
 use config::{Config as ConfigStore, ConfigBuilder, Environment, File, FileFormat};
 use directories::ProjectDirs;
@@ -58,14 +45,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// Authentication backend configuration.
     pub auth: AuthConfig,
-    /// GitHub configuration.
-    pub github: GitHubConfig,
-    /// GitLab configuration.
+    /// GitLab-specific configuration.
     pub gitlab: GitLabConfig,
-    /// Codeberg configuration (codeberg.org).
-    pub codeberg: CodebergConfig,
-    /// Gitea configuration (self-hosted Gitea/Forgejo).
-    pub gitea: GiteaConfig,
     /// Default sync options.
     pub sync: SyncConfig,
 }
@@ -101,29 +82,10 @@ pub struct DatabaseConfig {
     pub url: Option<String>,
 }
 
-/// GitHub configuration.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct GitHubConfig {
-    /// GitHub API token.
-    /// Can also be set via CURATOR_GITHUB_TOKEN environment variable.
-    pub token: Option<String>,
-}
-
 /// GitLab configuration.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct GitLabConfig {
-    /// GitLab host (e.g., "gitlab.com" or "https://gitlab.example.com").
-    /// Can also be set via CURATOR_GITLAB_HOST environment variable.
-    pub host: Option<String>,
-    /// GitLab API token (personal access token or OAuth access token).
-    /// Can also be set via CURATOR_GITLAB_TOKEN environment variable.
-    pub token: Option<String>,
-    /// OAuth refresh token for automatic token renewal.
-    pub refresh_token: Option<String>,
-    /// Unix timestamp when the OAuth access token expires.
-    pub token_expires_at: Option<u64>,
     /// Include projects from subgroups when syncing.
     pub include_subgroups: bool,
 }
@@ -131,38 +93,9 @@ pub struct GitLabConfig {
 impl Default for GitLabConfig {
     fn default() -> Self {
         Self {
-            host: Some("gitlab.com".to_string()),
-            token: None,
-            refresh_token: None,
-            token_expires_at: None,
             include_subgroups: true,
         }
     }
-}
-
-/// Codeberg configuration (for codeberg.org).
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct CodebergConfig {
-    /// Codeberg API token (OAuth access token or personal access token).
-    /// Can also be set via CURATOR_CODEBERG_TOKEN environment variable.
-    pub token: Option<String>,
-    /// OAuth refresh token for automatic token renewal.
-    pub refresh_token: Option<String>,
-    /// Unix timestamp when the OAuth token expires.
-    pub token_expires_at: Option<u64>,
-}
-
-/// Gitea configuration (for self-hosted Gitea/Forgejo instances).
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct GiteaConfig {
-    /// Gitea host URL (e.g., "https://gitea.example.com").
-    /// Can also be set via CURATOR_GITEA_HOST environment variable.
-    pub host: Option<String>,
-    /// Gitea API token (personal access token).
-    /// Can also be set via CURATOR_GITEA_TOKEN environment variable.
-    pub token: Option<String>,
 }
 
 /// Default sync options.
@@ -266,75 +199,6 @@ impl Config {
         Self::default_config_path().and_then(|path| path.parent().map(|p| p.join("auth.toml")))
     }
 
-    /// Get the GitHub token.
-    #[cfg(feature = "github")]
-    pub fn github_token(&self) -> Option<String> {
-        self.github.token.clone()
-    }
-
-    /// Get the GitLab host.
-    #[cfg(feature = "gitlab")]
-    #[allow(dead_code)] // May be used for auto-host detection
-    pub fn gitlab_host(&self) -> String {
-        self.gitlab
-            .host
-            .clone()
-            .unwrap_or_else(|| "gitlab.com".to_string())
-    }
-
-    /// Get the GitLab token.
-    #[cfg(feature = "gitlab")]
-    pub fn gitlab_token(&self) -> Option<String> {
-        self.gitlab.token.clone()
-    }
-
-    /// Get the GitLab OAuth refresh token.
-    #[cfg(feature = "gitlab")]
-    #[allow(dead_code)] // Will be used for automatic token refresh
-    pub fn gitlab_refresh_token(&self) -> Option<String> {
-        self.gitlab.refresh_token.clone()
-    }
-
-    /// Get the GitLab OAuth token expiry (Unix timestamp).
-    #[cfg(feature = "gitlab")]
-    #[allow(dead_code)] // Will be used for automatic token refresh
-    pub fn gitlab_token_expires_at(&self) -> Option<u64> {
-        self.gitlab.token_expires_at
-    }
-
-    /// Get the Codeberg token.
-    #[cfg(feature = "gitea")]
-    pub fn codeberg_token(&self) -> Option<String> {
-        self.codeberg.token.clone()
-    }
-
-    /// Get the Codeberg OAuth refresh token.
-    #[cfg(feature = "gitea")]
-    #[allow(dead_code)] // Will be used for automatic token refresh
-    pub fn codeberg_refresh_token(&self) -> Option<String> {
-        self.codeberg.refresh_token.clone()
-    }
-
-    /// Get the Codeberg OAuth token expiry (Unix timestamp).
-    #[cfg(feature = "gitea")]
-    #[allow(dead_code)] // Will be used for automatic token refresh
-    pub fn codeberg_token_expires_at(&self) -> Option<u64> {
-        self.codeberg.token_expires_at
-    }
-
-    /// Get the Gitea host.
-    #[cfg(feature = "gitea")]
-    #[allow(dead_code)] // May be used for auto-host detection
-    pub fn gitea_host(&self) -> Option<String> {
-        self.gitea.host.clone()
-    }
-
-    /// Get the Gitea token.
-    #[cfg(feature = "gitea")]
-    pub fn gitea_token(&self) -> Option<String> {
-        self.gitea.token.clone()
-    }
-
     /// Get the default config file path.
     ///
     /// Prefers `$XDG_CONFIG_HOME/curator/config.toml` when the environment
@@ -369,101 +233,6 @@ impl Config {
                 .unwrap_or_else(|| dirs.data_dir().to_path_buf())
         })
     }
-
-    /// Save a GitHub token to the config file.
-    ///
-    /// Creates the config file and parent directories if they don't exist.
-    /// If a config file already exists, it updates only the `[github]` section,
-    /// preserving formatting, comments, and other settings.
-    #[cfg(feature = "github")]
-    #[allow(dead_code)]
-    pub fn save_github_token(token: &str) -> io::Result<PathBuf> {
-        save_toml_section_tokens("github", |doc| {
-            doc["github"]["token"] = toml_edit::value(token);
-        })
-    }
-
-    /// Save GitLab OAuth tokens to the config file.
-    ///
-    /// Saves the access token, refresh token, and expiry timestamp to the
-    /// `[gitlab]` section. Creates the config file and parent directories
-    /// if they don't exist. Preserves existing config formatting and comments.
-    #[cfg(feature = "gitlab")]
-    pub fn save_gitlab_oauth_tokens(
-        access_token: &str,
-        refresh_token: Option<&str>,
-        expires_at: Option<u64>,
-    ) -> io::Result<PathBuf> {
-        save_toml_section_tokens("gitlab", |doc| {
-            doc["gitlab"]["token"] = toml_edit::value(access_token);
-
-            if let Some(rt) = refresh_token {
-                doc["gitlab"]["refresh_token"] = toml_edit::value(rt);
-            }
-            if let Some(exp) = expires_at {
-                doc["gitlab"]["token_expires_at"] = toml_edit::value(exp as i64);
-            }
-        })
-    }
-
-    /// Save Codeberg OAuth tokens to the config file.
-    ///
-    /// Creates the config file and parent directories if they don't exist.
-    /// If a config file already exists, it updates only the `[codeberg]` section,
-    /// preserving formatting, comments, and other settings.
-    #[cfg(feature = "gitea")]
-    pub fn save_codeberg_oauth_tokens(
-        access_token: &str,
-        refresh_token: Option<&str>,
-        expires_at: Option<u64>,
-    ) -> io::Result<PathBuf> {
-        save_toml_section_tokens("codeberg", |doc| {
-            doc["codeberg"]["token"] = toml_edit::value(access_token);
-
-            if let Some(rt) = refresh_token {
-                doc["codeberg"]["refresh_token"] = toml_edit::value(rt);
-            }
-            if let Some(exp) = expires_at {
-                doc["codeberg"]["token_expires_at"] = toml_edit::value(exp as i64);
-            }
-        })
-    }
-
-    /// Save a Gitea/Forgejo personal access token to the config file.
-    ///
-    /// Creates the config file and parent directories if they don't exist.
-    /// Updates only the `[gitea]` section while preserving other config content.
-    #[cfg(feature = "gitea")]
-    #[allow(dead_code)]
-    pub fn save_gitea_token(host: &str, token: &str) -> io::Result<PathBuf> {
-        save_toml_section_tokens("gitea", |doc| {
-            doc["gitea"]["host"] = toml_edit::value(host);
-            doc["gitea"]["token"] = toml_edit::value(token);
-        })
-    }
-
-    /// Clear legacy platform-global credential keys from the config file.
-    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-    pub fn clear_legacy_tokens(section: &str) -> io::Result<Option<PathBuf>> {
-        edit_config_doc(|doc| {
-            if !doc.contains_key(section) {
-                return Ok(false);
-            }
-
-            let Some(table) = doc[section].as_table_mut() else {
-                return Ok(false);
-            };
-
-            let mut changed = false;
-            for key in ["token", "refresh_token", "token_expires_at"] {
-                if table.remove(key).is_some() {
-                    changed = true;
-                }
-            }
-
-            Ok(changed)
-        })
-    }
 }
 
 fn sqlite_database_url(path: &Path) -> String {
@@ -480,111 +249,9 @@ fn sqlite_database_url(path: &Path) -> String {
     }
 }
 
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-fn save_toml_section_tokens(
-    section: &str,
-    update: impl FnOnce(&mut toml_edit::DocumentMut),
-) -> io::Result<PathBuf> {
-    edit_config_doc(|doc| {
-        if !doc.contains_key(section) {
-            doc[section] = toml_edit::table();
-        }
-
-        update(doc);
-        Ok(true)
-    })?
-    .ok_or_else(|| io::Error::other("failed to persist config update"))
-}
-
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-fn edit_config_doc(
-    update: impl FnOnce(&mut toml_edit::DocumentMut) -> io::Result<bool>,
-) -> io::Result<Option<PathBuf>> {
-    let config_path = Config::default_config_path().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Could not determine config directory",
-        )
-    })?;
-
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let content = if config_path.exists() {
-        fs::read_to_string(&config_path)?
-    } else {
-        String::new()
-    };
-
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid TOML: {}", e)))?;
-
-    if !update(&mut doc)? {
-        return Ok(None);
-    }
-
-    fs::write(&config_path, doc.to_string())?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
-    }
-
-    Ok(Some(config_path))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::fs;
-
-    struct TempConfigEnv {
-        temp_dir: PathBuf,
-        previous_home: Option<OsString>,
-        previous_xdg_config_home: Option<OsString>,
-    }
-
-    impl TempConfigEnv {
-        fn new(label: &str) -> Self {
-            let temp_dir = std::env::temp_dir().join(format!(
-                "curator-config-tests-{}-{}",
-                label,
-                uuid::Uuid::new_v4()
-            ));
-            fs::create_dir_all(&temp_dir).unwrap();
-            let previous_home = std::env::var_os("HOME");
-            let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-            unsafe {
-                std::env::set_var("HOME", &temp_dir);
-                std::env::set_var("XDG_CONFIG_HOME", &temp_dir);
-            }
-            Self {
-                temp_dir,
-                previous_home,
-                previous_xdg_config_home,
-            }
-        }
-    }
-
-    impl Drop for TempConfigEnv {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous_home {
-                    Some(value) => std::env::set_var("HOME", value),
-                    None => std::env::remove_var("HOME"),
-                }
-                match &self.previous_xdg_config_home {
-                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-            }
-            let _ = fs::remove_dir_all(&self.temp_dir);
-        }
-    }
 
     #[test]
     fn test_default_config() {
@@ -595,25 +262,11 @@ mod tests {
         assert!(config.sync.star);
         assert!(!config.sync.no_rate_limit);
         assert!(config.database.url.is_none());
-        assert!(config.github.token.is_none());
-        assert_eq!(config.gitlab.host, Some("gitlab.com".to_string()));
-        assert!(config.gitlab.token.is_none());
         assert!(config.gitlab.include_subgroups);
-        assert!(config.codeberg.token.is_none());
-        assert!(config.gitea.host.is_none());
-        assert!(config.gitea.token.is_none());
-    }
-
-    #[test]
-    #[cfg(feature = "gitlab")]
-    fn test_gitlab_host_default() {
-        let config = Config::default();
-        assert_eq!(config.gitlab_host(), "gitlab.com");
     }
 
     #[test]
     fn test_config_builder_with_toml_string() {
-        // Test that we can still parse TOML content correctly
         let toml_content = r#"
             [database]
             url = "sqlite:///tmp/test.db"
@@ -621,8 +274,8 @@ mod tests {
             [auth]
             credential_store = "db"
 
-            [github]
-            token = "ghp_test123"
+            [gitlab]
+            include_subgroups = false
 
             [sync]
             active_within_days = 90
@@ -642,7 +295,7 @@ mod tests {
             Some("sqlite:///tmp/test.db".to_string())
         );
         assert_eq!(config.auth.credential_store, CredentialStore::Db);
-        assert_eq!(config.github.token, Some("ghp_test123".to_string()));
+        assert!(!config.gitlab.include_subgroups);
         assert_eq!(config.sync.active_within_days, 90);
         assert_eq!(config.sync.concurrency, 10);
         assert!(!config.sync.star);
@@ -650,9 +303,7 @@ mod tests {
 
     #[test]
     fn test_config_builder_with_defaults() {
-        // Test that defaults are applied when no config is provided
         let settings = ConfigStore::builder().build().unwrap();
-
         let config: Config = settings.try_deserialize().unwrap_or_default();
 
         assert_eq!(config.sync.active_within_days, 60);
@@ -662,7 +313,6 @@ mod tests {
 
     #[test]
     fn test_config_builder_partial_override() {
-        // Test that partial config overrides only specified values
         let toml_content = r#"
             [sync]
             active_within_days = 30
@@ -676,7 +326,6 @@ mod tests {
         let config: Config = settings.try_deserialize().unwrap();
 
         assert_eq!(config.sync.active_within_days, 30);
-        // Other values should be defaults
         assert_eq!(config.sync.concurrency, 20);
         assert!(config.sync.star);
     }
@@ -691,15 +340,8 @@ mod tests {
             credential_store = "file"
             file_path = "/tmp/curator-auth.toml"
 
-            [github]
-            token = "ghp_test123"
-
-            [codeberg]
-            token = "codeberg_token"
-
-            [gitea]
-            host = "https://gitea.example.com"
-            token = "gitea_token"
+            [gitlab]
+            include_subgroups = false
 
             [sync]
             active_within_days = 90
@@ -723,13 +365,7 @@ mod tests {
             config.auth.file_path,
             Some("/tmp/curator-auth.toml".to_string())
         );
-        assert_eq!(config.github.token, Some("ghp_test123".to_string()));
-        assert_eq!(config.codeberg.token, Some("codeberg_token".to_string()));
-        assert_eq!(
-            config.gitea.host,
-            Some("https://gitea.example.com".to_string())
-        );
-        assert_eq!(config.gitea.token, Some("gitea_token".to_string()));
+        assert!(!config.gitlab.include_subgroups);
         assert_eq!(config.sync.active_within_days, 90);
         assert_eq!(config.sync.concurrency, 10);
         assert!(!config.sync.star);
@@ -762,8 +398,6 @@ mod tests {
     fn test_gitlab_config_include_subgroups() {
         let toml_content = r#"
             [gitlab]
-            host = "gitlab.example.com"
-            token = "test_token"
             include_subgroups = false
         "#;
 
@@ -775,14 +409,12 @@ mod tests {
         let config: Config = settings.try_deserialize().unwrap();
 
         assert!(!config.gitlab.include_subgroups);
-        assert_eq!(config.gitlab.host, Some("gitlab.example.com".to_string()));
     }
 
     #[test]
     fn test_gitlab_config_default_include_subgroups() {
         let config = GitLabConfig::default();
         assert!(config.include_subgroups);
-        assert_eq!(config.host, Some("gitlab.com".to_string()));
     }
 
     #[test]
@@ -796,7 +428,6 @@ mod tests {
         let config = Config::default();
         let db_url = config.database_url();
 
-        // Should return Some with a default SQLite path
         assert!(db_url.is_some());
         let url = db_url.unwrap();
         assert!(url.starts_with("sqlite://"));
@@ -836,59 +467,7 @@ mod tests {
         let state_dir = Config::default_state_dir();
         assert!(state_dir.is_some());
         let path = state_dir.unwrap();
-        // Should contain "curator" in the path
         assert!(path.to_string_lossy().contains("curator"));
-    }
-
-    #[test]
-    fn test_github_config_default() {
-        let config = GitHubConfig::default();
-        assert!(config.token.is_none());
-    }
-
-    #[test]
-    fn test_codeberg_config_default() {
-        let config = CodebergConfig::default();
-        assert!(config.token.is_none());
-    }
-
-    #[test]
-    fn test_gitea_config_default() {
-        let config = GiteaConfig::default();
-        assert!(config.host.is_none());
-        assert!(config.token.is_none());
-    }
-
-    #[test]
-    #[cfg(feature = "gitlab")]
-    fn test_config_gitlab_host_with_custom() {
-        let toml_content = r#"
-            [gitlab]
-            host = "https://gitlab.mycompany.com"
-        "#;
-
-        let settings = ConfigStore::builder()
-            .add_source(config::File::from_str(toml_content, FileFormat::Toml))
-            .build()
-            .unwrap();
-
-        let config: Config = settings.try_deserialize().unwrap();
-
-        assert_eq!(config.gitlab_host(), "https://gitlab.mycompany.com");
-    }
-
-    #[test]
-    fn test_config_all_token_methods_none_by_default() {
-        let config = Config::default();
-
-        // Without environment variables set, these should all return None
-        // Note: These tests may be affected by actual environment variables
-        // In practice, we can't easily test env var resolution without
-        // actually setting them, but we can test the config file paths
-        assert!(config.github.token.is_none());
-        assert!(config.gitlab.token.is_none());
-        assert!(config.codeberg.token.is_none());
-        assert!(config.gitea.token.is_none());
     }
 
     #[test]
@@ -908,19 +487,15 @@ mod tests {
 
     #[test]
     fn test_environment_prefix() {
-        // Test that environment variables with CURATOR_ prefix would be recognized
-        // We can verify the Environment source is correctly configured
         let env_source = Environment::with_prefix("CURATOR")
             .separator("_")
             .prefix_separator("_");
 
-        // Just verify it can be created without error
         let _builder = ConfigStore::builder().add_source(env_source);
     }
 
     #[test]
     fn test_config_merging_order() {
-        // When multiple sources are added, later sources should override earlier ones
         let base_toml = r#"
             [sync]
             active_within_days = 60
@@ -940,9 +515,7 @@ mod tests {
 
         let config: Config = settings.try_deserialize().unwrap();
 
-        // active_within_days should be overridden to 30
         assert_eq!(config.sync.active_within_days, 30);
-        // concurrency should remain 20 from base (not overridden)
         assert_eq!(config.sync.concurrency, 20);
     }
 
@@ -962,8 +535,14 @@ mod tests {
 
     #[test]
     fn test_config_unknown_fields_ignored() {
-        // Unknown fields should be silently ignored (serde default behavior)
         let toml_content = r#"
+            [github]
+            token = "ignored"
+
+            [gitea]
+            host = "https://gitea.example.com"
+            token = "ignored"
+
             [sync]
             active_within_days = 60
             unknown_field = "should be ignored"
@@ -974,23 +553,7 @@ mod tests {
             .build()
             .unwrap();
 
-        // This should succeed despite unknown_field
         let config: Config = settings.try_deserialize().unwrap();
         assert_eq!(config.sync.active_within_days, 60);
-    }
-
-    #[test]
-    #[cfg(feature = "gitlab")]
-    fn test_clear_legacy_tokens_removes_token_keys_only() {
-        let _env = TempConfigEnv::new("clear-legacy");
-        let path = Config::save_gitlab_oauth_tokens("access", Some("refresh"), Some(42)).unwrap();
-
-        Config::clear_legacy_tokens("gitlab").unwrap();
-
-        let contents = fs::read_to_string(path).unwrap();
-        assert!(contents.contains("[gitlab]"));
-        assert!(!contents.contains("access"));
-        assert!(!contents.contains("refresh"));
-        assert!(!contents.contains("42"));
     }
 }

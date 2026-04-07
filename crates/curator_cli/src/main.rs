@@ -68,10 +68,6 @@ CONFIGURATION
 ENVIRONMENT VARIABLES
     CURATOR_DATABASE_URL      Database connection string (default: sqlite://~/.local/state/curator/curator.db?mode=rwc)
     CURATOR_INSTANCE_<NAME>_TOKEN  Per-instance token override (blank values ignored)
-    CURATOR_GITHUB_TOKEN      GitHub personal access token (legacy global fallback)
-    CURATOR_GITLAB_TOKEN      GitLab personal access token (legacy global fallback)
-    CURATOR_GITEA_TOKEN       Gitea/Forgejo personal access token (legacy global fallback)
-    CURATOR_CODEBERG_TOKEN    Codeberg personal access token (legacy global fallback)
 
 AUTH STORAGE
     Per-instance credentials are stored using [auth].credential_store.
@@ -534,21 +530,6 @@ mod tests {
 
     #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[test]
-    fn parses_auth_cleanup_legacy_subcommand() {
-        let cli = Cli::try_parse_from(["curator", "auth", "cleanup-legacy"])
-            .expect("auth cleanup-legacy should parse");
-
-        match cli.command {
-            Commands::Auth { action } => match action {
-                commands::auth::AuthAction::CleanupLegacy { .. } => {}
-                _ => panic!("expected auth cleanup-legacy action"),
-            },
-            _ => panic!("expected auth command"),
-        }
-    }
-
-    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-    #[test]
     fn parses_login_subcommand() {
         let cli = Cli::try_parse_from(["curator", "login", "github"]).expect("login should parse");
 
@@ -672,18 +653,6 @@ mod tests {
             Commands::Auth { action } => match action {
                 commands::auth::AuthAction::Logout { instance } => assert_eq!(instance, "github"),
                 _ => panic!("expected auth logout action"),
-            },
-            _ => panic!("expected auth command"),
-        }
-
-        let migrate = Cli::try_parse_from(["curator", "auth", "migrate", "--output", "json"])
-            .expect("auth migrate should parse");
-        match migrate.command {
-            Commands::Auth { action } => match action {
-                commands::auth::AuthAction::Migrate { output } => {
-                    assert!(matches!(output, OutputFormat::Json));
-                }
-                _ => panic!("expected auth migrate action"),
             },
             _ => panic!("expected auth command"),
         }
@@ -976,19 +945,6 @@ mod tests {
             },
             _ => panic!("expected auth command"),
         }
-
-        let cleanup =
-            Cli::try_parse_from(["curator", "auth", "cleanup-legacy", "--output", "json"])
-                .expect("auth cleanup-legacy json should parse");
-        match cleanup.command {
-            Commands::Auth { action } => match action {
-                commands::auth::AuthAction::CleanupLegacy { output } => {
-                    assert!(matches!(output, OutputFormat::Json));
-                }
-                _ => panic!("expected auth cleanup action"),
-            },
-            _ => panic!("expected auth command"),
-        }
     }
 
     #[test]
@@ -1116,21 +1072,6 @@ mod tests {
                 _ => panic!("expected add action"),
             },
             _ => panic!("expected instance command"),
-        }
-    }
-
-    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-    #[test]
-    fn parses_auth_migrate_default_output() {
-        let cli = Cli::try_parse_from(["curator", "auth", "migrate"]).unwrap();
-        match cli.command {
-            Commands::Auth { action } => match action {
-                commands::auth::AuthAction::Migrate { output } => {
-                    assert!(matches!(output, OutputFormat::Table));
-                }
-                _ => panic!("expected auth migrate action"),
-            },
-            _ => panic!("expected auth command"),
         }
     }
 
@@ -1271,21 +1212,6 @@ mod tests {
                     assert!(matches!(output, OutputFormat::Json));
                 }
                 _ => panic!("expected status action"),
-            },
-            _ => panic!("expected auth command"),
-        }
-    }
-
-    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-    #[test]
-    fn parses_auth_cleanup_legacy_default_output() {
-        let cli = Cli::try_parse_from(["curator", "auth", "cleanup-legacy"]).unwrap();
-        match cli.command {
-            Commands::Auth { action } => match action {
-                commands::auth::AuthAction::CleanupLegacy { output } => {
-                    assert!(matches!(output, OutputFormat::Table));
-                }
-                _ => panic!("expected cleanup action"),
             },
             _ => panic!("expected auth command"),
         }
@@ -1823,36 +1749,6 @@ mod tests {
 
     #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[test]
-    fn parses_auth_cleanup_legacy_short_json_flag() {
-        let cli = Cli::try_parse_from(["curator", "auth", "cleanup-legacy", "-o", "json"]).unwrap();
-        match cli.command {
-            Commands::Auth { action } => match action {
-                commands::auth::AuthAction::CleanupLegacy { output } => {
-                    assert!(matches!(output, OutputFormat::Json));
-                }
-                _ => panic!("expected cleanup action"),
-            },
-            _ => panic!("expected auth command"),
-        }
-    }
-
-    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-    #[test]
-    fn parses_auth_migrate_short_json_flag() {
-        let cli = Cli::try_parse_from(["curator", "auth", "migrate", "-o", "json"]).unwrap();
-        match cli.command {
-            Commands::Auth { action } => match action {
-                commands::auth::AuthAction::Migrate { output } => {
-                    assert!(matches!(output, OutputFormat::Json));
-                }
-                _ => panic!("expected migrate action"),
-            },
-            _ => panic!("expected auth command"),
-        }
-    }
-
-    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-    #[test]
     fn parses_sync_org_short_flags() {
         let cli = Cli::try_parse_from([
             "curator",
@@ -1990,21 +1886,6 @@ mod tests {
                 _ => panic!("expected add action"),
             },
             _ => panic!("expected instance command"),
-        }
-    }
-
-    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-    #[test]
-    fn parses_auth_migrate_json_output() {
-        let cli = Cli::try_parse_from(["curator", "auth", "migrate", "--output", "json"]).unwrap();
-        match cli.command {
-            Commands::Auth { action } => match action {
-                commands::auth::AuthAction::Migrate { output } => {
-                    assert!(matches!(output, OutputFormat::Json));
-                }
-                _ => panic!("expected migrate action"),
-            },
-            _ => panic!("expected auth command"),
         }
     }
 

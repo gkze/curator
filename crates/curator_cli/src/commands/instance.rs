@@ -20,8 +20,6 @@ use curator::{
 
 use super::OutputFormat;
 use crate::config::Config;
-#[cfg(all(test, any(feature = "github", feature = "gitlab", feature = "gitea")))]
-use crate::credentials::LegacyCredentialSource;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::credentials::{CredentialSource, CredentialStatus, credential_status};
 
@@ -587,7 +585,6 @@ struct InstanceJson {
     credential_status: String,
     auth_kind: Option<String>,
     token_expires_at: Option<u64>,
-    legacy_fallback: Option<String>,
 }
 
 #[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
@@ -717,13 +714,6 @@ fn build_instance_details(
                 .unwrap_or_else(|| "(not set)".to_string()),
         },
         InstanceDetail {
-            property: "Legacy Fallback".to_string(),
-            value: auth_status
-                .legacy_source
-                .map(|source| source.display_name().to_string())
-                .unwrap_or_else(|| "none".to_string()),
-        },
-        InstanceDetail {
             property: "Created".to_string(),
             value: instance
                 .created_at
@@ -751,9 +741,6 @@ fn build_instance_json(
         credential_status: format_instance_credential_status(auth_status.active_source.as_ref()),
         auth_kind: auth_status.auth_kind,
         token_expires_at: auth_status.token_expires_at,
-        legacy_fallback: auth_status
-            .legacy_source
-            .map(|source| source.serialized_name().to_string()),
         instance,
     }
 }
@@ -1203,8 +1190,6 @@ mod tests {
             active_source: Some(CredentialSource::Db),
             auth_kind: Some("oauth".to_string()),
             token_expires_at: Some(1234),
-            has_legacy_fallback: true,
-            legacy_source: Some(LegacyCredentialSource::GitLab),
         };
 
         let details = build_instance_details(&instance, 7, &auth_status);
@@ -1214,12 +1199,6 @@ mod tests {
                 .any(|item| item.property == "Credential Store" && item.value == "db")
         );
         assert!(details.iter().any(|item| item.property == "Credential Status" && item.value == "configured (db)"));
-        assert!(
-            details
-                .iter()
-                .any(|item| item.property == "Legacy Fallback"
-                    && item.value == "legacy gitlab config")
-        );
 
         let json = build_instance_json(instance, 7, auth_status);
         assert_eq!(json.repository_count, 7);
@@ -1227,10 +1206,6 @@ mod tests {
         assert_eq!(json.credential_status, "configured (db)");
         assert_eq!(json.auth_kind.as_deref(), Some("oauth"));
         assert_eq!(json.token_expires_at, Some(1234));
-        assert_eq!(
-            json.legacy_fallback.as_deref(),
-            Some("legacy_gitlab_config")
-        );
     }
 
     #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
@@ -1250,8 +1225,6 @@ mod tests {
             active_source: None,
             auth_kind: None,
             token_expires_at: None,
-            has_legacy_fallback: false,
-            legacy_source: None,
         };
 
         let details = build_instance_details(&instance, 0, &auth_status);
@@ -1270,18 +1243,12 @@ mod tests {
                 .iter()
                 .any(|item| item.property == "Token Expires At" && item.value == "(not set)")
         );
-        assert!(
-            details
-                .iter()
-                .any(|item| item.property == "Legacy Fallback" && item.value == "none")
-        );
 
         let json = build_instance_json(instance, 0, auth_status);
         assert_eq!(json.credential_store, "auto");
         assert_eq!(json.credential_status, "missing");
         assert_eq!(json.auth_kind, None);
         assert_eq!(json.token_expires_at, None);
-        assert_eq!(json.legacy_fallback, None);
     }
 
     #[test]

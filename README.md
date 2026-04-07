@@ -82,22 +82,12 @@ Curator uses a layered configuration system. Settings are resolved in this order
 [database]
 url = "sqlite://~/.local/state/curator/curator.db?mode=rwc"
 
-[github]
-token = "ghp_..."
+[auth]
+credential_store = "auto" # auto, keychain, file, db
+# file_path = "~/.config/curator/auth.toml"
 
 [gitlab]
-token = "glpat-..."
-refresh_token = "..."      # optional; used for OAuth auto-refresh
-token_expires_at = 1735689600 # optional unix timestamp
-
-[codeberg]
-token = "..."
-refresh_token = "..."      # optional; used for OAuth auto-refresh
-token_expires_at = 1735689600 # optional unix timestamp
-
-[gitea]
-host = "gitea.example.com"
-token = "..."
+include_subgroups = true
 
 [sync]
 active_within_days = 60
@@ -114,16 +104,6 @@ All environment variables use the `CURATOR_` prefix:
 | ------------------------ | --------------------------------------------------- |
 | `CURATOR_DATABASE_URL` | Database connection string (default: see below) |
 | `CURATOR_INSTANCE_<NAME>_TOKEN` | Per-instance token override (blank/whitespace values are ignored) |
-| `CURATOR_GITHUB_TOKEN` | GitHub API token |
-| `CURATOR_GITLAB_HOST` | GitLab host (default: `gitlab.com`) |
-| `CURATOR_GITLAB_TOKEN` | GitLab API token |
-| `CURATOR_GITLAB_REFRESH_TOKEN` | GitLab OAuth refresh token |
-| `CURATOR_GITLAB_TOKEN_EXPIRES_AT` | GitLab OAuth token expiry (unix seconds) |
-| `CURATOR_CODEBERG_TOKEN` | Codeberg API token |
-| `CURATOR_CODEBERG_REFRESH_TOKEN` | Codeberg OAuth refresh token |
-| `CURATOR_CODEBERG_TOKEN_EXPIRES_AT` | Codeberg OAuth token expiry (unix seconds) |
-| `CURATOR_GITEA_HOST` | Gitea/Forgejo host |
-| `CURATOR_GITEA_TOKEN` | Gitea API token |
 
 The database URL defaults to `sqlite://~/.local/state/curator/curator.db?mode=rwc` on Linux (using the XDG state directory). On macOS, it defaults to `sqlite://~/Library/Application Support/curator/curator.db?mode=rwc`.
 
@@ -143,13 +123,9 @@ You can inspect and manage auth state with:
 curator auth status
 curator auth status github
 curator auth logout github
-curator auth migrate
-curator auth cleanup-legacy
 ```
 
 `auth status` also performs a live authenticated user lookup for each resolved credential source and reports whether that auth is currently valid at invocation time.
-
-`auth migrate` moves legacy global tokens (e.g. `[github].token`) into per-instance credential storage. When multiple instances share the same platform type, the migration uses host matching to route the credential to the correct instance. If the legacy config host doesn't match any single instance unambiguously, the migration is skipped for those instances to avoid misrouting credentials.
 
 ## Usage
 

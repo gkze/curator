@@ -790,42 +790,10 @@ pub async fn get_token_for_instance_with_db(
     }
 
     if let Some(located) = credentials::load_credential(instance, config, db).await? {
-        return resolve_located_credential(instance, config, db, located).await;
+        return resolve_located_credential(instance, db, located).await;
     }
 
-    match instance.platform_type {
-        #[cfg(feature = "github")]
-        PlatformType::GitHub => config.github_token().ok_or_else(|| {
-            format!(
-                "No GitHub token configured. Run 'curator login {}' or set CURATOR_GITHUB_TOKEN.",
-                instance.name
-            )
-            .into()
-        }),
-        #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => get_legacy_gitlab_token_with_refresh(instance, config).await,
-        #[cfg(feature = "gitea")]
-        PlatformType::Gitea => {
-            if instance.is_codeberg() {
-                get_codeberg_token_with_refresh(config).await
-            } else {
-                config.gitea_token().ok_or_else(|| {
-                    format!(
-                        "No Gitea token configured for '{}'. Run 'curator login {}' or set CURATOR_GITEA_TOKEN.",
-                        instance.name, instance.name
-                    )
-                    .into()
-                })
-            }
-        }
-        #[cfg(not(feature = "github"))]
-        PlatformType::GitHub => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
-        #[cfg(not(feature = "gitlab"))]
-        PlatformType::GitLab => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
-        #[cfg(not(feature = "gitea"))]
-        PlatformType::Gitea => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
-    }
-    .or_else(|e| {
+    Err(missing_instance_credential_error(instance)).or_else(|e| {
         // Fallback: try ~/.netrc for the instance host
         if let Some(token) = read_netrc_token(&instance.host) {
             Ok(token)
@@ -850,48 +818,7 @@ pub async fn peek_token_for_instance_with_db(
         return Ok(located.credential.access_token);
     }
 
-    match instance.platform_type {
-        #[cfg(feature = "github")]
-        PlatformType::GitHub => config.github_token().ok_or_else(|| {
-            format!(
-                "No GitHub token configured. Run 'curator login {}' or set CURATOR_GITHUB_TOKEN.",
-                instance.name
-            )
-            .into()
-        }),
-        #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => config.gitlab_token().ok_or_else(|| {
-            format!(
-                "No GitLab token configured. Run 'curator login {}' or set CURATOR_GITLAB_TOKEN.",
-                instance.name
-            )
-            .into()
-        }),
-        #[cfg(feature = "gitea")]
-        PlatformType::Gitea => {
-            if instance.is_codeberg() {
-                config.codeberg_token().ok_or_else(|| {
-                    "No Codeberg token configured. Run 'curator login codeberg' or set CURATOR_CODEBERG_TOKEN."
-                        .into()
-                })
-            } else {
-                config.gitea_token().ok_or_else(|| {
-                    format!(
-                        "No Gitea token configured for '{}'. Run 'curator login {}' or set CURATOR_GITEA_TOKEN.",
-                        instance.name, instance.name
-                    )
-                    .into()
-                })
-            }
-        }
-        #[cfg(not(feature = "github"))]
-        PlatformType::GitHub => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
-        #[cfg(not(feature = "gitlab"))]
-        PlatformType::GitLab => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
-        #[cfg(not(feature = "gitea"))]
-        PlatformType::Gitea => Err(unsupported_platform_error(instance.platform_type, "token lookup")),
-    }
-    .or_else(|e| {
+    Err(missing_instance_credential_error(instance)).or_else(|e| {
         if let Some(token) = read_netrc_token(&instance.host) {
             Ok(token)
         } else {
@@ -928,7 +855,6 @@ fn normalize_instance_env_name(name: &str) -> String {
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 async fn resolve_located_credential(
     instance: &InstanceModel,
-    config: &Config,
     db: Option<&DatabaseConnection>,
     located: LocatedCredential,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -938,7 +864,6 @@ async fn resolve_located_credential(
         return Ok(refreshed.access_token);
     }
 
-    let _ = config;
     Ok(located.credential.access_token)
 }
 
@@ -1002,6 +927,17 @@ async fn maybe_refresh_credential(
     }
 }
 
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+fn missing_instance_credential_error(instance: &InstanceModel) -> Box<dyn std::error::Error> {
+    format!(
+        "No credential configured for '{}'. Run 'curator login {}' or set CURATOR_INSTANCE_{}_TOKEN.",
+        instance.name,
+        instance.name,
+        normalize_instance_env_name(&instance.name)
+    )
+    .into()
+}
+
 #[cfg(any(feature = "gitlab", feature = "gitea"))]
 fn resolve_client_id(instance: &InstanceModel) -> Option<&str> {
     instance.oauth_client_id.as_deref().or_else(|| {
@@ -1059,131 +995,6 @@ fn read_netrc_token(host: &str) -> Option<String> {
     }
 
     default_password
-}
-
-/// Get the Codeberg token, refreshing if expired or near expiry.
-///
-/// This function:
-/// 1. Checks if a token exists
-/// 2. If a refresh token exists, checks if the access token is expired/near expiry
-/// 3. If refresh is needed and possible, refreshes and saves new tokens
-/// 4. Returns the (possibly refreshed) access token
-#[cfg(feature = "gitea")]
-async fn get_codeberg_token_with_refresh(
-    config: &Config,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use curator::gitea::oauth::{CodebergAuth, refresh_access_token, token_expires_at};
-    use curator::oauth::token_is_expired;
-
-    // Get the current token (if any)
-    let current_token = config.codeberg_token();
-    let refresh_token = config.codeberg_refresh_token();
-    let expires_at = config.codeberg_token_expires_at();
-
-    // If we have a refresh token and the access token is expired/near expiry, try to refresh
-    if let Some(ref rt) = refresh_token
-        && token_is_expired(expires_at, TOKEN_REFRESH_BUFFER_SECS)
-    {
-        tracing::info!("Codeberg token expired or near expiry, attempting refresh...");
-
-        match refresh_access_token(&CodebergAuth::new(), rt).await {
-            Ok(new_tokens) => {
-                // Calculate new expiry
-                let new_expires_at = token_expires_at(&new_tokens);
-
-                // Save the new tokens
-                Config::save_codeberg_oauth_tokens(
-                    &new_tokens.access_token,
-                    new_tokens.refresh_token.as_deref(),
-                    new_expires_at,
-                )?;
-
-                tracing::info!("Successfully refreshed Codeberg token");
-                return Ok(new_tokens.access_token);
-            }
-            Err(e) => {
-                // If refresh fails and we have a current token, warn but try to use it
-                // (it might still work if the expiry check was overly aggressive)
-                if current_token.is_some() {
-                    tracing::warn!(
-                        "Failed to refresh Codeberg token: {}. Trying existing token...",
-                        e
-                    );
-                } else {
-                    return Err(format!(
-                        "Codeberg token expired and refresh failed: {}. Run 'curator login codeberg' to re-authenticate.",
-                        e
-                    )
-                    .into());
-                }
-            }
-        }
-    }
-
-    // Return the current token if we have one
-    current_token.ok_or_else(|| {
-        "No Codeberg token configured. Run 'curator login codeberg' or set CURATOR_CODEBERG_TOKEN."
-            .into()
-    })
-}
-
-#[cfg(feature = "gitlab")]
-async fn get_legacy_gitlab_token_with_refresh(
-    instance: &InstanceModel,
-    config: &Config,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use curator::gitlab::oauth::{refresh_access_token, token_expires_at};
-    use curator::oauth::token_is_expired;
-
-    let current_token = config.gitlab_token();
-    let refresh_token = config.gitlab_refresh_token();
-    let expires_at = config.gitlab_token_expires_at();
-
-    if let Some(ref rt) = refresh_token
-        && token_is_expired(expires_at, TOKEN_REFRESH_BUFFER_SECS)
-    {
-        let client_id = resolve_client_id(instance).ok_or_else(|| {
-            format!(
-                "GitLab instance '{}' needs an OAuth client id to refresh legacy OAuth credentials.",
-                instance.name
-            )
-        })?;
-
-        match refresh_access_token(&instance.host, client_id, rt).await {
-            Ok(new_tokens) => {
-                let new_expires_at = token_expires_at(&new_tokens);
-                Config::save_gitlab_oauth_tokens(
-                    &new_tokens.access_token,
-                    new_tokens.refresh_token.as_deref(),
-                    new_expires_at,
-                )?;
-                return Ok(new_tokens.access_token);
-            }
-            Err(err) if current_token.is_some() => {
-                tracing::warn!(
-                    "Failed to refresh GitLab token for '{}': {}. Trying existing token...",
-                    instance.name,
-                    err
-                );
-            }
-            Err(err) => {
-                return Err(format!(
-                    "GitLab token expired and refresh failed: {}. Run 'curator login {}' to re-authenticate.",
-                    err,
-                    instance.name,
-                )
-                .into());
-            }
-        }
-    }
-
-    current_token.ok_or_else(|| {
-        format!(
-            "No GitLab token configured. Run 'curator login {}' or set CURATOR_GITLAB_TOKEN.",
-            instance.name
-        )
-        .into()
-    })
 }
 
 #[cfg(all(test, any(feature = "github", feature = "gitlab", feature = "gitea")))]
@@ -1770,7 +1581,7 @@ mod tests {
         let original_home = std::env::var("HOME").ok();
         unsafe {
             std::env::set_var("HOME", &dir);
-            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            std::env::remove_var("CURATOR_UNUSED_PLATFORM_TOKEN");
         }
 
         let config = Config::default();
@@ -1789,23 +1600,10 @@ mod tests {
         }
 
         assert!(
-            err.to_string().contains("No GitHub token configured"),
+            err.to_string()
+                .contains("No credential configured for 'github'"),
             "unexpected error: {err}"
         );
-    }
-
-    #[cfg(feature = "github")]
-    #[tokio::test]
-    async fn get_token_for_instance_prefers_configured_token() {
-        let mut config = Config::default();
-        config.github.token = Some("token-from-config".to_string());
-        let instance = sample_instance("github", PlatformType::GitHub, "github.com");
-
-        let token = get_token_for_instance(&instance, &config)
-            .await
-            .expect("token should resolve from config");
-
-        assert_eq!(token, "token-from-config");
     }
 
     #[cfg(feature = "github")]
@@ -1879,35 +1677,6 @@ mod tests {
         }
 
         assert_eq!(token, "instance-env-token");
-    }
-
-    #[cfg(feature = "github")]
-    #[tokio::test]
-    async fn get_token_for_instance_ignores_blank_instance_env_override() {
-        let _guard = env_lock().lock().await;
-        let instance = sample_instance("github-work", PlatformType::GitHub, "github.example.com");
-        let original = std::env::var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN").ok();
-        unsafe {
-            std::env::set_var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN", "   ");
-        }
-
-        let mut config = Config::default();
-        config.github.token = Some("token-from-config".to_string());
-
-        let token = get_token_for_instance(&instance, &config)
-            .await
-            .expect("blank instance env token should be ignored");
-
-        match original {
-            Some(value) => unsafe {
-                std::env::set_var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN", value);
-            },
-            None => unsafe {
-                std::env::remove_var("CURATOR_INSTANCE_GITHUB_WORK_TOKEN");
-            },
-        }
-
-        assert_eq!(token, "token-from-config");
     }
 
     #[test]
@@ -1992,7 +1761,7 @@ mod tests {
         let original_home = std::env::var("HOME").ok();
         unsafe {
             std::env::set_var("HOME", &dir);
-            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            std::env::remove_var("CURATOR_UNUSED_PLATFORM_TOKEN");
         }
 
         let config = Config::default();
@@ -2027,10 +1796,10 @@ mod tests {
         .expect("netrc should be written");
 
         let original_home = std::env::var("HOME").ok();
-        let original_github_token = std::env::var("CURATOR_GITHUB_TOKEN").ok();
+        let original_github_token = std::env::var("CURATOR_UNUSED_PLATFORM_TOKEN").ok();
         unsafe {
             std::env::set_var("HOME", &dir);
-            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            std::env::remove_var("CURATOR_UNUSED_PLATFORM_TOKEN");
         }
 
         let config = Config::default();
@@ -2049,15 +1818,16 @@ mod tests {
         }
         match original_github_token {
             Some(token) => unsafe {
-                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+                std::env::set_var("CURATOR_UNUSED_PLATFORM_TOKEN", token);
             },
             None => unsafe {
-                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+                std::env::remove_var("CURATOR_UNUSED_PLATFORM_TOKEN");
             },
         }
 
         assert!(
-            err.to_string().contains("No GitHub token configured"),
+            err.to_string()
+                .contains("No credential configured for 'github'"),
             "unexpected error: {err}"
         );
     }
@@ -2077,10 +1847,10 @@ mod tests {
         .expect("netrc should be written");
 
         let original_home = std::env::var("HOME").ok();
-        let original_github_token = std::env::var("CURATOR_GITHUB_TOKEN").ok();
+        let original_github_token = std::env::var("CURATOR_UNUSED_PLATFORM_TOKEN").ok();
         unsafe {
             std::env::set_var("HOME", &dir);
-            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            std::env::remove_var("CURATOR_UNUSED_PLATFORM_TOKEN");
         }
 
         let config = Config::default();
@@ -2100,10 +1870,10 @@ mod tests {
         }
         match original_github_token {
             Some(token) => unsafe {
-                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+                std::env::set_var("CURATOR_UNUSED_PLATFORM_TOKEN", token);
             },
             None => unsafe {
-                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+                std::env::remove_var("CURATOR_UNUSED_PLATFORM_TOKEN");
             },
         }
 
@@ -2125,10 +1895,10 @@ mod tests {
         .expect("netrc should be written");
 
         let original_home = std::env::var("HOME").ok();
-        let original_github_token = std::env::var("CURATOR_GITHUB_TOKEN").ok();
+        let original_github_token = std::env::var("CURATOR_UNUSED_PLATFORM_TOKEN").ok();
         unsafe {
             std::env::set_var("HOME", &dir);
-            std::env::set_var("CURATOR_GITHUB_TOKEN", "token-from-env");
+            std::env::set_var("CURATOR_UNUSED_PLATFORM_TOKEN", "token-from-env");
         }
 
         let config = Config::default();
@@ -2147,88 +1917,14 @@ mod tests {
         }
         match original_github_token {
             Some(token) => unsafe {
-                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+                std::env::set_var("CURATOR_UNUSED_PLATFORM_TOKEN", token);
             },
             None => unsafe {
-                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+                std::env::remove_var("CURATOR_UNUSED_PLATFORM_TOKEN");
             },
         }
 
         assert_eq!(token, "ghp_from_netrc");
-    }
-
-    #[cfg(feature = "github")]
-    #[tokio::test]
-    async fn get_token_for_instance_prefers_config_over_netrc_fallback() {
-        let _guard = env_lock().lock().await;
-        let dir = std::env::temp_dir().join(format!("curator-netrc-precedence-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("temp dir should be created");
-        let netrc = dir.join(".netrc");
-        std::fs::write(
-            &netrc,
-            "machine github.com login octo password ghp_from_netrc\n",
-        )
-        .expect("netrc should be written");
-
-        let original_home = std::env::var("HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", &dir);
-        }
-
-        let mut config = Config::default();
-        config.github.token = Some("token-from-config".to_string());
-        let instance = sample_instance("github", PlatformType::GitHub, "github.com");
-        let token = get_token_for_instance(&instance, &config)
-            .await
-            .expect("config token should have precedence");
-
-        match original_home {
-            Some(home) => unsafe {
-                std::env::set_var("HOME", home);
-            },
-            None => unsafe {
-                std::env::remove_var("HOME");
-            },
-        }
-
-        assert_eq!(token, "token-from-config");
-    }
-
-    #[cfg(feature = "gitlab")]
-    #[tokio::test]
-    async fn get_token_for_instance_reads_gitlab_token_from_config() {
-        let mut config = Config::default();
-
-        config.gitlab.token = Some("gitlab-config-token".to_string());
-        let gitlab_instance = sample_instance("gitlab", PlatformType::GitLab, "gitlab.com");
-        let gitlab_token = get_token_for_instance(&gitlab_instance, &config)
-            .await
-            .expect("gitlab token should resolve from config");
-        assert_eq!(gitlab_token, "gitlab-config-token");
-    }
-
-    #[cfg(feature = "gitea")]
-    #[tokio::test]
-    async fn get_token_for_instance_reads_gitea_and_codeberg_tokens_from_config() {
-        let mut config = Config::default();
-
-        config.gitea.token = Some("gitea-config-token".to_string());
-        let gitea_instance = sample_instance(
-            "self-hosted-gitea",
-            PlatformType::Gitea,
-            "gitea.example.com",
-        );
-        let gitea_token = get_token_for_instance(&gitea_instance, &config)
-            .await
-            .expect("self-hosted gitea token should resolve from config");
-        assert_eq!(gitea_token, "gitea-config-token");
-
-        config.codeberg.token = Some("codeberg-config-token".to_string());
-        let codeberg_instance = sample_instance("codeberg", PlatformType::Gitea, "codeberg.org");
-        let codeberg_token = get_token_for_instance(&codeberg_instance, &config)
-            .await
-            .expect("codeberg token should resolve from config without refresh token");
-        assert_eq!(codeberg_token, "codeberg-config-token");
     }
 
     #[cfg(feature = "gitea")]
@@ -2262,7 +1958,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("No Gitea token configured for 'forgejo-local'"),
+                .contains("No credential configured for 'forgejo-local'"),
             "unexpected error: {err}"
         );
     }

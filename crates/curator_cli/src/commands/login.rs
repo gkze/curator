@@ -40,6 +40,25 @@ fn resolve_client_id(instance: &InstanceModel) -> Option<&str> {
         .or_else(|| well_known::by_name(&instance.name).and_then(|wk| wk.oauth_client_id))
 }
 
+fn normalize_instance_env_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn instance_token_env_var(instance: &InstanceModel) -> String {
+    format!(
+        "CURATOR_INSTANCE_{}_TOKEN",
+        normalize_instance_env_name(&instance.name)
+    )
+}
+
 /// Handle the login command for a given instance.
 pub async fn handle_login(
     instance_name: &str,
@@ -238,8 +257,9 @@ async fn login_github(
             }
             LoginMethod::Pkce => continue,
             LoginMethod::Token => {
+                let env_var = instance_token_env_var(instance);
                 let token = read_token_with_prompt(
-                    "CURATOR_GITHUB_TOKEN",
+                    &env_var,
                     "GitHub",
                     Some("https://github.com/settings/tokens"),
                     "GitHub token",
@@ -384,8 +404,9 @@ async fn login_gitlab(
             }
             LoginMethod::Pkce => continue,
             LoginMethod::Token => {
+                let env_var = instance_token_env_var(instance);
                 let token = read_token_with_prompt(
-                    "CURATOR_GITLAB_TOKEN",
+                    &env_var,
                     "GitLab",
                     Some(&format!(
                         "https://{}/-/user_settings/personal_access_tokens",
@@ -425,8 +446,11 @@ async fn login_gitlab(
         "No usable login method found for GitLab instance '{}' ({}).\n\
          Add an OAuth client id with:\n\
          curator instance update {} -c <client-id>\n\
-         or set CURATOR_GITLAB_TOKEN.",
-        instance.name, instance.host, instance.name,
+         or set {}.",
+        instance.name,
+        instance.host,
+        instance.name,
+        instance_token_env_var(instance),
     )
     .into())
 }
@@ -520,16 +544,15 @@ async fn login_gitea(
                 return Ok(());
             }
             LoginMethod::Token => {
-                let (env_var, provider, settings_url, prompt) = if instance.is_codeberg() {
+                let env_var = instance_token_env_var(instance);
+                let (provider, settings_url, prompt) = if instance.is_codeberg() {
                     (
-                        "CURATOR_CODEBERG_TOKEN",
                         "Codeberg",
                         Some("https://codeberg.org/user/settings/applications".to_string()),
                         "Codeberg token",
                     )
                 } else {
                     (
-                        "CURATOR_GITEA_TOKEN",
                         "Gitea/Forgejo",
                         Some(format!(
                             "https://{}/user/settings/applications",
@@ -540,7 +563,7 @@ async fn login_gitea(
                 };
 
                 let token = read_token_with_prompt(
-                    env_var,
+                    &env_var,
                     provider,
                     settings_url.as_deref(),
                     prompt,
@@ -1117,9 +1140,10 @@ mod tests {
         let db = setup_db("handle-login-github-token").await;
         let instance = sample_instance("github", "token", PlatformType::GitHub, "github.com");
         insert_instance(&db, &instance).await;
+        let env_var = instance_token_env_var(&instance);
 
         unsafe {
-            std::env::set_var("CURATOR_GITHUB_TOKEN", "gh_test_token");
+            std::env::set_var(&env_var, "gh_test_token");
         }
 
         let config = Config {
@@ -1140,7 +1164,7 @@ mod tests {
         assert_auth_value(&auth_path, "github", "access_token", "gh_test_token");
 
         unsafe {
-            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            std::env::remove_var(&env_var);
         }
     }
 
@@ -1153,9 +1177,10 @@ mod tests {
         let db = setup_db("handle-login-gitlab-token").await;
         let instance = sample_instance("gitlab", "token", PlatformType::GitLab, "gitlab.com");
         insert_instance(&db, &instance).await;
+        let env_var = instance_token_env_var(&instance);
 
         unsafe {
-            std::env::set_var("CURATOR_GITLAB_TOKEN", "gl_test_token");
+            std::env::set_var(&env_var, "gl_test_token");
         }
 
         let config = Config {
@@ -1176,7 +1201,7 @@ mod tests {
         assert_auth_value(&auth_path, "gitlab", "access_token", "gl_test_token");
 
         unsafe {
-            std::env::remove_var("CURATOR_GITLAB_TOKEN");
+            std::env::remove_var(&env_var);
         }
     }
 
@@ -1190,9 +1215,10 @@ mod tests {
         let instance =
             sample_instance("login-gitea", "token", PlatformType::Gitea, "gitea.example");
         insert_instance(&db, &instance).await;
+        let env_var = instance_token_env_var(&instance);
 
         unsafe {
-            std::env::set_var("CURATOR_GITEA_TOKEN", "gitea_test_token");
+            std::env::set_var(&env_var, "gitea_test_token");
         }
 
         let config = Config {
@@ -1218,7 +1244,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("CURATOR_GITEA_TOKEN");
+            std::env::remove_var(&env_var);
         }
     }
 
@@ -1231,9 +1257,10 @@ mod tests {
         let db = setup_db("handle-login-codeberg-token").await;
         let instance = sample_instance("codeberg", "token", PlatformType::Gitea, "codeberg.org");
         insert_instance(&db, &instance).await;
+        let env_var = instance_token_env_var(&instance);
 
         unsafe {
-            std::env::set_var("CURATOR_CODEBERG_TOKEN", "codeberg_test_token");
+            std::env::set_var(&env_var, "codeberg_test_token");
         }
 
         let config = Config {
@@ -1259,7 +1286,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("CURATOR_CODEBERG_TOKEN");
+            std::env::remove_var(&env_var);
         }
     }
 
@@ -1276,9 +1303,10 @@ mod tests {
             "gitlab.auto.test",
         );
         insert_instance(&db, &instance).await;
+        let env_var = instance_token_env_var(&instance);
 
         unsafe {
-            std::env::set_var("CURATOR_GITLAB_TOKEN", "gl_auto_token");
+            std::env::set_var(&env_var, "gl_auto_token");
         }
 
         let config = Config {
@@ -1299,7 +1327,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("CURATOR_GITLAB_TOKEN");
+            std::env::remove_var(&env_var);
         }
     }
 
@@ -1307,10 +1335,6 @@ mod tests {
     #[tokio::test]
     async fn login_github_returns_no_supported_method_for_non_github_device_only_instance() {
         let _guard = env_lock().lock().await;
-        let original = std::env::var("CURATOR_GITHUB_TOKEN").ok();
-        unsafe {
-            std::env::remove_var("CURATOR_GITHUB_TOKEN");
-        }
 
         let db = setup_db("github-no-supported-method").await;
         let instance = sample_instance(
@@ -1319,6 +1343,11 @@ mod tests {
             PlatformType::GitHub,
             "github.enterprise.test",
         );
+        let env_var = instance_token_env_var(&instance);
+        let original = std::env::var(&env_var).ok();
+        unsafe {
+            std::env::remove_var(&env_var);
+        }
 
         let err = login_github(&instance, &db, &Config::default(), false)
             .await
@@ -1326,10 +1355,10 @@ mod tests {
 
         match original {
             Some(token) => unsafe {
-                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+                std::env::set_var(&env_var, token);
             },
             None => unsafe {
-                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+                std::env::remove_var(&env_var);
             },
         }
 
@@ -1347,8 +1376,9 @@ mod tests {
             PlatformType::GitLab,
             "gitlab.missing.test",
         );
+        let env_var = instance_token_env_var(&instance);
         unsafe {
-            std::env::remove_var("CURATOR_GITLAB_TOKEN");
+            std::env::remove_var(&env_var);
         }
 
         let err = login_gitlab(&instance, &db, &Config::default(), false)
@@ -1368,8 +1398,9 @@ mod tests {
             PlatformType::Gitea,
             "forgejo.missing.test",
         );
+        let env_var = instance_token_env_var(&instance);
         unsafe {
-            std::env::remove_var("CURATOR_GITEA_TOKEN");
+            std::env::remove_var(&env_var);
         }
 
         let err = login_gitea(&instance, &db, &Config::default(), false)
@@ -1394,9 +1425,10 @@ mod tests {
             "github.enterprise.test",
         );
         insert_instance(&db, &instance).await;
+        let env_var = instance_token_env_var(&instance);
 
         unsafe {
-            std::env::set_var("CURATOR_GITHUB_TOKEN", "gh_enterprise_token");
+            std::env::set_var(&env_var, "gh_enterprise_token");
         }
 
         let config = Config {
@@ -1416,7 +1448,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("CURATOR_GITHUB_TOKEN");
+            std::env::remove_var(&env_var);
         }
     }
 
@@ -1433,9 +1465,10 @@ mod tests {
             "gitlab.token.test",
         );
         insert_instance(&db, &instance).await;
+        let env_var = instance_token_env_var(&instance);
 
         unsafe {
-            std::env::set_var("CURATOR_GITLAB_TOKEN", "gitlab_pat_token");
+            std::env::set_var(&env_var, "gitlab_pat_token");
         }
 
         let config = Config {
@@ -1455,7 +1488,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("CURATOR_GITLAB_TOKEN");
+            std::env::remove_var(&env_var);
         }
     }
 
@@ -1463,10 +1496,6 @@ mod tests {
     #[tokio::test]
     async fn login_github_token_only_without_token_errors() {
         let _guard = env_lock().lock().await;
-        let original = std::env::var("CURATOR_GITHUB_TOKEN").ok();
-        unsafe {
-            std::env::remove_var("CURATOR_GITHUB_TOKEN");
-        }
 
         let db = setup_db("github-token-missing").await;
         let instance = sample_instance(
@@ -1475,6 +1504,11 @@ mod tests {
             PlatformType::GitHub,
             "github.enterprise.test",
         );
+        let env_var = instance_token_env_var(&instance);
+        let original = std::env::var(&env_var).ok();
+        unsafe {
+            std::env::remove_var(&env_var);
+        }
 
         let err = login_github(&instance, &db, &Config::default(), false)
             .await
@@ -1482,10 +1516,10 @@ mod tests {
 
         match original {
             Some(token) => unsafe {
-                std::env::set_var("CURATOR_GITHUB_TOKEN", token);
+                std::env::set_var(&env_var, token);
             },
             None => unsafe {
-                std::env::remove_var("CURATOR_GITHUB_TOKEN");
+                std::env::remove_var(&env_var);
             },
         }
 
@@ -1496,10 +1530,6 @@ mod tests {
     #[tokio::test]
     async fn login_gitlab_token_only_without_token_errors() {
         let _guard = env_lock().lock().await;
-        let original = std::env::var("CURATOR_GITLAB_TOKEN").ok();
-        unsafe {
-            std::env::remove_var("CURATOR_GITLAB_TOKEN");
-        }
 
         let db = setup_db("gitlab-token-missing").await;
         let instance = sample_instance(
@@ -1508,6 +1538,11 @@ mod tests {
             PlatformType::GitLab,
             "gitlab.missing.test",
         );
+        let env_var = instance_token_env_var(&instance);
+        let original = std::env::var(&env_var).ok();
+        unsafe {
+            std::env::remove_var(&env_var);
+        }
 
         let err = login_gitlab(&instance, &db, &Config::default(), false)
             .await
@@ -1515,10 +1550,10 @@ mod tests {
 
         match original {
             Some(token) => unsafe {
-                std::env::set_var("CURATOR_GITLAB_TOKEN", token);
+                std::env::set_var(&env_var, token);
             },
             None => unsafe {
-                std::env::remove_var("CURATOR_GITLAB_TOKEN");
+                std::env::remove_var(&env_var);
             },
         }
 
@@ -1529,10 +1564,6 @@ mod tests {
     #[tokio::test]
     async fn login_gitea_token_only_without_token_errors() {
         let _guard = env_lock().lock().await;
-        let original = std::env::var("CURATOR_GITEA_TOKEN").ok();
-        unsafe {
-            std::env::remove_var("CURATOR_GITEA_TOKEN");
-        }
 
         let db = setup_db("gitea-token-missing").await;
         let instance = sample_instance(
@@ -1541,6 +1572,11 @@ mod tests {
             PlatformType::Gitea,
             "forgejo.missing.test",
         );
+        let env_var = instance_token_env_var(&instance);
+        let original = std::env::var(&env_var).ok();
+        unsafe {
+            std::env::remove_var(&env_var);
+        }
 
         let err = login_gitea(&instance, &db, &Config::default(), false)
             .await
@@ -1548,10 +1584,10 @@ mod tests {
 
         match original {
             Some(token) => unsafe {
-                std::env::set_var("CURATOR_GITEA_TOKEN", token);
+                std::env::set_var(&env_var, token);
             },
             None => unsafe {
-                std::env::remove_var("CURATOR_GITEA_TOKEN");
+                std::env::remove_var(&env_var);
             },
         }
 
@@ -1574,9 +1610,10 @@ mod tests {
             "forgejo.auto.test",
         );
         insert_instance(&db, &instance).await;
+        let env_var = instance_token_env_var(&instance);
 
         unsafe {
-            std::env::set_var("CURATOR_GITEA_TOKEN", "forgejo_pat_token");
+            std::env::set_var(&env_var, "forgejo_pat_token");
         }
 
         let config = Config {
@@ -1596,7 +1633,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("CURATOR_GITEA_TOKEN");
+            std::env::remove_var(&env_var);
         }
     }
 
