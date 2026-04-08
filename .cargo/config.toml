@@ -1,4 +1,8 @@
 [target.aarch64-apple-darwin]
+# Use the Apple toolchain linker on macOS. The Nix `cc` wrapper used in the
+# dev shell fails to link proc-macro dylibs, which breaks normal cargo commands
+# like `cargo run -- --help`.
+linker = "/usr/bin/cc"
 rustflags = [
   "-L",
   "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
