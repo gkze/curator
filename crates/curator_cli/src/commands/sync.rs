@@ -6,15 +6,16 @@
 use std::sync::Arc;
 
 use clap::Subcommand;
-use console::Term;
-#[cfg(feature = "github")]
-use console::style;
+use console::{Term, style};
 use sea_orm::{DatabaseConnection, EntityTrait, QueryOrder};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+#[cfg(test)]
+use curator::PlatformType;
 use curator::{
-    Instance, InstanceColumn, InstanceModel, PlatformType, db,
+    Instance, InstanceColumn, InstanceModel, db,
+    platform::create_client,
     sync::{PlatformOptions, SyncOptions, SyncStrategy},
 };
 
@@ -341,52 +342,10 @@ async fn sync_org(
 
     let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
 
-    match instance.platform_type {
-        #[cfg(feature = "github")]
-        PlatformType::GitHub => {
-            use curator::github::GitHubClient;
-
-            let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
-            display_rate_limit(&client, is_tty).await;
-            run_namespace_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
-        }
-        #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => {
-            use curator::gitlab::GitLabClient;
-
-            let client =
-                GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
-            run_namespace_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
-        }
-        #[cfg(feature = "gitea")]
-        PlatformType::Gitea => {
-            use curator::gitea::GiteaClient;
-
-            let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
-            run_namespace_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
-        }
-        #[cfg(not(feature = "github"))]
-        PlatformType::GitHub => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "sync",
-            ));
-        }
-        #[cfg(not(feature = "gitlab"))]
-        PlatformType::GitLab => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "sync",
-            ));
-        }
-        #[cfg(not(feature = "gitea"))]
-        PlatformType::Gitea => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "sync",
-            ));
-        }
-    }
+    let client: Arc<dyn curator::PlatformClient> =
+        Arc::from(create_client(&instance, &token, rate_limiter).await?);
+    display_rate_limit(&client, is_tty).await;
+    run_namespace_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
 
     Ok(())
 }
@@ -427,52 +386,10 @@ async fn sync_user(
 
     let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
 
-    match instance.platform_type {
-        #[cfg(feature = "github")]
-        PlatformType::GitHub => {
-            use curator::github::GitHubClient;
-
-            let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
-            display_rate_limit(&client, is_tty).await;
-            run_user_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
-        }
-        #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => {
-            use curator::gitlab::GitLabClient;
-
-            let client =
-                GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
-            run_user_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
-        }
-        #[cfg(feature = "gitea")]
-        PlatformType::Gitea => {
-            use curator::gitea::GiteaClient;
-
-            let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
-            run_user_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
-        }
-        #[cfg(not(feature = "github"))]
-        PlatformType::GitHub => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "sync",
-            ));
-        }
-        #[cfg(not(feature = "gitlab"))]
-        PlatformType::GitLab => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "sync",
-            ));
-        }
-        #[cfg(not(feature = "gitea"))]
-        PlatformType::Gitea => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "sync",
-            ));
-        }
-    }
+    let client: Arc<dyn curator::PlatformClient> =
+        Arc::from(create_client(&instance, &token, rate_limiter).await?);
+    display_rate_limit(&client, is_tty).await;
+    run_user_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
 
     Ok(())
 }
@@ -658,79 +575,21 @@ async fn sync_stars_for_instance_with_token(
     let is_tty = Term::stdout().is_term();
     let rate_limiter = build_rate_limiter(instance.platform_type, settings.no_rate_limit);
 
-    match instance.platform_type {
-        #[cfg(feature = "github")]
-        PlatformType::GitHub => {
-            use curator::github::GitHubClient;
-
-            let client = GitHubClient::new(token, instance.id, rate_limiter)?;
-            display_rate_limit(&client, is_tty).await;
-            run_starred_sync_for_client(
-                &runner,
-                &client,
-                settings.prune,
-                is_tty,
-                settings.no_rate_limit,
-            )
-            .await?;
-        }
-        #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => {
-            use curator::gitlab::GitLabClient;
-
-            let client =
-                GitLabClient::new(&instance.host, token, instance.id, rate_limiter).await?;
-            run_starred_sync_for_client(
-                &runner,
-                &client,
-                settings.prune,
-                is_tty,
-                settings.no_rate_limit,
-            )
-            .await?;
-        }
-        #[cfg(feature = "gitea")]
-        PlatformType::Gitea => {
-            use curator::gitea::GiteaClient;
-
-            let client = GiteaClient::new(&instance.base_url(), token, instance.id, rate_limiter)?;
-            run_starred_sync_for_client(
-                &runner,
-                &client,
-                settings.prune,
-                is_tty,
-                settings.no_rate_limit,
-            )
-            .await?;
-        }
-        #[cfg(not(feature = "github"))]
-        PlatformType::GitHub => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "sync",
-            ));
-        }
-        #[cfg(not(feature = "gitlab"))]
-        PlatformType::GitLab => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "sync",
-            ));
-        }
-        #[cfg(not(feature = "gitea"))]
-        PlatformType::Gitea => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "sync",
-            ));
-        }
-    }
+    let client: Arc<dyn curator::PlatformClient> =
+        Arc::from(create_client(instance, token, rate_limiter).await?);
+    display_rate_limit(&client, is_tty).await;
+    run_starred_sync_for_client(
+        &runner,
+        &client,
+        settings.prune,
+        is_tty,
+        settings.no_rate_limit,
+    )
+    .await?;
 
     Ok(())
 }
 
-/// Display initial rate limit status (GitHub only currently).
-#[cfg(feature = "github")]
 async fn display_rate_limit<C: curator::PlatformClient>(client: &C, is_tty: bool) {
     match client.get_rate_limit().await {
         Ok(rate_limit) => {

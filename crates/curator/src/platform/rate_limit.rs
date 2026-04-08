@@ -12,27 +12,18 @@ use super::types::RateLimitInfo;
 pub mod rate_limits {
     use crate::entity::platform_type::PlatformType;
 
-    /// GitHub: 5000 requests/hour = ~1.4/sec, we use 10/sec to allow bursts.
-    pub const GITHUB_DEFAULT_RPS: u32 = 10;
-    /// GitLab: 2000 requests/minute = ~33/sec, we use 5/sec for safety.
-    pub const GITLAB_DEFAULT_RPS: u32 = 5;
-    /// Gitea/Codeberg: varies by instance, conservative default.
-    pub const GITEA_DEFAULT_RPS: u32 = 5;
+    pub use super::super::catalog::{GITEA_DEFAULT_RPS, GITHUB_DEFAULT_RPS, GITLAB_DEFAULT_RPS};
 
     /// Get the default rate limit for a platform type.
     pub fn default_rps_for_platform(platform_type: PlatformType) -> u32 {
-        match platform_type {
-            PlatformType::GitHub => GITHUB_DEFAULT_RPS,
-            PlatformType::GitLab => GITLAB_DEFAULT_RPS,
-            PlatformType::Gitea => GITEA_DEFAULT_RPS,
-        }
+        super::super::platform_catalog(platform_type).default_rps()
     }
 }
 
 /// Get the default rate limit for a platform type.
 #[allow(dead_code)]
 pub fn default_rps_for_platform(platform_type: PlatformType) -> u32 {
-    rate_limits::default_rps_for_platform(platform_type)
+    super::platform_catalog(platform_type).default_rps()
 }
 
 /// Minimum requests per second floor to avoid stalling.

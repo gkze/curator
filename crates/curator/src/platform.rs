@@ -18,6 +18,7 @@
 //! ```
 
 mod cache_fallback;
+mod catalog;
 mod conditional;
 mod convert;
 mod errors;
@@ -29,6 +30,8 @@ pub use cache_fallback::{
     handle_cache_hit_fallback, handle_streaming_cache_hit_fallback, load_repos_by_instance,
     load_repos_by_instance_and_owner,
 };
+pub use catalog::WellKnownInstance;
+pub(crate) use catalog::{ALL_WELL_KNOWN_INSTANCES, platform_catalog};
 pub use conditional::{CacheStats, FetchResult, PaginationInfo};
 pub use convert::strip_null_values;
 pub use errors::{PlatformError, Result, short_error_message};

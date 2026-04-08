@@ -11,6 +11,7 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::entity::platform_type::PlatformType;
+use crate::platform::platform_catalog;
 
 /// Instance model - tracks specific deployments of platform types.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
@@ -88,22 +89,7 @@ impl Model {
 
     /// Compute the API URL for this instance.
     pub fn api_url(&self) -> String {
-        match self.platform_type {
-            PlatformType::GitHub => {
-                if self.host == "github.com" {
-                    "https://api.github.com".to_string()
-                } else {
-                    // GitHub Enterprise uses /api/v3
-                    format!("https://{}/api/v3", self.host)
-                }
-            }
-            PlatformType::GitLab => {
-                format!("https://{}/api/v4", self.host)
-            }
-            PlatformType::Gitea => {
-                format!("https://{}/api/v1", self.host)
-            }
-        }
+        platform_catalog(self.platform_type).api_url(&self.host)
     }
 
     /// Compute the web URL for a repository on this instance.
@@ -123,41 +109,32 @@ impl Model {
 
     /// Check if this is the canonical GitHub instance.
     pub fn is_github_com(&self) -> bool {
-        self.platform_type == PlatformType::GitHub && self.host == "github.com"
+        well_known::is_well_known(PlatformType::GitHub, &self.host)
     }
 
     /// Check if this is the canonical GitLab instance.
     pub fn is_gitlab_com(&self) -> bool {
-        self.platform_type == PlatformType::GitLab && self.host == "gitlab.com"
+        well_known::by_name("gitlab").is_some_and(|instance| {
+            self.platform_type == instance.platform_type && self.host == instance.host
+        })
     }
 
     /// Check if this is the Codeberg instance.
     pub fn is_codeberg(&self) -> bool {
-        self.platform_type == PlatformType::Gitea && self.host == "codeberg.org"
+        well_known::is_well_known(PlatformType::Gitea, &self.host)
     }
 }
 
-/// Well-known instance definitions - the single source of truth.
-///
-/// This module centralizes all well-known instance configurations to avoid
-/// duplication across the codebase.
+/// Well-known instance definitions backed by the shared platform catalog.
 pub mod well_known {
-    use super::*;
+    use super::{Model, PlatformType};
     use chrono::Utc;
     use uuid::Uuid;
 
-    /// Definition of a well-known instance (compile-time data).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct WellKnownInstance {
-        /// Canonical name (e.g., "github", "gitlab", "codeberg")
-        pub name: &'static str,
-        /// Platform type
-        pub platform_type: PlatformType,
-        /// Host URL without protocol
-        pub host: &'static str,
-        /// OAuth Client ID registered on this instance (if any)
-        pub oauth_client_id: Option<&'static str>,
-    }
+    use crate::platform::ALL_WELL_KNOWN_INSTANCES;
+    pub use crate::platform::WellKnownInstance;
+
+    pub const INSTANCES: &[WellKnownInstance] = ALL_WELL_KNOWN_INSTANCES;
 
     impl WellKnownInstance {
         /// Convert to a Model instance (with nil UUID, to be replaced on insert).
@@ -173,68 +150,6 @@ pub mod well_known {
             }
         }
     }
-
-    /// All well-known instances - the canonical source of truth.
-    pub const INSTANCES: &[WellKnownInstance] = &[
-        WellKnownInstance {
-            name: "github",
-            platform_type: PlatformType::GitHub,
-            host: "github.com",
-            oauth_client_id: Some("Ov23liN0721EfoUpRrLl"),
-        },
-        WellKnownInstance {
-            name: "gitlab",
-            platform_type: PlatformType::GitLab,
-            host: "gitlab.com",
-            oauth_client_id: Some(
-                "eba8ea9cbb5e8ddd455a3b3db35871963d8aa6b0a344a4b8c8e34ae8d71f336f",
-            ),
-        },
-        WellKnownInstance {
-            name: "gnome-gitlab",
-            platform_type: PlatformType::GitLab,
-            host: "gitlab.gnome.org",
-            oauth_client_id: None,
-        },
-        WellKnownInstance {
-            name: "freedesktop-gitlab",
-            platform_type: PlatformType::GitLab,
-            host: "gitlab.freedesktop.org",
-            oauth_client_id: None,
-        },
-        WellKnownInstance {
-            name: "kde-gitlab",
-            platform_type: PlatformType::GitLab,
-            host: "invent.kde.org",
-            oauth_client_id: None,
-        },
-        WellKnownInstance {
-            name: "kitware-gitlab",
-            platform_type: PlatformType::GitLab,
-            host: "gitlab.kitware.com",
-            oauth_client_id: Some(
-                "2860b6473e16b639ccb37ce9ffdc6643cd5d09f6e55168621a72f6d687f3c637",
-            ),
-        },
-        WellKnownInstance {
-            name: "haskell-gitlab",
-            platform_type: PlatformType::GitLab,
-            host: "gitlab.haskell.org",
-            oauth_client_id: None,
-        },
-        WellKnownInstance {
-            name: "archlinux-gitlab",
-            platform_type: PlatformType::GitLab,
-            host: "gitlab.archlinux.org",
-            oauth_client_id: None,
-        },
-        WellKnownInstance {
-            name: "codeberg",
-            platform_type: PlatformType::Gitea,
-            host: "codeberg.org",
-            oauth_client_id: Some("dfe120ce-2440-4f13-8bb0-9ba5620542a7"),
-        },
-    ];
 
     /// Look up a well-known instance by name (case-insensitive).
     pub fn by_name(name: &str) -> Option<&'static WellKnownInstance> {
@@ -352,6 +267,15 @@ mod tests {
 
         let codeberg = well_known::codeberg();
         assert!(codeberg.is_codeberg());
+    }
+
+    #[test]
+    fn test_is_gitlab_com_only_matches_gitlab_dot_com() {
+        let gitlab = make_instance(PlatformType::GitLab, "gitlab.com");
+        assert!(gitlab.is_gitlab_com());
+
+        let gnome_gitlab = make_instance(PlatformType::GitLab, "gitlab.gnome.org");
+        assert!(!gnome_gitlab.is_gitlab_com());
     }
 
     #[test]

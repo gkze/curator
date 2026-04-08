@@ -7,10 +7,13 @@ use console::Term;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use url::Url;
 
+#[cfg(test)]
+use curator::PlatformType;
 use curator::discovery::DiscoveryResult;
 use curator::discovery::{CrawlOptions, DiscoveryProgress, RepoLink, discover_repo_links};
 use curator::{
-    Instance, InstanceModel, PlatformType, db,
+    Instance, InstanceModel, db,
+    platform::create_client,
     sync::{PlatformOptions, SyncOptions},
 };
 
@@ -283,72 +286,17 @@ async fn sync_instance_repos(
 
     let rate_limiter = build_rate_limiter(instance.platform_type, resolved.no_rate_limit);
 
-    match instance.platform_type {
-        #[cfg(feature = "github")]
-        PlatformType::GitHub => {
-            use curator::github::GitHubClient;
-            let client = GitHubClient::new(&token, instance.id, rate_limiter)?;
-            run_discovery_sync_for_client(
-                &runner,
-                &client,
-                instance,
-                repos,
-                is_tty,
-                resolved.no_rate_limit,
-            )
-            .await?;
-        }
-        #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => {
-            use curator::gitlab::GitLabClient;
-            let client =
-                GitLabClient::new(&instance.host, &token, instance.id, rate_limiter).await?;
-            run_discovery_sync_for_client(
-                &runner,
-                &client,
-                instance,
-                repos,
-                is_tty,
-                resolved.no_rate_limit,
-            )
-            .await?;
-        }
-        #[cfg(feature = "gitea")]
-        PlatformType::Gitea => {
-            use curator::gitea::GiteaClient;
-            let client = GiteaClient::new(&instance.base_url(), &token, instance.id, rate_limiter)?;
-            run_discovery_sync_for_client(
-                &runner,
-                &client,
-                instance,
-                repos,
-                is_tty,
-                resolved.no_rate_limit,
-            )
-            .await?;
-        }
-        #[cfg(not(feature = "github"))]
-        PlatformType::GitHub => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "discovery sync",
-            ));
-        }
-        #[cfg(not(feature = "gitlab"))]
-        PlatformType::GitLab => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "discovery sync",
-            ));
-        }
-        #[cfg(not(feature = "gitea"))]
-        PlatformType::Gitea => {
-            return Err(crate::commands::shared::unsupported_platform_error(
-                instance.platform_type,
-                "discovery sync",
-            ));
-        }
-    }
+    let client: Arc<dyn curator::PlatformClient> =
+        Arc::from(create_client(instance, &token, rate_limiter).await?);
+    run_discovery_sync_for_client(
+        &runner,
+        &client,
+        instance,
+        repos,
+        is_tty,
+        resolved.no_rate_limit,
+    )
+    .await?;
 
     Ok(())
 }

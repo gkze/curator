@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sea_orm::DatabaseConnection;
@@ -279,6 +281,131 @@ pub trait PlatformClient: Send + Sync {
         skip_rate_checks: bool,
         on_progress: Option<&ProgressCallback>,
     ) -> Result<usize>;
+}
+
+#[async_trait]
+impl<T> PlatformClient for Arc<T>
+where
+    T: PlatformClient + ?Sized,
+{
+    fn platform_type(&self) -> PlatformType {
+        (**self).platform_type()
+    }
+
+    fn instance_id(&self) -> Uuid {
+        (**self).instance_id()
+    }
+
+    async fn get_rate_limit(&self) -> Result<RateLimitInfo> {
+        (**self).get_rate_limit().await
+    }
+
+    async fn get_org_info(&self, org: &str) -> Result<OrgInfo> {
+        (**self).get_org_info(org).await
+    }
+
+    async fn get_authenticated_user(&self) -> Result<UserInfo> {
+        (**self).get_authenticated_user().await
+    }
+
+    async fn get_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        db: Option<&DatabaseConnection>,
+    ) -> Result<PlatformRepo> {
+        (**self).get_repo(owner, name, db).await
+    }
+
+    async fn list_org_repos(
+        &self,
+        org: &str,
+        db: Option<&DatabaseConnection>,
+        on_progress: Option<&ProgressCallback>,
+    ) -> Result<Vec<PlatformRepo>> {
+        (**self).list_org_repos(org, db, on_progress).await
+    }
+
+    async fn list_org_repos_with_concurrency(
+        &self,
+        org: &str,
+        db: Option<&DatabaseConnection>,
+        concurrency: usize,
+        on_progress: Option<&ProgressCallback>,
+    ) -> Result<Vec<PlatformRepo>> {
+        (**self)
+            .list_org_repos_with_concurrency(org, db, concurrency, on_progress)
+            .await
+    }
+
+    async fn list_user_repos(
+        &self,
+        username: &str,
+        db: Option<&DatabaseConnection>,
+        on_progress: Option<&ProgressCallback>,
+    ) -> Result<Vec<PlatformRepo>> {
+        (**self).list_user_repos(username, db, on_progress).await
+    }
+
+    async fn list_user_repos_with_concurrency(
+        &self,
+        username: &str,
+        db: Option<&DatabaseConnection>,
+        concurrency: usize,
+        on_progress: Option<&ProgressCallback>,
+    ) -> Result<Vec<PlatformRepo>> {
+        (**self)
+            .list_user_repos_with_concurrency(username, db, concurrency, on_progress)
+            .await
+    }
+
+    async fn is_repo_starred(&self, owner: &str, name: &str) -> Result<bool> {
+        (**self).is_repo_starred(owner, name).await
+    }
+
+    async fn star_repo(&self, owner: &str, name: &str) -> Result<bool> {
+        (**self).star_repo(owner, name).await
+    }
+
+    async fn star_repo_with_retry(
+        &self,
+        owner: &str,
+        name: &str,
+        on_progress: Option<&ProgressCallback>,
+    ) -> Result<bool> {
+        (**self)
+            .star_repo_with_retry(owner, name, on_progress)
+            .await
+    }
+
+    async fn unstar_repo(&self, owner: &str, name: &str) -> Result<bool> {
+        (**self).unstar_repo(owner, name).await
+    }
+
+    async fn list_starred_repos(
+        &self,
+        db: Option<&DatabaseConnection>,
+        concurrency: usize,
+        skip_rate_checks: bool,
+        on_progress: Option<&ProgressCallback>,
+    ) -> Result<Vec<PlatformRepo>> {
+        (**self)
+            .list_starred_repos(db, concurrency, skip_rate_checks, on_progress)
+            .await
+    }
+
+    async fn list_starred_repos_streaming(
+        &self,
+        repo_tx: mpsc::Sender<PlatformRepo>,
+        db: Option<&DatabaseConnection>,
+        concurrency: usize,
+        skip_rate_checks: bool,
+        on_progress: Option<&ProgressCallback>,
+    ) -> Result<usize> {
+        (**self)
+            .list_starred_repos_streaming(repo_tx, db, concurrency, skip_rate_checks, on_progress)
+            .await
+    }
 }
 
 #[cfg(test)]

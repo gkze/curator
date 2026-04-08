@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::entity::instance::{self, ActiveModel, Entity, Model, well_known};
 use crate::entity::platform_type::PlatformType;
+use crate::platform::platform_catalog;
 
 /// Error type for instance operations.
 #[derive(Debug, thiserror::Error)]
@@ -123,24 +124,7 @@ pub async fn get_or_create_well_known(
 
 /// Generate an instance name from the platform type and host.
 fn generate_instance_name(platform_type: PlatformType, host: &str) -> String {
-    // Check if this is a well-known instance - use canonical name
-    if let Some(wk) = well_known::by_platform_and_host(platform_type, host) {
-        return wk.name.to_string();
-    }
-
-    // Remove common TLDs and simplify for custom instances
-    let simplified = host
-        .trim_end_matches(".com")
-        .trim_end_matches(".org")
-        .trim_end_matches(".io")
-        .replace('.', "-");
-
-    // Add platform prefix for non-canonical hosts
-    match platform_type {
-        PlatformType::GitHub => format!("github-{}", simplified),
-        PlatformType::GitLab => format!("gitlab-{}", simplified),
-        PlatformType::Gitea => simplified,
-    }
+    platform_catalog(platform_type).instance_name(host)
 }
 
 /// List all instances.
