@@ -15,7 +15,10 @@
 //! - Output formatting (TTY vs non-TTY)
 //! - Shutdown handling
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use console::Term;
 use curator::PlatformType;
@@ -37,8 +40,6 @@ use crate::config::Config;
 use crate::credentials::{self, LocatedCredential, StoredCredential};
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::progress::ProgressReporter;
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-use crate::shutdown::{SHUTDOWN_FLAG, is_shutdown_requested};
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use crate::{CommonSyncOptions, StarredSyncOptions};
 
@@ -93,6 +94,12 @@ pub(crate) struct ResolvedCommonSyncOptions {
 
 /// Resolve common sync options with precedence CLI flags > config defaults.
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+fn normalize_concurrency(concurrency: usize) -> usize {
+    concurrency.max(1)
+}
+
+/// Resolve common sync options with precedence CLI flags > config defaults.
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 pub(crate) fn resolve_common_sync_options(
     sync_opts: &CommonSyncOptions,
     config: &Config,
@@ -107,7 +114,9 @@ pub(crate) fn resolve_common_sync_options(
         active_within_days: sync_opts
             .active_within_days
             .unwrap_or(config.sync.active_within_days),
-        concurrency: sync_opts.concurrency.unwrap_or(config.sync.concurrency),
+        concurrency: normalize_concurrency(
+            sync_opts.concurrency.unwrap_or(config.sync.concurrency),
+        ),
         star: if sync_opts.no_star {
             false
         } else {
@@ -138,7 +147,9 @@ pub(crate) fn resolve_starred_sync_options(
         active_within_days: sync_opts
             .active_within_days
             .unwrap_or(config.sync.active_within_days),
-        concurrency: sync_opts.concurrency.unwrap_or(config.sync.concurrency),
+        concurrency: normalize_concurrency(
+            sync_opts.concurrency.unwrap_or(config.sync.concurrency),
+        ),
         prune: !sync_opts.no_prune,
         no_rate_limit: sync_opts.no_rate_limit || config.sync.no_rate_limit,
     }
@@ -337,6 +348,8 @@ pub struct SyncRunner {
     active_within_days: u64,
     /// Whether rate limiting is disabled (used for display and skip_rate_checks).
     no_rate_limit: bool,
+    /// Optional shutdown flag injected by the CLI.
+    shutdown_flag: Option<Arc<AtomicBool>>,
 }
 
 impl SyncRunner {
@@ -374,7 +387,14 @@ impl SyncRunner {
             is_tty,
             active_within_days,
             no_rate_limit,
+            shutdown_flag: None,
         }
+    }
+
+    /// Inject a shutdown flag shared with the CLI signal handler.
+    pub fn with_shutdown_flag(mut self, shutdown_flag: Arc<AtomicBool>) -> Self {
+        self.shutdown_flag = Some(shutdown_flag);
+        self
     }
 
     /// Get whether we're running in a TTY.
@@ -389,17 +409,29 @@ impl SyncRunner {
         self.no_rate_limit
     }
 
-    fn sync_context<C: PlatformClient + Clone + 'static>(&self, client: C) -> SyncContext<C> {
-        let shutdown_flag: Arc<AtomicBool> = Arc::clone(&SHUTDOWN_FLAG);
-
-        SyncContext::builder()
+    fn sync_context<C: PlatformClient + Clone + 'static>(
+        &self,
+        client: C,
+    ) -> Result<SyncContext<C>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut builder = SyncContext::builder()
             .client(client)
             .options(self.options.clone())
             .database(Arc::clone(&self.db))
-            .progress(Arc::clone(&self.progress))
-            .shutdown_flag(shutdown_flag)
+            .progress(Arc::clone(&self.progress));
+
+        if let Some(shutdown_flag) = &self.shutdown_flag {
+            builder = builder.shutdown_flag(Arc::clone(shutdown_flag));
+        }
+
+        builder
             .build()
-            .expect("SyncRunner always provides required SyncContext fields")
+            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    fn was_interrupted(&self) -> bool {
+        self.shutdown_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     /// Run a single namespace sync (org/group).
@@ -407,9 +439,9 @@ impl SyncRunner {
         &self,
         client: &C,
         namespace: &str,
-    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
+    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error + Send + Sync>> {
         let result = self
-            .sync_context(client.clone())
+            .sync_context(client.clone())?
             .sync_namespace_streaming(namespace)
             .await?;
 
@@ -427,10 +459,18 @@ impl SyncRunner {
         client: &C,
         namespaces: &[String],
     ) -> AggregatedSyncResult {
-        let (results, persist_result) = self
-            .sync_context(client.clone())
-            .sync_namespaces_streaming(namespaces)
-            .await;
+        let sync_context = match self.sync_context(client.clone()) {
+            Ok(sync_context) => sync_context,
+            Err(err) => {
+                self.reporter.finish();
+                return AggregatedSyncResult {
+                    all_errors: vec![format!("Failed to initialize sync context: {err}")],
+                    ..Default::default()
+                };
+            }
+        };
+
+        let (results, persist_result) = sync_context.sync_namespaces_streaming(namespaces).await;
 
         self.reporter.finish();
 
@@ -442,9 +482,9 @@ impl SyncRunner {
         &self,
         client: &C,
         user: &str,
-    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
+    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error + Send + Sync>> {
         let result = self
-            .sync_context(client.clone())
+            .sync_context(client.clone())?
             .sync_user_streaming(user)
             .await?;
 
@@ -463,9 +503,9 @@ impl SyncRunner {
         client: &C,
         label: &str,
         repos: &[(String, String)],
-    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
+    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error + Send + Sync>> {
         let result = self
-            .sync_context(client.clone())
+            .sync_context(client.clone())?
             .sync_repo_list_streaming(label, repos)
             .await?;
 
@@ -483,10 +523,18 @@ impl SyncRunner {
         client: &C,
         users: &[String],
     ) -> AggregatedSyncResult {
-        let (results, persist_result) = self
-            .sync_context(client.clone())
-            .sync_users_streaming(users)
-            .await;
+        let sync_context = match self.sync_context(client.clone()) {
+            Ok(sync_context) => sync_context,
+            Err(err) => {
+                self.reporter.finish();
+                return AggregatedSyncResult {
+                    all_errors: vec![format!("Failed to initialize sync context: {err}")],
+                    ..Default::default()
+                };
+            }
+        };
+
+        let (results, persist_result) = sync_context.sync_users_streaming(users).await;
 
         self.reporter.finish();
 
@@ -497,9 +545,9 @@ impl SyncRunner {
     pub async fn run_starred<C: PlatformClient + Clone + 'static>(
         &self,
         client: &C,
-    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error>> {
+    ) -> Result<AggregatedSyncResult, Box<dyn std::error::Error + Send + Sync>> {
         let result = self
-            .sync_context(client.clone())
+            .sync_context(client.clone())?
             .sync_starred_streaming(self.no_rate_limit)
             .await?;
 
@@ -536,7 +584,7 @@ impl SyncRunner {
 
     /// Print results for a single namespace/user sync.
     pub fn print_single_result(&self, name: &str, result: &AggregatedSyncResult, kind: SyncKind) {
-        let was_interrupted = is_shutdown_requested();
+        let was_interrupted = self.was_interrupted();
         let saved = result.persist_result.saved_count;
         let incremental = self.options.strategy == curator::sync::SyncStrategy::Incremental;
 
@@ -608,7 +656,7 @@ impl SyncRunner {
 
     /// Print aggregated results for multiple namespace/user syncs.
     pub fn print_multi_result(&self, count: usize, result: &AggregatedSyncResult, kind: SyncKind) {
-        let was_interrupted = is_shutdown_requested();
+        let was_interrupted = self.was_interrupted();
         let total_saved = result.persist_result.saved_count;
         let incremental = self.options.strategy == curator::sync::SyncStrategy::Incremental;
 
@@ -692,7 +740,7 @@ impl SyncRunner {
 
     /// Print results for a starred sync.
     pub fn print_starred_result(&self, result: &AggregatedSyncResult, prune: bool) {
-        let was_interrupted = is_shutdown_requested();
+        let was_interrupted = self.was_interrupted();
         let saved = result.persist_result.saved_count;
 
         if self.is_tty {
@@ -789,7 +837,7 @@ pub async fn get_token_for_instance_with_db(
         return Ok(token);
     }
 
-    if let Some(located) = credentials::load_credential(instance, config, db).await? {
+    if let Some(located) = load_token_credential(instance, config, db).await? {
         return resolve_located_credential(instance, db, located).await;
     }
 
@@ -814,7 +862,7 @@ pub async fn peek_token_for_instance_with_db(
         return Ok(token);
     }
 
-    if let Some(located) = credentials::load_credential(instance, config, db).await? {
+    if let Some(located) = load_token_credential(instance, config, db).await? {
         return Ok(located.credential.access_token);
     }
 
@@ -827,12 +875,16 @@ pub async fn peek_token_for_instance_with_db(
     })
 }
 
+pub(crate) fn instance_token_env_var_name(name: &str) -> String {
+    format!(
+        "CURATOR_INSTANCE_{}_TOKEN",
+        normalize_instance_env_name(name)
+    )
+}
+
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 fn read_instance_env_token(instance: &InstanceModel) -> Option<String> {
-    let key = format!(
-        "CURATOR_INSTANCE_{}_TOKEN",
-        normalize_instance_env_name(&instance.name)
-    );
+    let key = instance_token_env_var_name(&instance.name);
     std::env::var(key).ok().and_then(|value| {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -850,6 +902,26 @@ fn normalize_instance_env_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+async fn load_token_credential(
+    instance: &InstanceModel,
+    config: &Config,
+    db: Option<&DatabaseConnection>,
+) -> Result<Option<LocatedCredential>, Box<dyn std::error::Error>> {
+    match credentials::load_credential(instance, config, db).await {
+        Ok(located) => Ok(located),
+        Err(err) => {
+            tracing::warn!(
+                instance = %instance.name,
+                host = %instance.host,
+                error = %err,
+                "credential lookup failed; continuing with environment and netrc fallbacks"
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
@@ -930,10 +1002,10 @@ async fn maybe_refresh_credential(
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 fn missing_instance_credential_error(instance: &InstanceModel) -> Box<dyn std::error::Error> {
     format!(
-        "No credential configured for '{}'. Run 'curator login {}' or set CURATOR_INSTANCE_{}_TOKEN.",
+        "No credential configured for '{}'. Run 'curator auth login {}' or set {}.",
         instance.name,
         instance.name,
-        normalize_instance_env_name(&instance.name)
+        instance_token_env_var_name(&instance.name)
     )
     .into()
 }

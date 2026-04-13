@@ -562,6 +562,8 @@ impl GiteaClient {
         &self,
         concurrency: usize,
     ) -> Result<Vec<GiteaRepo>, GiteaError> {
+        let concurrency = concurrency.max(1);
+
         // Fetch first page to check if there are more
         let first_page: Vec<GiteaRepo> = self
             .get(&format!("/user/starred?page=1&limit={}", PAGE_SIZE))
@@ -862,6 +864,7 @@ impl PlatformClient for GiteaClient {
         use crate::entity::api_cache::{EndpointType, Model as ApiCacheModel};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let concurrency = concurrency.max(1);
         emit(
             on_progress,
             SyncProgress::FetchingRepos {

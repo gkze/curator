@@ -15,6 +15,7 @@ pub(crate) static SHUTDOWN_FLAG: std::sync::LazyLock<Arc<AtomicBool>> =
 
 /// Check if shutdown has been requested.
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn is_shutdown_requested() -> bool {
     SHUTDOWN_FLAG.load(Ordering::Acquire)

@@ -3,8 +3,10 @@ use console::style;
 use sea_orm::{DatabaseConnection, EntityTrait, QueryOrder};
 use tabled::{Table, Tabled, settings::Style};
 
-use curator::platform::{PlatformClient, short_error_message};
-use curator::{Instance, InstanceColumn, InstanceModel, PlatformType};
+#[cfg(test)]
+use curator::PlatformType;
+use curator::platform::{create_client, short_error_message};
+use curator::{Instance, InstanceColumn, InstanceModel};
 
 use crate::commands::shared::{find_instance_by_name, peek_token_for_instance_with_db};
 use crate::config::Config;
@@ -16,6 +18,15 @@ use super::OutputFormat;
 
 #[derive(Subcommand)]
 pub enum AuthAction {
+    /// Authenticate with a platform instance
+    ///
+    /// Logs in to the specified instance using the appropriate OAuth flow.
+    /// For well-known instances (github, gitlab, codeberg), the instance
+    /// is auto-created if it doesn't exist.
+    Login {
+        /// Instance name (e.g., "github", "gitlab", "codeberg", or a custom name)
+        instance: String,
+    },
     /// Show auth status for one or all instances
     Status {
         /// Optional instance name
@@ -64,6 +75,7 @@ pub async fn handle_auth(
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
+        AuthAction::Login { instance } => super::login::handle_login(&instance, db, config).await,
         AuthAction::Status { instance, output } => {
             handle_status(instance.as_deref(), output, db, config).await
         }
@@ -93,6 +105,8 @@ async fn handle_status(
         rows.push(auth_status_row(instance, status, live_validity));
     }
 
+    sort_auth_status_rows(&mut rows);
+
     render_rows(output, rows)?;
     Ok(())
 }
@@ -114,46 +128,12 @@ async fn live_auth_validity(
         }
     };
 
-    let result = match instance.platform_type {
-        #[cfg(feature = "github")]
-        PlatformType::GitHub => {
-            let client = match curator::github::GitHubClient::new(&token, instance.id, None) {
-                Ok(client) => client,
-                Err(_) => return LiveAuthValidity::Error,
-            };
-            client.get_authenticated_user().await
-        }
-        #[cfg(feature = "gitlab")]
-        PlatformType::GitLab => {
-            let client =
-                match curator::gitlab::GitLabClient::new(&instance.host, &token, instance.id, None)
-                    .await
-                {
-                    Ok(client) => client,
-                    Err(_) => return LiveAuthValidity::Error,
-                };
-            client.get_authenticated_user().await
-        }
-        #[cfg(feature = "gitea")]
-        PlatformType::Gitea => {
-            let client = match curator::gitea::GiteaClient::new(
-                &instance.base_url(),
-                &token,
-                instance.id,
-                None,
-            ) {
-                Ok(client) => client,
-                Err(_) => return LiveAuthValidity::Error,
-            };
-            client.get_authenticated_user().await
-        }
-        #[cfg(not(feature = "github"))]
-        PlatformType::GitHub => return LiveAuthValidity::Error,
-        #[cfg(not(feature = "gitlab"))]
-        PlatformType::GitLab => return LiveAuthValidity::Error,
-        #[cfg(not(feature = "gitea"))]
-        PlatformType::Gitea => return LiveAuthValidity::Error,
+    let client = match create_client(instance, &token, None).await {
+        Ok(client) => client,
+        Err(_) => return LiveAuthValidity::Error,
     };
+
+    let result = client.get_authenticated_user().await;
 
     match result {
         Ok(_) => LiveAuthValidity::Valid,
@@ -231,6 +211,10 @@ fn auth_status_row(
     }
 }
 
+fn sort_auth_status_rows(rows: &mut [AuthStatusRow]) {
+    rows.sort_by_key(|row| row.instance.to_ascii_lowercase());
+}
+
 fn live_auth_validity_label(validity: LiveAuthValidity) -> String {
     match validity {
         LiveAuthValidity::Valid => "yes".to_string(),
@@ -259,6 +243,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::credentials::{StoredCredential, load_credential, save_credential};
+    use crate::test_support::env_lock;
 
     fn sample_instance(name: &str, platform: PlatformType, host: &str) -> InstanceModel {
         InstanceModel {
@@ -446,6 +431,48 @@ mod tests {
     }
 
     #[test]
+    fn sort_auth_status_rows_orders_by_instance_name() {
+        let mut rows = vec![
+            AuthStatusRow {
+                instance: "zebra".to_string(),
+                platform: "github".to_string(),
+                configured_store: "file".to_string(),
+                active_credential: "missing".to_string(),
+                auth_kind: "-".to_string(),
+                expires: "-".to_string(),
+                live_valid: "missing".to_string(),
+            },
+            AuthStatusRow {
+                instance: "Alpha".to_string(),
+                platform: "gitlab".to_string(),
+                configured_store: "file".to_string(),
+                active_credential: "missing".to_string(),
+                auth_kind: "-".to_string(),
+                expires: "-".to_string(),
+                live_valid: "missing".to_string(),
+            },
+            AuthStatusRow {
+                instance: "beta".to_string(),
+                platform: "gitea".to_string(),
+                configured_store: "file".to_string(),
+                active_credential: "missing".to_string(),
+                auth_kind: "-".to_string(),
+                expires: "-".to_string(),
+                live_valid: "missing".to_string(),
+            },
+        ];
+
+        sort_auth_status_rows(&mut rows);
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.instance.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha", "beta", "zebra"]
+        );
+    }
+
+    #[test]
     fn live_auth_validity_label_formats_all_variants() {
         assert_eq!(live_auth_validity_label(LiveAuthValidity::Valid), "yes");
         assert_eq!(live_auth_validity_label(LiveAuthValidity::Invalid), "no");
@@ -535,7 +562,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_auth_dispatches_status_and_logout_actions() {
+    async fn handle_auth_dispatches_login_status_and_logout_actions() {
+        let _guard = env_lock().lock().await;
         let env = TempConfigEnv::new("dispatch");
         let db = setup_db("dispatch").await;
         let instance = sample_instance(
@@ -551,6 +579,27 @@ mod tests {
             },
             ..Config::default()
         };
+        let original_token = std::env::var("CURATOR_INSTANCE_GITHUB_DISPATCH_TOKEN").ok();
+
+        unsafe {
+            std::env::set_var("CURATOR_INSTANCE_GITHUB_DISPATCH_TOKEN", "dispatch-token");
+        }
+
+        handle_auth(
+            AuthAction::Login {
+                instance: "github-dispatch".to_string(),
+            },
+            &db,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let stored = load_credential(&instance, &config, Some(&db))
+            .await
+            .unwrap()
+            .expect("login should persist a credential");
+        assert_eq!(stored.credential.access_token, "dispatch-token");
 
         handle_auth(
             AuthAction::Status {
@@ -572,5 +621,14 @@ mod tests {
         )
         .await
         .unwrap();
+
+        match original_token {
+            Some(token) => unsafe {
+                std::env::set_var("CURATOR_INSTANCE_GITHUB_DISPATCH_TOKEN", token);
+            },
+            None => unsafe {
+                std::env::remove_var("CURATOR_INSTANCE_GITHUB_DISPATCH_TOKEN");
+            },
+        }
     }
 }

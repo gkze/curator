@@ -57,6 +57,7 @@ const FILTER_PROGRESS_CHANNEL_BUFFER: usize = 256;
 const FILTER_PROGRESS_EMIT_MATCHED_STEP: usize = 25;
 const FILTER_PROGRESS_EMIT_PROCESSED_STEP: usize = 100;
 const PROCESSOR_LOG_EVERY: usize = 1000;
+const NAMESPACE_CONCURRENCY_DIVISOR: usize = 4;
 
 /// Trait for concurrent sync result types.
 ///
@@ -143,7 +144,7 @@ where
         SyncProgress::SyncingNamespaces { count: items.len() },
     );
 
-    let semaphore = Arc::new(Semaphore::new(std::cmp::max(1, concurrency / 4)));
+    let semaphore = Arc::new(Semaphore::new(namespace_sync_concurrency(concurrency)));
     let handles: Vec<_> = items
         .iter()
         .map(|item| tokio::spawn(make_task(item.clone(), Arc::clone(&semaphore))))
@@ -203,7 +204,7 @@ where
         SyncProgress::SyncingNamespaces { count: items.len() },
     );
 
-    let ns_concurrency = std::cmp::max(1, concurrency / 4);
+    let ns_concurrency = namespace_sync_concurrency(concurrency);
     let semaphore = Arc::new(Semaphore::new(ns_concurrency));
 
     let handles: Vec<_> = items
@@ -377,6 +378,10 @@ async fn sync_repos<C: PlatformClient + Clone + 'static>(
     );
 
     Ok((result, models))
+}
+
+fn namespace_sync_concurrency(concurrency: usize) -> usize {
+    std::cmp::max(1, concurrency / NAMESPACE_CONCURRENCY_DIVISOR)
 }
 
 async fn sync_repos_streaming<C: PlatformClient + Clone + 'static>(
@@ -910,32 +915,21 @@ fn spawn_starred_processor_task<C: PlatformClient + Clone + 'static>(
 
         tracing::debug!("Processor task started");
         while let Some(repo) = repo_rx.recv().await {
-            let new_processed = processor_processed.fetch_add(1, Ordering::Relaxed) + 1;
-            if new_processed.is_multiple_of(PROCESSOR_LOG_EVERY) {
-                tracing::debug!(processed = new_processed, "Processor progress");
-            }
-
-            let is_active = filter::is_active_repo(&repo, cutoff);
-            let new_matched = if is_active {
-                processor_matched.fetch_add(1, Ordering::Relaxed) + 1
-            } else {
-                processor_matched.load(Ordering::Relaxed)
-            };
-
-            let _ = progress_tx.try_send((new_matched, new_processed));
-
-            if is_active {
-                if !dry_run && !processor_channel_closed.load(Ordering::Relaxed) {
-                    let model = repo.to_active_model(processor_client.instance_id());
-                    if processor_model_tx.send(model).await.is_err() {
-                        processor_channel_closed.store(true, Ordering::Relaxed);
-                    } else {
-                        processor_saved.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            } else if prune && let Ok(mut prune_list) = processor_repos_to_prune.lock() {
-                prune_list.push((repo.owner.clone(), repo.name.clone()));
-            }
+            process_starred_repo(
+                &processor_client,
+                repo,
+                cutoff,
+                &processor_model_tx,
+                &progress_tx,
+                dry_run,
+                prune,
+                &processor_processed,
+                &processor_matched,
+                &processor_saved,
+                &processor_channel_closed,
+                &processor_repos_to_prune,
+            )
+            .await;
         }
 
         tracing::debug!(
@@ -945,6 +939,55 @@ fn spawn_starred_processor_task<C: PlatformClient + Clone + 'static>(
             "Processor task finished"
         );
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_starred_repo<C: PlatformClient>(
+    client: &C,
+    repo: PlatformRepo,
+    cutoff: chrono::DateTime<Utc>,
+    model_tx: &mpsc::Sender<CodeRepositoryActiveModel>,
+    progress_tx: &mpsc::Sender<(usize, usize)>,
+    dry_run: bool,
+    prune: bool,
+    processed: &AtomicUsize,
+    matched: &AtomicUsize,
+    saved: &AtomicUsize,
+    channel_closed: &AtomicBool,
+    repos_to_prune: &Mutex<Vec<(String, String)>>,
+) {
+    let new_processed = processed.fetch_add(1, Ordering::Relaxed) + 1;
+    if new_processed.is_multiple_of(PROCESSOR_LOG_EVERY) {
+        tracing::debug!(processed = new_processed, "Processor progress");
+    }
+
+    let is_active = filter::is_active_repo(&repo, cutoff);
+    let new_matched = if is_active {
+        matched.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        matched.load(Ordering::Relaxed)
+    };
+
+    if progress_tx.try_send((new_matched, new_processed)).is_err() {
+        tracing::debug!(
+            matched = new_matched,
+            processed = new_processed,
+            "Dropping progress update because the channel is full"
+        );
+    }
+
+    if is_active {
+        if !dry_run && !channel_closed.load(Ordering::Relaxed) {
+            let model = repo.to_active_model(client.instance_id());
+            if model_tx.send(model).await.is_err() {
+                channel_closed.store(true, Ordering::Relaxed);
+            } else {
+                saved.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    } else if prune && let Ok(mut prune_list) = repos_to_prune.lock() {
+        prune_list.push((repo.owner.clone(), repo.name.clone()));
+    }
 }
 
 async fn poll_starred_stream_tasks<F>(
@@ -973,16 +1016,13 @@ where
 
             result = progress_stream.next(), if processor_result.is_none() && !progress_stream_done => {
                 if let Some((matched_count, processed_count)) = result {
-                    if should_emit_filtered_progress(
+                    maybe_emit_filtered_progress(
+                        on_progress,
                         matched_count,
                         processed_count,
-                        last_emitted_matched,
-                        last_emitted_processed,
-                    ) {
-                        emit_filtered_progress(on_progress, matched_count, processed_count);
-                        last_emitted_matched = matched_count;
-                        last_emitted_processed = processed_count;
-                    }
+                        &mut last_emitted_matched,
+                        &mut last_emitted_processed,
+                    );
                 } else {
                     progress_stream_done = true;
                 }
@@ -1000,16 +1040,13 @@ where
 
         if fetch_done && processor_result.is_some() {
             while let Some((matched_count, processed_count)) = progress_stream.next().await {
-                if should_emit_filtered_progress(
+                maybe_emit_filtered_progress(
+                    on_progress,
                     matched_count,
                     processed_count,
-                    last_emitted_matched,
-                    last_emitted_processed,
-                ) {
-                    emit_filtered_progress(on_progress, matched_count, processed_count);
-                    last_emitted_matched = matched_count;
-                    last_emitted_processed = processed_count;
-                }
+                    &mut last_emitted_matched,
+                    &mut last_emitted_processed,
+                );
             }
             break;
         }
@@ -1196,6 +1233,25 @@ fn should_emit_filtered_progress(
         || processed_count >= last_emitted_processed + FILTER_PROGRESS_EMIT_PROCESSED_STEP
         || (matched_count > 0 && last_emitted_matched == 0)
         || (processed_count > 0 && last_emitted_processed == 0)
+}
+
+fn maybe_emit_filtered_progress(
+    on_progress: Option<&ProgressCallback>,
+    matched_count: usize,
+    processed_count: usize,
+    last_emitted_matched: &mut usize,
+    last_emitted_processed: &mut usize,
+) {
+    if should_emit_filtered_progress(
+        matched_count,
+        processed_count,
+        *last_emitted_matched,
+        *last_emitted_processed,
+    ) {
+        emit_filtered_progress(on_progress, matched_count, processed_count);
+        *last_emitted_matched = matched_count;
+        *last_emitted_processed = processed_count;
+    }
 }
 
 fn emit_filtered_progress(

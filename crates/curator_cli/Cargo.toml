@@ -49,7 +49,11 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 url = "2.5"
 rpassword = "7"
-keyring = "3"
+keyring = { version = "3", features = [
+  "apple-native",
+  "windows-native",
+  "linux-native-sync-persistent",
+] }
 
 [dev-dependencies]
 async-trait = "0.1"

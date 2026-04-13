@@ -14,6 +14,7 @@ use curator::{
     Instance, InstanceColumn, InstanceModel, PlatformType, entity::instance::well_known,
 };
 
+use crate::commands::shared::instance_token_env_var_name;
 use crate::config::Config;
 use crate::credentials::{StoredCredential, save_credential};
 
@@ -40,23 +41,19 @@ fn resolve_client_id(instance: &InstanceModel) -> Option<&str> {
         .or_else(|| well_known::by_name(&instance.name).and_then(|wk| wk.oauth_client_id))
 }
 
-fn normalize_instance_env_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
+fn instance_token_env_var(instance: &InstanceModel) -> String {
+    instance_token_env_var_name(&instance.name)
 }
 
-fn instance_token_env_var(instance: &InstanceModel) -> String {
-    format!(
-        "CURATOR_INSTANCE_{}_TOKEN",
-        normalize_instance_env_name(&instance.name)
-    )
+fn open_browser_or_warn(url: &str, is_tty: bool) {
+    if let Err(err) = open::that(url) {
+        if is_tty {
+            eprintln!("Could not open browser automatically: {err}");
+            eprintln!("Open this URL manually: {url}");
+        } else {
+            tracing::warn!(url, error = %err, "Could not open browser automatically");
+        }
+    }
 }
 
 /// Handle the login command for a given instance.
@@ -212,7 +209,7 @@ async fn login_github(
                     );
                 }
 
-                let _ = open::that(&device_code.verification_uri);
+                open_browser_or_warn(&device_code.verification_uri, is_tty);
 
                 let token_response = match poll_for_token(&device_code).await {
                     Ok(token) => token,
@@ -354,7 +351,7 @@ async fn login_gitlab(
                     .verification_uri_complete
                     .as_deref()
                     .unwrap_or(&device_code.verification_uri);
-                let _ = open::that(open_url);
+                open_browser_or_warn(open_url, is_tty);
 
                 let token_response =
                     match oauth::poll_for_token(&instance.host, client_id, &device_code).await {

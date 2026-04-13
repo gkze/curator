@@ -59,6 +59,9 @@ cd curator
 cargo install --path crates/curator_cli
 ```
 
+On Linux, keychain support uses the native Secret Service backend. Install `pkg-config`
+and the system `dbus` development headers first if they are not already present.
+
 ### With Nix
 
 ```bash
@@ -117,6 +120,8 @@ credential_store = "auto" # auto, keychain, file, db
 
 `db` storage is supported for portability-focused setups, but it stores secrets in the curator database in plaintext-at-rest. Use it only when that tradeoff is acceptable; `keychain` or `auto` are the recommended defaults.
 
+Keychain-backed credentials are keyed by platform and host, so multiple Curator databases on the same machine share auth state for the same external instance. The `db` backend keeps credentials scoped to that specific database. Because keychain entries may be shared, `curator instance remove` leaves keychain credentials in place; use `curator auth logout <instance>` when you want to remove the shared credential too.
+
 You can inspect and manage auth state with:
 
 ```bash
@@ -150,17 +155,17 @@ curator instance list
 curator instance update work-gitlab -c my-oauth-client-id -f device
 
 # OAuth login (GitHub/GitLab/Codeberg)
-curator login github
-curator login gitlab
-curator login codeberg
+curator auth login github
+curator auth login gitlab
+curator auth login codeberg
 ```
 
 OAuth login is supported for well-known instances with a bundled client ID.
-If a well-known instance does not have a bundled client ID, `curator login` falls back to PAT/token auth unless you configure one with `curator instance update <instance> -c <client-id>`.
+If a well-known instance does not have a bundled client ID, `curator auth login` falls back to PAT/token auth unless you configure one with `curator instance update <instance> -c <client-id>`.
 
 #### Well-known auth matrix
 
-| Instance | Host | Platform | Bundled OAuth client ID | Default `curator login` path | Notes |
+| Instance | Host | Platform | Bundled OAuth client ID | Default `curator auth login` path | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `archlinux-gitlab` | `gitlab.archlinux.org` | GitLab | No | PAT/token | Arch SSO/account provisioning may be required |
 | `codeberg` | `codeberg.org` | Gitea/Forgejo | Yes | PKCE OAuth, then token fallback | Uses Codeberg OAuth app |
@@ -172,7 +177,7 @@ If a well-known instance does not have a bundled client ID, `curator login` fall
 | `kde-gitlab` | `invent.kde.org` | GitLab | No | PAT/token | OAuth requires admin-provided client ID; user app creation may be disabled |
 | `kitware-gitlab` | `gitlab.kitware.com` | GitLab | Yes | Device OAuth, then token fallback | Built-in client ID |
 
-For GitHub Enterprise or self-hosted GitLab/Gitea, configure a PAT via `curator login <instance>` or `CURATOR_INSTANCE_<NAME>_TOKEN`.
+For GitHub Enterprise or self-hosted GitLab/Gitea, configure a PAT via `curator auth login <instance>` or `CURATOR_INSTANCE_<NAME>_TOKEN`.
 
 ### Database Setup
 

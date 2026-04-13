@@ -33,7 +33,7 @@
 use std::path::{Path, PathBuf};
 
 use config::{Config as ConfigStore, ConfigBuilder, Environment, File, FileFormat};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use serde::Deserialize;
 use url::Url;
 
@@ -177,12 +177,16 @@ impl Config {
     /// Note: SQLite-specific pragmas (WAL mode, busy timeout) are configured automatically
     /// when connecting via `curator::db::connect()` or `curator::db::connect_and_migrate()`.
     pub fn database_url(&self) -> Option<String> {
-        self.database.url.clone().or_else(|| {
-            Self::default_state_dir().map(|state_dir| {
-                let db_path = state_dir.join("curator.db");
-                sqlite_database_url(&db_path)
+        self.database
+            .url
+            .as_deref()
+            .map(normalize_configured_database_url)
+            .or_else(|| {
+                Self::default_state_dir().map(|state_dir| {
+                    let db_path = state_dir.join("curator.db");
+                    sqlite_database_url(&db_path)
+                })
             })
-        })
     }
 
     /// Get the configured credential store mode.
@@ -193,7 +197,7 @@ impl Config {
     /// Get the auth file path for the file credential backend.
     pub fn auth_file_path(&self) -> Option<PathBuf> {
         if let Some(path) = &self.auth.file_path {
-            return Some(PathBuf::from(path));
+            return Some(expand_user_path(path));
         }
 
         Self::default_config_path().and_then(|path| path.parent().map(|p| p.join("auth.toml")))
@@ -236,22 +240,98 @@ impl Config {
 }
 
 fn sqlite_database_url(path: &Path) -> String {
+    sqlite_database_url_with_suffix(path, "?mode=rwc")
+}
+
+fn sqlite_database_url_with_suffix(path: &Path, suffix: &str) -> String {
     // Build through file:// first so path components are URL-encoded.
     match Url::from_file_path(path) {
         Ok(file_url) => {
             let encoded_path = file_url.to_string();
             format!(
-                "sqlite://{}?mode=rwc",
-                encoded_path.trim_start_matches("file://")
+                "sqlite://{}{}",
+                encoded_path.trim_start_matches("file://"),
+                suffix
             )
         }
-        Err(_) => format!("sqlite://{}?mode=rwc", path.display()),
+        Err(_) => format!("sqlite://{}{}", path.display(), suffix),
+    }
+}
+
+pub(crate) fn sqlite_database_parent(database_url: &str) -> Option<(PathBuf, bool)> {
+    let db_path = sqlite_database_path(database_url)?;
+    let parent = db_path.parent()?.to_path_buf();
+    let warn_relative = db_path.is_relative() && !parent.as_os_str().is_empty();
+    Some((parent, warn_relative))
+}
+
+fn normalize_configured_database_url(database_url: &str) -> String {
+    let Some((path, suffix)) = split_sqlite_database_url(database_url) else {
+        return database_url.to_string();
+    };
+
+    if !path_uses_home_shorthand(path) {
+        return database_url.to_string();
+    }
+
+    sqlite_database_url_with_suffix(&expand_user_path(path), suffix)
+}
+
+fn sqlite_database_path(database_url: &str) -> Option<PathBuf> {
+    let (path, _) = split_sqlite_database_url(database_url)?;
+    if path.is_empty() {
+        return None;
+    }
+
+    if path_uses_home_shorthand(path) {
+        return Some(expand_user_path(path));
+    }
+
+    if path.starts_with('/') {
+        return Some(decode_absolute_sqlite_path(path).unwrap_or_else(|| PathBuf::from(path)));
+    }
+
+    Some(PathBuf::from(path))
+}
+
+fn split_sqlite_database_url(database_url: &str) -> Option<(&str, &str)> {
+    let path_and_suffix = database_url.strip_prefix("sqlite://")?;
+    let split_at = path_and_suffix
+        .find(['?', '#'])
+        .unwrap_or(path_and_suffix.len());
+    Some((&path_and_suffix[..split_at], &path_and_suffix[split_at..]))
+}
+
+fn decode_absolute_sqlite_path(path: &str) -> Option<PathBuf> {
+    Url::parse(&format!("file://{path}"))
+        .ok()?
+        .to_file_path()
+        .ok()
+}
+
+fn path_uses_home_shorthand(path: &str) -> bool {
+    path == "~" || path.starts_with("~/")
+}
+
+pub(crate) fn expand_user_path(path: &str) -> PathBuf {
+    if !path_uses_home_shorthand(path) {
+        return PathBuf::from(path);
+    }
+
+    let Some(home_dir) = BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) else {
+        return PathBuf::from(path);
+    };
+
+    match path.strip_prefix("~/") {
+        Some(suffix) => home_dir.join(suffix),
+        None => home_dir,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
 
     #[test]
     fn test_default_config() {
@@ -460,6 +540,87 @@ mod tests {
         let db_url = config.database_url();
 
         assert_eq!(db_url, Some("postgres://localhost/curator".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_auth_file_path_expands_home_shorthand() {
+        let _guard = env_lock().lock().await;
+        let home_dir =
+            std::env::temp_dir().join(format!("curator-config-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let previous_home = std::env::var_os("HOME");
+
+        unsafe {
+            std::env::set_var("HOME", &home_dir);
+        }
+
+        let config = Config {
+            auth: AuthConfig {
+                credential_store: CredentialStore::File,
+                file_path: Some("~/.config/curator/auth.toml".to_string()),
+            },
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.auth_file_path(),
+            Some(home_dir.join(".config").join("curator").join("auth.toml"))
+        );
+
+        match previous_home {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test]
+    async fn test_database_url_expands_home_shorthand_for_configured_sqlite_url() {
+        let _guard = env_lock().lock().await;
+        let home_dir =
+            std::env::temp_dir().join(format!("curator-db-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let previous_home = std::env::var_os("HOME");
+
+        unsafe {
+            std::env::set_var("HOME", &home_dir);
+        }
+
+        let config = Config {
+            database: DatabaseConfig {
+                url: Some("sqlite://~/.local/state/curator/curator.db?mode=ro".to_string()),
+            },
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.database_url(),
+            Some(format!(
+                "sqlite://{}?mode=ro",
+                home_dir
+                    .join(".local")
+                    .join("state")
+                    .join("curator")
+                    .join("curator.db")
+                    .display()
+            ))
+        );
+
+        match previous_home {
+            Some(home) => unsafe { std::env::set_var("HOME", home) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[test]
+    fn test_sqlite_database_parent_decodes_encoded_paths() {
+        let (parent, warn_relative) =
+            sqlite_database_parent("sqlite:///tmp/curator%20db/with%23chars%3F.db?mode=rwc")
+                .unwrap();
+
+        assert_eq!(parent, PathBuf::from("/tmp/curator db"));
+        assert!(!warn_relative);
     }
 
     #[test]

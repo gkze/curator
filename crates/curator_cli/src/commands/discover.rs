@@ -25,6 +25,7 @@ use crate::commands::shared::{
 };
 use crate::config::Config;
 use crate::progress::ProgressReporter;
+use crate::shutdown::SHUTDOWN_FLAG;
 
 pub async fn handle_discover(
     url: String,
@@ -180,6 +181,7 @@ fn build_discovery_runner(
     active_within_days: u64,
 ) -> SyncRunner {
     SyncRunner::new(db_conn, options, no_rate_limit, active_within_days)
+        .with_shutdown_flag(Arc::clone(&SHUTDOWN_FLAG))
 }
 
 fn build_discovery_sync_options_from_common(
@@ -201,7 +203,7 @@ fn build_crawl_options(discover_opts: &DiscoverOptions) -> CrawlOptions {
     CrawlOptions {
         max_depth: discover_opts.max_depth,
         max_pages: discover_opts.max_pages,
-        concurrency: discover_opts.crawl_concurrency,
+        concurrency: discover_opts.crawl_concurrency.max(1),
         same_host: !discover_opts.allow_external,
         include_subdomains: discover_opts.include_subdomains,
         use_sitemaps: !discover_opts.no_sitemaps,
@@ -312,7 +314,7 @@ fn build_discovery_sync_options(
         active_within: active_within_duration(active_within_days)?,
         star,
         dry_run,
-        concurrency,
+        concurrency: concurrency.max(1),
         platform_options: PlatformOptions::default(),
         prune: false,
         strategy,
@@ -327,7 +329,10 @@ async fn run_discovery_sync_for_client<C: curator::PlatformClient + Clone + 'sta
     is_tty: bool,
     no_rate_limit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result = runner.run_repo_list(client, &instance.name, repos).await?;
+    let result = runner
+        .run_repo_list(client, &instance.name, repos)
+        .await
+        .map_err(|err| -> Box<dyn std::error::Error> { err })?;
     runner.print_single_result(&instance.name, &result, SyncKind::Namespace);
     display_final_rate_limit(client, is_tty, no_rate_limit).await;
     Ok(())
@@ -1004,6 +1009,21 @@ mod tests {
     }
 
     #[test]
+    fn build_crawl_options_clamps_zero_concurrency() {
+        let opts = DiscoverOptions {
+            max_depth: 1,
+            max_pages: 2,
+            crawl_concurrency: 0,
+            allow_external: false,
+            include_subdomains: false,
+            no_sitemaps: false,
+        };
+
+        let crawl = build_crawl_options(&opts);
+        assert_eq!(crawl.concurrency, 1);
+    }
+
+    #[test]
     fn discovery_output_helpers_format_expected_messages() {
         let discovery = curator::discovery::DiscoveryResult {
             start_url: Url::parse("https://example.com").unwrap(),
@@ -1090,6 +1110,28 @@ mod tests {
         assert_eq!(resolved.strategy, curator::sync::SyncStrategy::Incremental);
         assert_eq!(options.concurrency, 9);
         assert!(options.dry_run);
+    }
+
+    #[test]
+    fn build_discovery_sync_options_from_common_clamps_zero_config_concurrency() {
+        let mut config = crate::config::Config::default();
+        config.sync.concurrency = 0;
+
+        let (options, resolved) = build_discovery_sync_options_from_common(
+            &crate::CommonSyncOptions {
+                active_within_days: None,
+                no_star: false,
+                dry_run: false,
+                concurrency: None,
+                no_rate_limit: false,
+                incremental: false,
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.concurrency, 1);
+        assert_eq!(options.concurrency, 1);
     }
 
     #[cfg(feature = "gitlab")]

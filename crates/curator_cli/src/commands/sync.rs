@@ -27,6 +27,13 @@ use crate::commands::shared::{
     resolve_starred_sync_options,
 };
 use crate::config::Config;
+use crate::shutdown::SHUTDOWN_FLAG;
+
+struct PreparedSyncExecution {
+    runner: SyncRunner,
+    client: Arc<dyn curator::PlatformClient>,
+    is_tty: bool,
+}
 
 async fn run_namespace_sync_for_client<C: curator::PlatformClient + Clone + 'static>(
     runner: &SyncRunner,
@@ -34,7 +41,7 @@ async fn run_namespace_sync_for_client<C: curator::PlatformClient + Clone + 'sta
     names: &[String],
     is_tty: bool,
     no_rate_limit: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if names.len() == 1 {
         let result = runner.run_namespace(client, &names[0]).await?;
         runner.print_single_result(&names[0], &result, SyncKind::Namespace);
@@ -53,7 +60,7 @@ async fn run_user_sync_for_client<C: curator::PlatformClient + Clone + 'static>(
     names: &[String],
     is_tty: bool,
     no_rate_limit: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if names.len() == 1 {
         let result = runner.run_user(client, &names[0]).await?;
         runner.print_single_result(&names[0], &result, SyncKind::User);
@@ -72,7 +79,7 @@ async fn run_starred_sync_for_client<C: curator::PlatformClient + Clone + 'stati
     prune: bool,
     is_tty: bool,
     no_rate_limit: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result = runner.run_starred(client).await?;
     runner.print_starred_result(&result, prune);
     display_final_rate_limit(client, is_tty, no_rate_limit).await;
@@ -249,12 +256,12 @@ fn build_namespace_sync_options(
     dry_run: bool,
     no_subgroups: bool,
     strategy: SyncStrategy,
-) -> Result<SyncOptions, Box<dyn std::error::Error>> {
+) -> Result<SyncOptions, Box<dyn std::error::Error + Send + Sync>> {
     Ok(SyncOptions {
         active_within: active_within_duration(active_within_days)?,
         star,
         dry_run,
-        concurrency,
+        concurrency: concurrency.max(1),
         platform_options: PlatformOptions {
             include_subgroups: !no_subgroups,
         },
@@ -269,12 +276,12 @@ fn build_user_sync_options(
     star: bool,
     dry_run: bool,
     strategy: SyncStrategy,
-) -> Result<SyncOptions, Box<dyn std::error::Error>> {
+) -> Result<SyncOptions, Box<dyn std::error::Error + Send + Sync>> {
     Ok(SyncOptions {
         active_within: active_within_duration(active_within_days)?,
         star,
         dry_run,
-        concurrency,
+        concurrency: concurrency.max(1),
         platform_options: PlatformOptions::default(),
         prune: false,
         strategy,
@@ -283,12 +290,12 @@ fn build_user_sync_options(
 
 fn build_starred_sync_options(
     settings: ResolvedStarredSyncSettings,
-) -> Result<SyncOptions, Box<dyn std::error::Error>> {
+) -> Result<SyncOptions, Box<dyn std::error::Error + Send + Sync>> {
     Ok(SyncOptions {
         active_within: active_within_duration(settings.active_within_days)?,
         star: false,
         dry_run: settings.dry_run,
-        concurrency: settings.concurrency,
+        concurrency: settings.concurrency.max(1),
         platform_options: PlatformOptions::default(),
         prune: settings.prune,
         strategy: SyncStrategy::Full,
@@ -328,24 +335,28 @@ async fn sync_org(
         sync_opts.dry_run,
         no_subgroups,
         strategy,
-    )?;
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err })?;
 
-    let runner = build_runner(
+    let execution = prepare_sync_execution(
         Arc::clone(&db),
-        options.clone(),
+        &instance,
+        &token,
+        options,
         no_rate_limit,
         active_within_days,
-    );
-
-    // Display rate limit status (platform-dependent)
-    let is_tty = Term::stdout().is_term();
-
-    let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
-
-    let client: Arc<dyn curator::PlatformClient> =
-        Arc::from(create_client(&instance, &token, rate_limiter).await?);
-    display_rate_limit(&client, is_tty).await;
-    run_namespace_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
+    )
+    .await
+    .map_err(|err| -> Box<dyn std::error::Error> { err })?;
+    run_namespace_sync_for_client(
+        &execution.runner,
+        &execution.client,
+        names,
+        execution.is_tty,
+        no_rate_limit,
+    )
+    .await
+    .map_err(|err| -> Box<dyn std::error::Error> { err })?;
 
     Ok(())
 }
@@ -373,23 +384,28 @@ async fn sync_user(
         star,
         sync_opts.dry_run,
         strategy,
-    )?;
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err })?;
 
-    let runner = build_runner(
+    let execution = prepare_sync_execution(
         Arc::clone(&db),
-        options.clone(),
+        &instance,
+        &token,
+        options,
         no_rate_limit,
         active_within_days,
-    );
-
-    let is_tty = Term::stdout().is_term();
-
-    let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
-
-    let client: Arc<dyn curator::PlatformClient> =
-        Arc::from(create_client(&instance, &token, rate_limiter).await?);
-    display_rate_limit(&client, is_tty).await;
-    run_user_sync_for_client(&runner, &client, names, is_tty, no_rate_limit).await?;
+    )
+    .await
+    .map_err(|err| -> Box<dyn std::error::Error> { err })?;
+    run_user_sync_for_client(
+        &execution.runner,
+        &execution.client,
+        names,
+        execution.is_tty,
+        no_rate_limit,
+    )
+    .await
+    .map_err(|err| -> Box<dyn std::error::Error> { err })?;
 
     Ok(())
 }
@@ -543,6 +559,30 @@ fn build_runner(
     active_within_days: u64,
 ) -> SyncRunner {
     SyncRunner::new(db, options, no_rate_limit, active_within_days)
+        .with_shutdown_flag(Arc::clone(&SHUTDOWN_FLAG))
+}
+
+async fn prepare_sync_execution(
+    db: Arc<DatabaseConnection>,
+    instance: &InstanceModel,
+    token: &str,
+    options: SyncOptions,
+    no_rate_limit: bool,
+    active_within_days: u64,
+) -> Result<PreparedSyncExecution, Box<dyn std::error::Error + Send + Sync>> {
+    let runner = build_runner(db, options, no_rate_limit, active_within_days);
+    let is_tty = Term::stdout().is_term();
+    let rate_limiter = build_rate_limiter(instance.platform_type, no_rate_limit);
+    let client: Arc<dyn curator::PlatformClient> =
+        Arc::from(create_client(instance, token, rate_limiter).await?);
+
+    display_rate_limit(&client, is_tty).await;
+
+    Ok(PreparedSyncExecution {
+        runner,
+        client,
+        is_tty,
+    })
 }
 
 async fn sync_stars_for_instance(
@@ -554,7 +594,9 @@ async fn sync_stars_for_instance(
     let token = get_token_for_instance_with_db(instance, config, Some(db.as_ref())).await?;
     let settings = resolve_starred_sync_settings(sync_opts, config);
 
-    sync_stars_for_instance_with_token(db, instance, &token, settings).await
+    sync_stars_for_instance_with_token(db, instance, &token, settings)
+        .await
+        .map_err(|err| -> Box<dyn std::error::Error> { err })
 }
 
 async fn sync_stars_for_instance_with_token(
@@ -562,27 +604,23 @@ async fn sync_stars_for_instance_with_token(
     instance: &InstanceModel,
     token: &str,
     settings: ResolvedStarredSyncSettings,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let options = build_starred_sync_options(settings)?;
 
-    let runner = build_runner(
+    let execution = prepare_sync_execution(
         Arc::clone(db),
+        instance,
+        token,
         options,
         settings.no_rate_limit,
         settings.active_within_days,
-    );
-
-    let is_tty = Term::stdout().is_term();
-    let rate_limiter = build_rate_limiter(instance.platform_type, settings.no_rate_limit);
-
-    let client: Arc<dyn curator::PlatformClient> =
-        Arc::from(create_client(instance, token, rate_limiter).await?);
-    display_rate_limit(&client, is_tty).await;
+    )
+    .await?;
     run_starred_sync_for_client(
-        &runner,
-        &client,
+        &execution.runner,
+        &execution.client,
         settings.prune,
-        is_tty,
+        execution.is_tty,
         settings.no_rate_limit,
     )
     .await?;
@@ -613,6 +651,8 @@ async fn display_rate_limit<C: curator::PlatformClient>(client: &C, is_tty: bool
                     style("⚠").yellow(),
                     e
                 );
+            } else {
+                tracing::warn!(error = %e, "Could not fetch rate limit");
             }
         }
     }
@@ -951,6 +991,22 @@ mod tests {
     }
 
     #[test]
+    fn merge_common_sync_options_clamps_zero_concurrency() {
+        let mut config = Config::default();
+        config.sync.concurrency = 0;
+
+        let from_config = merge_common_sync_options(&sample_common_sync_options(), &config);
+        assert_eq!(from_config.1, 1);
+
+        let cli_opts = CommonSyncOptions {
+            concurrency: Some(0),
+            ..sample_common_sync_options()
+        };
+        let from_cli = merge_common_sync_options(&cli_opts, &Config::default());
+        assert_eq!(from_cli.1, 1);
+    }
+
+    #[test]
     fn merge_starred_sync_options_combines_values() {
         let mut config = Config::default();
         config.sync.active_within_days = 45;
@@ -1006,6 +1062,22 @@ mod tests {
         let (_, _, prune, no_rate_limit) = merge_starred_sync_options(&opts, &config);
         assert!(prune);
         assert!(no_rate_limit);
+    }
+
+    #[test]
+    fn merge_starred_sync_options_clamps_zero_concurrency() {
+        let mut config = Config::default();
+        config.sync.concurrency = 0;
+
+        let from_config = merge_starred_sync_options(&sample_starred_sync_options(), &config);
+        assert_eq!(from_config.1, 1);
+
+        let opts = StarredSyncOptions {
+            concurrency: Some(0),
+            ..sample_starred_sync_options()
+        };
+        let from_cli = merge_starred_sync_options(&opts, &Config::default());
+        assert_eq!(from_cli.1, 1);
     }
 
     #[test]

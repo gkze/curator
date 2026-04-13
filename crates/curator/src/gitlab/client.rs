@@ -1166,6 +1166,7 @@ impl PlatformClient for GitLabClient {
     ) -> platform::Result<Vec<PlatformRepo>> {
         use tokio::sync::Semaphore;
 
+        let concurrency = concurrency.max(1);
         emit(
             on_progress,
             SyncProgress::FetchingRepos {
@@ -1410,6 +1411,7 @@ impl PlatformClient for GitLabClient {
     ) -> platform::Result<usize> {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let concurrency = concurrency.max(1);
         emit(
             on_progress,
             SyncProgress::FetchingRepos {

@@ -21,7 +21,9 @@ use curator::{
 use super::OutputFormat;
 use crate::config::Config;
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-use crate::credentials::{CredentialSource, CredentialStatus, credential_status};
+use crate::credentials::{
+    CredentialSource, CredentialStatus, credential_status, delete_credential,
+};
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum OauthFlowArg {
@@ -190,7 +192,7 @@ pub async fn handle_instance(
             list_instances(db, output).await?;
         }
         InstanceAction::Remove { name, yes } => {
-            remove_instance(db, &name, yes).await?;
+            remove_instance(db, &name, yes, config).await?;
         }
         InstanceAction::Show { name, output } => {
             show_instance(db, &name, output, config).await?;
@@ -429,6 +431,7 @@ async fn remove_instance(
     db: &DatabaseConnection,
     name: &str,
     skip_confirm: bool,
+    config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Find the instance
     let instance = Instance::find()
@@ -475,6 +478,8 @@ async fn remove_instance(
         }
     }
 
+    remove_instance_credentials(&instance, config, db).await?;
+
     // Delete associated repositories first (cascade)
     if repo_count > 0 {
         CodeRepository::delete_many()
@@ -494,6 +499,44 @@ async fn remove_instance(
         if repo_count == 1 { "y" } else { "ies" }
     );
 
+    Ok(())
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+async fn remove_instance_credentials(
+    instance: &InstanceModel,
+    config: &Config,
+    db: &DatabaseConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(source) = credential_status(instance, config, Some(db))
+        .await?
+        .active_source
+    {
+        if should_delete_credentials_on_instance_remove(&source) {
+            delete_credential(instance, &source, Some(db)).await?;
+        } else {
+            tracing::info!(
+                instance = %instance.name,
+                host = %instance.host,
+                "retaining shared keychain credential while removing instance"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+fn should_delete_credentials_on_instance_remove(source: &CredentialSource) -> bool {
+    !matches!(source, CredentialSource::Keychain)
+}
+
+#[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
+async fn remove_instance_credentials(
+    _instance: &InstanceModel,
+    _config: &Config,
+    _db: &DatabaseConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
@@ -520,44 +563,20 @@ async fn show_instance(
     #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     {
         let auth_status = credential_status(&instance, config, Some(db)).await?;
-        let details = build_instance_details(&instance, repo_count, &auth_status);
-
-        match output {
-            OutputFormat::Table => {
-                let mut table = Table::new(details);
-                table.with(Style::rounded());
-                println!("{}", table);
-            }
-            OutputFormat::Json => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&build_instance_json(
-                        instance,
-                        repo_count,
-                        auth_status,
-                    ))?
-                );
-            }
-        }
+        render_instance_output(
+            output,
+            build_instance_details_with_auth(&instance, repo_count, &auth_status),
+            build_instance_json_with_auth(instance, repo_count, auth_status),
+        )?;
     }
 
     #[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
     {
-        let details = build_instance_details_basic(&instance, repo_count);
-
-        match output {
-            OutputFormat::Table => {
-                let mut table = Table::new(details);
-                table.with(Style::rounded());
-                println!("{}", table);
-            }
-            OutputFormat::Json => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&build_instance_json_basic(instance, repo_count))?
-                );
-            }
-        }
+        render_instance_output(
+            output,
+            build_instance_details_basic(&instance, repo_count),
+            build_instance_json(instance, repo_count),
+        )?;
     }
 
     Ok(())
@@ -572,8 +591,6 @@ struct InstanceDetail {
     value: String,
 }
 
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-#[allow(dead_code)]
 #[derive(serde::Serialize)]
 struct InstanceJson {
     #[serde(flatten)]
@@ -581,25 +598,36 @@ struct InstanceJson {
     base_url: String,
     api_url: String,
     repository_count: u64,
-    credential_store: String,
-    credential_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_store: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     auth_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     token_expires_at: Option<u64>,
 }
 
-#[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
-#[allow(dead_code)]
-#[derive(serde::Serialize)]
-struct InstanceJsonBasic {
-    #[serde(flatten)]
-    instance: InstanceModel,
-    base_url: String,
-    api_url: String,
-    repository_count: u64,
+fn render_instance_output<T: serde::Serialize>(
+    output: OutputFormat,
+    details: Vec<InstanceDetail>,
+    json: T,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match output {
+        OutputFormat::Table => {
+            let mut table = Table::new(details);
+            table.with(Style::rounded());
+            println!("{}", table);
+        }
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        }
+    }
+
+    Ok(())
 }
 
-#[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
-fn build_instance_details_basic(instance: &InstanceModel, repo_count: u64) -> Vec<InstanceDetail> {
+fn build_instance_details_base(instance: &InstanceModel, repo_count: u64) -> Vec<InstanceDetail> {
     vec![
         InstanceDetail {
             property: "Name".to_string(),
@@ -625,6 +653,14 @@ fn build_instance_details_basic(instance: &InstanceModel, repo_count: u64) -> Ve
             property: "Repositories".to_string(),
             value: repo_count.to_string(),
         },
+    ]
+}
+
+fn finalize_instance_details(
+    mut details: Vec<InstanceDetail>,
+    instance: &InstanceModel,
+) -> Vec<InstanceDetail> {
+    details.extend([
         InstanceDetail {
             property: "Created".to_string(),
             value: instance
@@ -636,61 +672,52 @@ fn build_instance_details_basic(instance: &InstanceModel, repo_count: u64) -> Ve
             property: "ID".to_string(),
             value: instance.id.to_string(),
         },
-    ]
+    ]);
+    details
 }
 
 #[cfg(not(any(feature = "github", feature = "gitlab", feature = "gitea")))]
-fn build_instance_json_basic(instance: InstanceModel, repo_count: u64) -> InstanceJsonBasic {
-    InstanceJsonBasic {
+fn build_instance_details_basic(instance: &InstanceModel, repo_count: u64) -> Vec<InstanceDetail> {
+    finalize_instance_details(build_instance_details_base(instance, repo_count), instance)
+}
+
+fn build_instance_json(instance: InstanceModel, repo_count: u64) -> InstanceJson {
+    InstanceJson {
         base_url: instance.base_url(),
         api_url: instance.api_url(),
         repository_count: repo_count,
+        credential_store: None,
+        credential_status: None,
+        auth_kind: None,
+        token_expires_at: None,
         instance,
     }
 }
 
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-fn build_instance_details(
+fn build_instance_details_with_auth(
     instance: &InstanceModel,
     repo_count: u64,
     auth_status: &CredentialStatus,
 ) -> Vec<InstanceDetail> {
-    vec![
-        InstanceDetail {
-            property: "Name".to_string(),
-            value: instance.name.clone(),
-        },
-        InstanceDetail {
-            property: "Platform Type".to_string(),
-            value: instance.platform_type.to_string(),
-        },
-        InstanceDetail {
-            property: "Host".to_string(),
-            value: instance.host.clone(),
-        },
-        InstanceDetail {
-            property: "OAuth Client ID".to_string(),
-            value: instance
-                .oauth_client_id
-                .clone()
-                .unwrap_or_else(|| "(not set)".to_string()),
-        },
-        InstanceDetail {
-            property: "OAuth Flow".to_string(),
-            value: instance.oauth_flow.clone(),
-        },
-        InstanceDetail {
-            property: "Base URL".to_string(),
-            value: instance.base_url(),
-        },
-        InstanceDetail {
-            property: "API URL".to_string(),
-            value: instance.api_url(),
-        },
-        InstanceDetail {
-            property: "Repositories".to_string(),
-            value: repo_count.to_string(),
-        },
+    let mut details = build_instance_details_base(instance, repo_count);
+    details.splice(
+        3..3,
+        [
+            InstanceDetail {
+                property: "OAuth Client ID".to_string(),
+                value: instance
+                    .oauth_client_id
+                    .clone()
+                    .unwrap_or_else(|| "(not set)".to_string()),
+            },
+            InstanceDetail {
+                property: "OAuth Flow".to_string(),
+                value: instance.oauth_flow.clone(),
+            },
+        ],
+    );
+    details.extend([
         InstanceDetail {
             property: "Credential Store".to_string(),
             value: format!("{:?}", auth_status.configured_store).to_lowercase(),
@@ -713,36 +740,25 @@ fn build_instance_details(
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "(not set)".to_string()),
         },
-        InstanceDetail {
-            property: "Created".to_string(),
-            value: instance
-                .created_at
-                .format("%Y-%m-%d %H:%M:%S %Z")
-                .to_string(),
-        },
-        InstanceDetail {
-            property: "ID".to_string(),
-            value: instance.id.to_string(),
-        },
-    ]
+    ]);
+
+    finalize_instance_details(details, instance)
 }
 
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
-fn build_instance_json(
+fn build_instance_json_with_auth(
     instance: InstanceModel,
     repo_count: u64,
     auth_status: CredentialStatus,
 ) -> InstanceJson {
-    InstanceJson {
-        base_url: instance.base_url(),
-        api_url: instance.api_url(),
-        repository_count: repo_count,
-        credential_store: format!("{:?}", auth_status.configured_store).to_lowercase(),
-        credential_status: format_instance_credential_status(auth_status.active_source.as_ref()),
-        auth_kind: auth_status.auth_kind,
-        token_expires_at: auth_status.token_expires_at,
-        instance,
-    }
+    let mut json = build_instance_json(instance, repo_count);
+    json.credential_store = Some(format!("{:?}", auth_status.configured_store).to_lowercase());
+    json.credential_status = Some(format_instance_credential_status(
+        auth_status.active_source.as_ref(),
+    ));
+    json.auth_kind = auth_status.auth_kind;
+    json.token_expires_at = auth_status.token_expires_at;
+    json
 }
 
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
@@ -758,6 +774,9 @@ fn format_instance_credential_status(source: Option<&CredentialSource>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AuthConfig, CredentialStore};
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    use crate::credentials::{StoredCredential, load_credential, save_credential};
     use sea_orm::DatabaseConnection;
 
     fn sqlite_test_url(label: &str) -> String {
@@ -773,6 +792,16 @@ mod tests {
         curator::db::connect_and_migrate(&sqlite_test_url(label))
             .await
             .expect("test database should initialize")
+    }
+
+    fn isolated_auth_config() -> Config {
+        Config {
+            auth: AuthConfig {
+                credential_store: CredentialStore::Db,
+                file_path: None,
+            },
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -1175,6 +1204,20 @@ mod tests {
 
     #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[test]
+    fn remove_instance_only_deletes_instance_scoped_credentials() {
+        assert!(!should_delete_credentials_on_instance_remove(
+            &CredentialSource::Keychain
+        ));
+        assert!(should_delete_credentials_on_instance_remove(
+            &CredentialSource::File(std::path::PathBuf::from("/tmp/auth.toml"))
+        ));
+        assert!(should_delete_credentials_on_instance_remove(
+            &CredentialSource::Db
+        ));
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[test]
     fn build_instance_helpers_include_auth_fields() {
         let instance = InstanceModel {
             id: Uuid::new_v4(),
@@ -1192,7 +1235,7 @@ mod tests {
             token_expires_at: Some(1234),
         };
 
-        let details = build_instance_details(&instance, 7, &auth_status);
+        let details = build_instance_details_with_auth(&instance, 7, &auth_status);
         assert!(
             details
                 .iter()
@@ -1200,10 +1243,10 @@ mod tests {
         );
         assert!(details.iter().any(|item| item.property == "Credential Status" && item.value == "configured (db)"));
 
-        let json = build_instance_json(instance, 7, auth_status);
+        let json = build_instance_json_with_auth(instance, 7, auth_status);
         assert_eq!(json.repository_count, 7);
-        assert_eq!(json.credential_store, "db");
-        assert_eq!(json.credential_status, "configured (db)");
+        assert_eq!(json.credential_store.as_deref(), Some("db"));
+        assert_eq!(json.credential_status.as_deref(), Some("configured (db)"));
         assert_eq!(json.auth_kind.as_deref(), Some("oauth"));
         assert_eq!(json.token_expires_at, Some(1234));
     }
@@ -1227,7 +1270,7 @@ mod tests {
             token_expires_at: None,
         };
 
-        let details = build_instance_details(&instance, 0, &auth_status);
+        let details = build_instance_details_with_auth(&instance, 0, &auth_status);
         assert!(
             details
                 .iter()
@@ -1244,9 +1287,9 @@ mod tests {
                 .any(|item| item.property == "Token Expires At" && item.value == "(not set)")
         );
 
-        let json = build_instance_json(instance, 0, auth_status);
-        assert_eq!(json.credential_store, "auto");
-        assert_eq!(json.credential_status, "missing");
+        let json = build_instance_json_with_auth(instance, 0, auth_status);
+        assert_eq!(json.credential_store.as_deref(), Some("auto"));
+        assert_eq!(json.credential_status.as_deref(), Some("missing"));
         assert_eq!(json.auth_kind, None);
         assert_eq!(json.token_expires_at, None);
     }
@@ -1353,7 +1396,9 @@ mod tests {
         .await
         .unwrap();
 
-        remove_instance(&db, "work-gitlab", true).await.unwrap();
+        remove_instance(&db, "work-gitlab", true, &isolated_auth_config())
+            .await
+            .unwrap();
 
         assert!(
             Instance::find()
@@ -1375,6 +1420,65 @@ mod tests {
 
     #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
     #[tokio::test]
+    async fn remove_instance_deletes_file_backed_credentials() {
+        let db = setup_db("remove-instance-credentials").await;
+        add_instance(
+            &db,
+            "work-gitlab",
+            Some("gitlab"),
+            Some("gitlab.work.test"),
+            None,
+            OauthFlowArg::Auto,
+        )
+        .await
+        .unwrap();
+
+        let instance = Instance::find()
+            .filter(InstanceColumn::Name.eq("work-gitlab"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let auth_path =
+            std::env::temp_dir().join(format!("curator-instance-auth-{}.toml", Uuid::new_v4()));
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: crate::config::CredentialStore::File,
+                file_path: Some(auth_path.display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        save_credential(
+            &instance,
+            &StoredCredential {
+                access_token: "secret".to_string(),
+                refresh_token: None,
+                token_expires_at: None,
+                auth_kind: "pat".to_string(),
+                token_type: None,
+            },
+            &config,
+            &db,
+        )
+        .await
+        .unwrap();
+
+        remove_instance(&db, "work-gitlab", true, &config)
+            .await
+            .unwrap();
+
+        assert!(
+            load_credential(&instance, &config, Some(&db))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+    #[tokio::test]
     async fn list_instances_and_show_instance_succeed_for_json_output() {
         let db = setup_db("list-show-success").await;
         add_instance(
@@ -1389,8 +1493,13 @@ mod tests {
         .unwrap();
 
         list_instances(&db, OutputFormat::Json).await.unwrap();
-        show_instance(&db, "work-gitlab", OutputFormat::Json, &Config::default())
-            .await
-            .unwrap();
+        show_instance(
+            &db,
+            "work-gitlab",
+            OutputFormat::Json,
+            &isolated_auth_config(),
+        )
+        .await
+        .unwrap();
     }
 }

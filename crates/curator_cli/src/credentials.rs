@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -18,6 +19,28 @@ use uuid::Uuid;
 use crate::config::{Config, CredentialStore};
 
 const KEYCHAIN_SERVICE: &str = "dev.gkze.curator.instance-auth";
+
+trait KeychainStore {
+    fn set_password(&self, account: &str, payload: &str) -> Result<(), keyring::Error>;
+    fn get_password(&self, account: &str) -> Result<String, keyring::Error>;
+    fn delete_credential(&self, account: &str) -> Result<(), keyring::Error>;
+}
+
+struct SystemKeychainStore;
+
+impl KeychainStore for SystemKeychainStore {
+    fn set_password(&self, account: &str, payload: &str) -> Result<(), keyring::Error> {
+        keychain_entry(account)?.set_password(payload)
+    }
+
+    fn get_password(&self, account: &str) -> Result<String, keyring::Error> {
+        keychain_entry(account)?.get_password()
+    }
+
+    fn delete_credential(&self, account: &str) -> Result<(), keyring::Error> {
+        keychain_entry(account)?.delete_credential()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StoredCredential {
@@ -71,13 +94,7 @@ pub(crate) async fn save_credential(
     db: &DatabaseConnection,
 ) -> Result<CredentialSource, Box<dyn std::error::Error>> {
     match config.credential_store() {
-        CredentialStore::Auto => match save_to_keychain(instance, credential) {
-            Ok(()) => Ok(CredentialSource::Keychain),
-            Err(_) => {
-                let path = save_to_file(instance, credential, config)?;
-                Ok(CredentialSource::File(path))
-            }
-        },
+        CredentialStore::Auto => save_auto_credential(instance, credential, config),
         CredentialStore::Keychain => {
             save_to_keychain(instance, credential)?;
             Ok(CredentialSource::Keychain)
@@ -99,23 +116,7 @@ pub(crate) async fn load_credential(
     db: Option<&DatabaseConnection>,
 ) -> Result<Option<LocatedCredential>, Box<dyn std::error::Error>> {
     match config.credential_store() {
-        CredentialStore::Auto => {
-            if let Ok(Some(credential)) = load_from_keychain(instance) {
-                return Ok(Some(LocatedCredential {
-                    credential,
-                    source: CredentialSource::Keychain,
-                }));
-            }
-
-            if let Some((path, credential)) = load_from_file(instance, config)? {
-                return Ok(Some(LocatedCredential {
-                    credential,
-                    source: CredentialSource::File(path),
-                }));
-            }
-
-            Ok(None)
-        }
+        CredentialStore::Auto => load_auto_credential(instance, config),
         CredentialStore::Keychain => {
             Ok(
                 load_from_keychain(instance)?.map(|credential| LocatedCredential {
@@ -166,6 +167,84 @@ pub(crate) async fn update_credential(
     Ok(())
 }
 
+fn save_auto_credential(
+    instance: &InstanceModel,
+    credential: &StoredCredential,
+    config: &Config,
+) -> Result<CredentialSource, Box<dyn std::error::Error>> {
+    let store = SystemKeychainStore;
+    save_auto_credential_with_store(instance, credential, config, &store)
+}
+
+fn save_auto_credential_with_store<S: KeychainStore>(
+    instance: &InstanceModel,
+    credential: &StoredCredential,
+    config: &Config,
+    store: &S,
+) -> Result<CredentialSource, Box<dyn std::error::Error>> {
+    match save_to_keychain_with_store(instance, credential, store) {
+        Ok(()) => Ok(CredentialSource::Keychain),
+        Err(err) => {
+            tracing::warn!(
+                instance = %instance.name,
+                host = %instance.host,
+                error = %err,
+                "keychain save failed; falling back to file credential storage"
+            );
+            let path = save_to_file(instance, credential, config)?;
+            Ok(CredentialSource::File(path))
+        }
+    }
+}
+
+fn load_auto_credential(
+    instance: &InstanceModel,
+    config: &Config,
+) -> Result<Option<LocatedCredential>, Box<dyn std::error::Error>> {
+    let store = SystemKeychainStore;
+    load_auto_credential_with_store(instance, config, &store)
+}
+
+fn load_auto_credential_with_store<S: KeychainStore>(
+    instance: &InstanceModel,
+    config: &Config,
+    store: &S,
+) -> Result<Option<LocatedCredential>, Box<dyn std::error::Error>> {
+    match load_from_keychain_with_store(instance, store) {
+        Ok(Some(credential)) => {
+            return Ok(Some(LocatedCredential {
+                credential,
+                source: CredentialSource::Keychain,
+            }));
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(
+                instance = %instance.name,
+                host = %instance.host,
+                error = %err,
+                "keychain lookup failed; checking file credential storage"
+            );
+
+            if let Some((path, credential)) = load_from_file(instance, config)? {
+                return Ok(Some(LocatedCredential {
+                    credential,
+                    source: CredentialSource::File(path),
+                }));
+            }
+
+            return Err(err);
+        }
+    }
+
+    Ok(
+        load_from_file(instance, config)?.map(|(path, credential)| LocatedCredential {
+            credential,
+            source: CredentialSource::File(path),
+        }),
+    )
+}
+
 pub(crate) async fn delete_credential(
     instance: &InstanceModel,
     source: &CredentialSource,
@@ -206,33 +285,90 @@ fn save_to_keychain(
     instance: &InstanceModel,
     credential: &StoredCredential,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let entry = keychain_entry(instance)?;
+    let store = SystemKeychainStore;
+    save_to_keychain_with_store(instance, credential, &store)
+}
+
+fn save_to_keychain_with_store<S: KeychainStore>(
+    instance: &InstanceModel,
+    credential: &StoredCredential,
+    store: &S,
+) -> Result<(), Box<dyn std::error::Error>> {
     let payload = serde_json::to_string(credential)?;
-    entry.set_password(&payload)?;
+    let account = stable_keychain_account(instance);
+    store.set_password(&account, &payload)?;
     Ok(())
 }
 
 fn load_from_keychain(
     instance: &InstanceModel,
 ) -> Result<Option<StoredCredential>, Box<dyn std::error::Error>> {
-    let entry = keychain_entry(instance)?;
-    match entry.get_password() {
-        Ok(payload) => Ok(Some(serde_json::from_str(&payload)?)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(Box::new(err)),
+    let store = SystemKeychainStore;
+    load_from_keychain_with_store(instance, &store)
+}
+
+fn load_from_keychain_with_store<S: KeychainStore>(
+    instance: &InstanceModel,
+    store: &S,
+) -> Result<Option<StoredCredential>, Box<dyn std::error::Error>> {
+    let account = stable_keychain_account(instance);
+    if let Some(payload) = load_keychain_payload(store, &account)? {
+        return Ok(Some(serde_json::from_str(&payload)?));
     }
+
+    Ok(None)
 }
 
 fn delete_from_keychain(instance: &InstanceModel) -> Result<(), Box<dyn std::error::Error>> {
-    let entry = keychain_entry(instance)?;
-    match entry.delete_credential() {
+    let store = SystemKeychainStore;
+    delete_from_keychain_with_store(instance, &store)
+}
+
+fn delete_from_keychain_with_store<S: KeychainStore>(
+    instance: &InstanceModel,
+    store: &S,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let account = stable_keychain_account(instance);
+    delete_keychain_account(store, &account)?;
+
+    Ok(())
+}
+
+fn load_keychain_payload<S: KeychainStore>(
+    store: &S,
+    account: &str,
+) -> Result<Option<String>, keyring::Error> {
+    match store.get_password(account) {
+        Ok(payload) => Ok(Some(payload)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn delete_keychain_account<S: KeychainStore>(
+    store: &S,
+    account: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match store.delete_credential(account) {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(err) => Err(Box::new(err)),
     }
 }
 
-fn keychain_entry(instance: &InstanceModel) -> Result<Entry, keyring::Error> {
-    Entry::new(KEYCHAIN_SERVICE, &instance.id.to_string())
+fn stable_keychain_account(instance: &InstanceModel) -> String {
+    format!(
+        "{}:{}",
+        instance.platform_type,
+        normalize_keychain_host(&instance.host)
+    )
+}
+
+fn normalize_keychain_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn keychain_entry(account: &str) -> Result<Entry, keyring::Error> {
+    Entry::new(KEYCHAIN_SERVICE, account)
 }
 
 fn save_to_file(
@@ -260,13 +396,7 @@ fn save_to_file_path(
     auth_file
         .instances
         .insert(instance.name.clone(), credential.clone());
-    fs::write(path, toml::to_string_pretty(&auth_file)?)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
+    write_auth_file_atomically(path, &auth_file)?;
 
     Ok(())
 }
@@ -305,10 +435,50 @@ fn delete_from_file_path(
     if auth_file.instances.is_empty() {
         fs::remove_file(path)?;
     } else {
-        fs::write(path, toml::to_string_pretty(&auth_file)?)?;
+        write_auth_file_atomically(path, &auth_file)?;
     }
 
     Ok(())
+}
+
+fn write_auth_file_atomically(
+    path: &Path,
+    auth_file: &AuthFile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let contents = toml::to_string_pretty(auth_file)?;
+    let temp_path = temp_auth_file_path(path);
+
+    let mut temp_file = fs::File::create(&temp_path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+
+    temp_file.write_all(contents.as_bytes())?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+
+    fs::rename(&temp_path, path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
+}
+
+fn temp_auth_file_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("auth.toml");
+    let temp_name = format!(".{file_name}.{}.tmp", Uuid::new_v4());
+
+    path.with_file_name(temp_name)
 }
 
 fn load_auth_file(path: &Path) -> Result<AuthFile, Box<dyn std::error::Error>> {
@@ -500,6 +670,27 @@ mod tests {
     }
 
     #[test]
+    fn supported_platforms_do_not_use_entry_only_keyring_backend() {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "macos",
+            target_os = "windows"
+        ))]
+        {
+            let persistence = keyring::default::default_credential_builder().persistence();
+            assert!(
+                !matches!(
+                    persistence,
+                    keyring::credential::CredentialPersistence::EntryOnly
+                ),
+                "keyring default backend must persist credentials across entry instances"
+            );
+        }
+    }
+
+    #[test]
     fn load_auth_file_returns_default_for_missing_and_empty_file() {
         let dir = std::env::temp_dir().join(format!("curator-auth-file-{}", Uuid::new_v4()));
         let path = dir.join("auth.toml");
@@ -532,6 +723,33 @@ mod tests {
 
         assert_eq!(loaded.0, path);
         assert_eq!(loaded.1, credential);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_file_uses_secure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _home = TempHome::new("file-permissions");
+        let auth_path =
+            std::env::temp_dir().join(format!("curator-auth-permissions-{}.toml", Uuid::new_v4()));
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: CredentialStore::File,
+                file_path: Some(auth_path.display().to_string()),
+            },
+            ..Config::default()
+        };
+
+        let path = save_to_file(
+            &sample_instance("perms"),
+            &sample_credential("token"),
+            &config,
+        )
+        .unwrap();
+
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
@@ -656,5 +874,215 @@ mod tests {
 
         let loaded = load_from_db(&instance, &db).await.unwrap().unwrap();
         assert_eq!(loaded.access_token, "after");
+    }
+
+    #[derive(Default)]
+    struct TestKeychainStore {
+        entries: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    }
+
+    impl TestKeychainStore {
+        fn insert(&self, account: &str, credential: &StoredCredential) {
+            self.entries.lock().unwrap().insert(
+                account.to_string(),
+                serde_json::to_string(credential).unwrap(),
+            );
+        }
+
+        fn contains(&self, account: &str) -> bool {
+            self.entries.lock().unwrap().contains_key(account)
+        }
+    }
+
+    impl KeychainStore for TestKeychainStore {
+        fn set_password(&self, account: &str, payload: &str) -> Result<(), keyring::Error> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(account.to_string(), payload.to_string());
+            Ok(())
+        }
+
+        fn get_password(&self, account: &str) -> Result<String, keyring::Error> {
+            self.entries
+                .lock()
+                .unwrap()
+                .get(account)
+                .cloned()
+                .ok_or(keyring::Error::NoEntry)
+        }
+
+        fn delete_credential(&self, account: &str) -> Result<(), keyring::Error> {
+            self.entries
+                .lock()
+                .unwrap()
+                .remove(account)
+                .map(|_| ())
+                .ok_or(keyring::Error::NoEntry)
+        }
+    }
+
+    struct FailingKeychainStore {
+        save_fails: bool,
+        load_fails: bool,
+    }
+
+    impl KeychainStore for FailingKeychainStore {
+        fn set_password(&self, _account: &str, _payload: &str) -> Result<(), keyring::Error> {
+            if self.save_fails {
+                Err(keyring::Error::NoStorageAccess(Box::new(io::Error::other(
+                    "keychain unavailable",
+                ))))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn get_password(&self, _account: &str) -> Result<String, keyring::Error> {
+            if self.load_fails {
+                Err(keyring::Error::NoStorageAccess(Box::new(io::Error::other(
+                    "keychain unavailable",
+                ))))
+            } else {
+                Err(keyring::Error::NoEntry)
+            }
+        }
+
+        fn delete_credential(&self, _account: &str) -> Result<(), keyring::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stable_keychain_account_uses_platform_and_canonical_host() {
+        let mut instance = sample_instance("github-prod");
+        instance.host = " GitHub.COM. ".to_string();
+
+        assert_eq!(stable_keychain_account(&instance), "github:github.com");
+    }
+
+    #[test]
+    fn save_and_load_keychain_share_credentials_across_db_instance_ids() {
+        let store = TestKeychainStore::default();
+        let mut first = sample_instance("github-dev");
+        first.host = "GitHub.COM.".to_string();
+
+        let mut second = sample_instance("github-release");
+        second.host = "github.com".to_string();
+
+        let credential = sample_credential("shared-token");
+        save_to_keychain_with_store(&first, &credential, &store).unwrap();
+
+        let loaded = load_from_keychain_with_store(&second, &store)
+            .unwrap()
+            .expect("credential should resolve by stable host key");
+
+        assert_eq!(loaded, credential);
+        assert!(store.contains("github:github.com"));
+    }
+
+    #[test]
+    fn load_from_keychain_returns_none_without_stable_account() {
+        let store = TestKeychainStore::default();
+        let mut instance = sample_instance("github");
+        instance.host = "github.com".to_string();
+
+        let loaded = load_from_keychain_with_store(&instance, &store).unwrap();
+
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn delete_from_keychain_removes_stable_account() {
+        let store = TestKeychainStore::default();
+        let mut instance = sample_instance("github");
+        instance.host = "github.com".to_string();
+        let credential = sample_credential("token");
+        let stable_account = stable_keychain_account(&instance);
+        store.insert(&stable_account, &credential);
+
+        delete_from_keychain_with_store(&instance, &store).unwrap();
+
+        assert!(!store.contains(&stable_account));
+    }
+
+    #[test]
+    fn save_auto_credential_falls_back_to_file_when_keychain_save_fails() {
+        let _home = TempHome::new("auto-save-fallback");
+        let auth_path =
+            std::env::temp_dir().join(format!("curator-auth-auto-save-{}.toml", Uuid::new_v4()));
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: CredentialStore::Auto,
+                file_path: Some(auth_path.display().to_string()),
+            },
+            ..Config::default()
+        };
+        let instance = sample_instance("auto-save");
+        let credential = sample_credential("auto-token");
+        let store = FailingKeychainStore {
+            save_fails: true,
+            load_fails: false,
+        };
+
+        let source = save_auto_credential_with_store(&instance, &credential, &config, &store)
+            .expect("auto mode should fall back to file storage");
+
+        assert!(matches!(source, CredentialSource::File(_)));
+        let loaded = load_from_file(&instance, &config).unwrap().unwrap().1;
+        assert_eq!(loaded, credential);
+    }
+
+    #[test]
+    fn load_auto_credential_uses_file_when_keychain_lookup_fails() {
+        let _home = TempHome::new("auto-load-fallback");
+        let auth_path =
+            std::env::temp_dir().join(format!("curator-auth-auto-load-{}.toml", Uuid::new_v4()));
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: CredentialStore::Auto,
+                file_path: Some(auth_path.display().to_string()),
+            },
+            ..Config::default()
+        };
+        let instance = sample_instance("auto-load");
+        let credential = sample_credential("file-token");
+        let store = FailingKeychainStore {
+            save_fails: false,
+            load_fails: true,
+        };
+
+        save_to_file(&instance, &credential, &config).unwrap();
+
+        let loaded = load_auto_credential_with_store(&instance, &config, &store)
+            .expect("auto mode should check file storage after keychain errors")
+            .expect("file-backed credential should be returned");
+
+        assert!(matches!(loaded.source, CredentialSource::File(_)));
+        assert_eq!(loaded.credential, credential);
+    }
+
+    #[test]
+    fn load_auto_credential_returns_error_when_keychain_lookup_fails_without_fallback() {
+        let _home = TempHome::new("auto-load-error");
+        let auth_path =
+            std::env::temp_dir().join(format!("curator-auth-auto-error-{}.toml", Uuid::new_v4()));
+        let config = Config {
+            auth: crate::config::AuthConfig {
+                credential_store: CredentialStore::Auto,
+                file_path: Some(auth_path.display().to_string()),
+            },
+            ..Config::default()
+        };
+        let instance = sample_instance("auto-error");
+        let store = FailingKeychainStore {
+            save_fails: false,
+            load_fails: true,
+        };
+
+        let err = load_auto_credential_with_store(&instance, &config, &store)
+            .expect_err("backend failures without fallback should be surfaced");
+
+        assert!(err.to_string().contains("keychain unavailable"));
     }
 }

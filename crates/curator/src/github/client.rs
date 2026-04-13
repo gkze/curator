@@ -875,6 +875,8 @@ impl PlatformClient for GitHubClient {
         skip_rate_checks: bool,
         on_progress: Option<&platform::ProgressCallback>,
     ) -> platform::Result<Vec<PlatformRepo>> {
+        let concurrency = concurrency.max(1);
+
         // Use cached version if database connection is provided
         if let Some(db) = db {
             // Get username for cache key
@@ -1044,6 +1046,7 @@ impl PlatformClient for GitHubClient {
     ) -> platform::Result<usize> {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let concurrency = concurrency.max(1);
         let total_sent = Arc::new(AtomicUsize::new(0));
         if let Some(db) = db {
             use crate::api_cache;

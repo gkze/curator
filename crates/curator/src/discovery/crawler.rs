@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration as StdDuration;
 
 use regex::Regex;
@@ -14,6 +14,12 @@ use super::sitemap::collect_sitemap_urls;
 use crate::{HttpMethod, HttpRequest, HttpTransport, header_get};
 
 pub type DiscoveryProgressCallback = dyn Fn(DiscoveryProgress) + Send + Sync;
+
+static LINK_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("a[href]").expect("selector should parse"));
+static TEXT_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https://[A-Za-z0-9._~:/?#\[\]@!$()*+,;=%-]+"#).expect("regex is valid")
+});
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
@@ -399,9 +405,8 @@ fn extract_links(base: &Url, body: &str) -> (Vec<Url>, Vec<RepoLink>) {
     let mut seen: HashSet<String> = HashSet::new();
 
     let document = Html::parse_document(body);
-    let selector = Selector::parse("a[href]").expect("selector should parse");
 
-    for element in document.select(&selector) {
+    for element in document.select(&LINK_SELECTOR) {
         let Some(href) = element.value().attr("href") else {
             continue;
         };
@@ -458,10 +463,7 @@ fn extract_text_urls(
     // contexts. We intentionally exclude `&`, `'`, `"`, `<`, `>`, and `{`/`}`
     // so the regex stops before HTML entities (`&amp;`, `&quot;`), attribute
     // boundaries, and embedded JSON.
-    let url_re =
-        Regex::new(r#"https://[A-Za-z0-9._~:/?#\[\]@!$()*+,;=%-]+"#).expect("regex is valid");
-
-    for m in url_re.find_iter(body) {
+    for m in TEXT_URL_RE.find_iter(body) {
         let raw = m.as_str().trim_end_matches(['.', ',', ')', ']', ';', ':']);
 
         let Ok(url) = Url::parse(raw) else {

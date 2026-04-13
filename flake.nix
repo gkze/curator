@@ -68,6 +68,9 @@
             postgresql_18
             openssl
           ]
+          ++ lib.optionals stdenv.hostPlatform.isLinux [
+            dbus
+          ]
           ++ lib.optionals stdenv.hostPlatform.isDarwin [
             libiconv
             apple-sdk_15
