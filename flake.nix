@@ -288,6 +288,10 @@
                 name = "LIBRARY_PATH";
                 value = lib.makeLibraryPath (mkBuildInputs pkgs);
               }
+              {
+                name = "PKG_CONFIG_PATH";
+                value = lib.makeSearchPathOutput "dev" "lib/pkgconfig" (mkBuildInputs pkgs);
+              }
             ];
 
             devshell.startup.pre-commit.text = preCommitCheck.shellHook;
