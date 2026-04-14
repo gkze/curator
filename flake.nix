@@ -277,7 +277,8 @@
                 rustToolchain
                 yq-go
               ]
-              ++ mkBuildInputs pkgs;
+              ++ mkBuildInputs pkgs
+              ++ lib.optionals stdenv.hostPlatform.isLinux [ dbus.dev ];
 
             env = [
               {

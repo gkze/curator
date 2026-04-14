@@ -11,3 +11,8 @@
         echo "${var}=${value}" >> "$GITHUB_ENV"
       fi
     done
+
+    pkg_config_path=$(nix develop --command bash -lc 'command -v pkg-config')
+    if [ -n "$pkg_config_path" ]; then
+      echo "PKG_CONFIG=${pkg_config_path}" >> "$GITHUB_ENV"
+    fi
