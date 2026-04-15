@@ -5,14 +5,30 @@
   run: |-
     nix develop --command printenv > /tmp/nix-env
 
+    is_linux=false
+    if [ "$(uname -s)" = "Linux" ]; then
+      is_linux=true
+      sudo apt-get update
+      sudo apt-get install -y libdbus-1-dev pkg-config
+    fi
+
+    filter_nix_dbus_paths() {
+      printf '%s' "$1" | tr ':' '\n' | grep -v '/dbus-1\.' | paste -sd ':' -
+    }
+
     for var in PKG_CONFIG_PATH LIBRARY_PATH C_INCLUDE_PATH CPATH; do
       value=$(grep "^${var}=" /tmp/nix-env | cut -d= -f2- || true)
       if [ -n "$value" ]; then
+        if [ "$is_linux" = true ] && [ "$var" != "C_INCLUDE_PATH" ] && [ "$var" != "CPATH" ]; then
+          value=$(filter_nix_dbus_paths "$value")
+        fi
         echo "${var}=${value}" >> "$GITHUB_ENV"
       fi
     done
 
-    pkg_config_path=$(nix develop --command bash -lc 'command -v pkg-config')
-    if [ -n "$pkg_config_path" ]; then
-      echo "PKG_CONFIG=${pkg_config_path}" >> "$GITHUB_ENV"
+    if [ "$is_linux" != true ]; then
+      pkg_config_path=$(nix develop --command bash -lc 'command -v pkg-config')
+      if [ -n "$pkg_config_path" ]; then
+        echo "PKG_CONFIG=${pkg_config_path}" >> "$GITHUB_ENV"
+      fi
     fi
