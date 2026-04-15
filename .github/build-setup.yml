@@ -13,7 +13,7 @@
     fi
 
     filter_nix_dbus_paths() {
-      printf '%s' "$1" | tr ':' '\n' | grep -v '/dbus-1\.' | paste -sd ':' -
+      printf '%s' "$1" | tr ':' '\n' | grep -v 'dbus-1\.' | paste -sd ':' -
     }
 
     for var in PKG_CONFIG_PATH LIBRARY_PATH C_INCLUDE_PATH CPATH; do
