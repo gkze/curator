@@ -29,10 +29,8 @@ struct ProgressState {
     star_total: usize,
     /// Separate bar for persistence.
     save_bar: Option<ProgressBar>,
-    /// Final count of items to save (set by FilterComplete).
+    /// Final count of items expected to be saved once known.
     save_total: usize,
-    /// Whether filtering is complete (save total is final).
-    filter_complete: bool,
     /// Single bar for pruning inactive starred repositories.
     prune_bar: Option<ProgressBar>,
     /// Total repositories to prune (accumulated for multiple prune batches).
@@ -66,11 +64,9 @@ impl InteractiveReporter {
     /// Create the save bar with proper styling.
     /// Positions it after the filter bar if one exists.
     fn create_save_bar(&self, state: &ProgressState) -> ProgressBar {
-        let pb = if state.filter_complete && state.save_total > 0 {
-            // Progress bar with known total
+        let pb = if state.save_total > 0 {
             ProgressBar::new(state.save_total as u64)
         } else {
-            // Spinner with counter (total not known yet)
             let bar = ProgressBar::new_spinner();
             bar.enable_steady_tick(std::time::Duration::from_millis(100));
             bar
@@ -83,7 +79,7 @@ impl InteractiveReporter {
             self.multi.add(pb)
         };
 
-        if state.filter_complete && state.save_total > 0 {
+        if state.save_total > 0 {
             pb.set_style(Self::bar_style());
         } else {
             pb.set_style(Self::counter_style());
@@ -228,22 +224,7 @@ impl InteractiveReporter {
 
                 // Finish filter bar
                 if let Some(ref pb) = state.filter_bar {
-                    pb.finish_with_message(format!("✓ {}/{} active", matched, total));
-                }
-
-                // Set final save total and mark filtering as complete
-                state.save_total = matched;
-                state.filter_complete = true;
-
-                // Convert save spinner to progress bar in-place (preserves position in MultiProgress)
-                if matched > 0
-                    && let Some(ref pb) = state.save_bar
-                {
-                    pb.set_length(matched as u64);
-                    pb.set_style(Self::bar_style());
-                    pb.disable_steady_tick();
-                    let pos = pb.position();
-                    pb.set_message(format!("{}/{} saved", pos, matched));
+                    pb.finish_with_message(format!("✓ {matched}/{total} active"));
                 }
             }
 
@@ -358,20 +339,26 @@ impl InteractiveReporter {
             SyncProgress::ConvertingModels => {}
 
             SyncProgress::ModelsReady { count } => {
-                // Create save bar with known count
-                if state.save_bar.is_none() && count > 0 {
-                    // Insert after filter bar if it exists
-                    let pb = ProgressBar::new(count as u64);
-                    let pb = if let Some(ref filter_bar) = state.filter_bar {
-                        self.multi.insert_after(filter_bar, pb)
-                    } else {
-                        self.multi.add(pb)
-                    };
-                    pb.set_style(Self::bar_style());
+                state.save_total = count;
+
+                if let Some(ref pb) = state.save_bar {
+                    if count > 0 {
+                        pb.set_length(count as u64);
+                        pb.set_style(Self::bar_style());
+                        pb.disable_steady_tick();
+
+                        let pos = pb.position();
+                        if pos > 0 {
+                            pb.set_message(format!("{pos}/{count} saved"));
+                        } else {
+                            pb.set_message("Saving to database...");
+                        }
+                    }
+                } else if count > 0 {
+                    let pb = self.create_save_bar(&state);
                     pb.set_prefix(format!("{:12}", "Saving"));
                     pb.set_message("Saving to database...");
                     state.save_bar = Some(pb);
-                    state.save_total = count;
                 }
             }
 
@@ -406,17 +393,15 @@ impl InteractiveReporter {
                 if let Some(ref pb) = state.save_bar {
                     pb.inc(1);
 
-                    // Convert spinner to progress bar in-place if filter is now complete
-                    if state.filter_complete && state.save_total > 0 {
-                        // Set length if not already set to the correct value
+                    if state.save_total > 0 {
                         if pb.length() != Some(state.save_total as u64) {
                             pb.set_length(state.save_total as u64);
                             pb.set_style(Self::bar_style());
                             pb.disable_steady_tick();
                         }
-                        pb.set_message(format!("{}/{}", owner, name));
+                        pb.set_message(format!("{owner}/{name}"));
                     } else {
-                        pb.set_message(format!("saved - {}/{}", owner, name));
+                        pb.set_message(format!("saved - {owner}/{name}"));
                     }
                 }
             }
@@ -505,6 +490,22 @@ impl InteractiveReporter {
                         retry_after_ms as f64 / 1000.0
                     ));
                 }
+            }
+
+            SyncProgress::PageFetchRetry {
+                page,
+                retry_after_ms,
+                attempt,
+            } => {
+                drop(state);
+                self.multi
+                    .println(format!(
+                        "⏳ page {} rate limited, retry {} in {:.1}s",
+                        page,
+                        attempt,
+                        retry_after_ms as f64 / 1000.0
+                    ))
+                    .ok();
             }
 
             SyncProgress::CacheHit {
@@ -680,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn save_spinner_is_converted_in_place_after_filter_complete() {
+    fn save_spinner_is_converted_in_place_after_models_ready() {
         let reporter = InteractiveReporter::hidden();
 
         reporter.handle(SyncProgress::PersistingBatch {
@@ -702,19 +703,14 @@ mod tests {
             assert_eq!(save_bar.position(), 1);
         }
 
-        reporter.handle(SyncProgress::FilterComplete {
-            namespace: "org".to_string(),
-            matched: 3,
-            total: 10,
-        });
+        reporter.handle(SyncProgress::ModelsReady { count: 3 });
 
         let state = reporter.state.lock().unwrap_or_else(|e| e.into_inner());
         let save_bar = state
             .save_bar
             .as_ref()
-            .expect("save bar should remain after filter complete");
+            .expect("save bar should remain after models ready");
 
-        assert!(state.filter_complete);
         assert_eq!(state.save_total, 3);
         assert_eq!(save_bar.length(), Some(3));
         assert_eq!(save_bar.position(), 1);
@@ -828,7 +824,6 @@ mod tests {
             .as_ref()
             .expect("save bar should still exist");
 
-        assert!(state.filter_complete);
         assert_eq!(state.save_total, 0);
         assert_eq!(save_bar.length(), None);
         assert_eq!(save_bar.position(), 1);
@@ -1038,7 +1033,6 @@ mod tests {
 
         let mut state = ProgressState {
             save_total: 4,
-            filter_complete: true,
             ..Default::default()
         };
 

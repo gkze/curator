@@ -138,6 +138,19 @@ impl LoggingReporter {
                 );
             }
 
+            SyncProgress::PageFetchRetry {
+                page,
+                retry_after_ms,
+                attempt,
+            } => {
+                tracing::warn!(
+                    page,
+                    retry_after_ms,
+                    attempt,
+                    "Page fetch rate limited, backing off"
+                );
+            }
+
             SyncProgress::PruningRepos { count, dry_run } => {
                 tracing::info!(count, dry_run, "Pruning inactive repositories");
             }

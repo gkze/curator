@@ -33,13 +33,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use chrono::Utc;
-use tokio::sync::{Semaphore, mpsc};
-use tokio::task::JoinSet;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
-
 use std::future::Future;
+
+use chrono::Utc;
+use futures::stream::{self, StreamExt};
+use tokio::sync::{Semaphore, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
 
 use sea_orm::DatabaseConnection;
 
@@ -704,40 +703,25 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
         },
     );
 
-    let mut join_set: JoinSet<(String, String, Result<PlatformRepo, PlatformError>)> =
-        JoinSet::new();
     let concurrency = std::cmp::max(1, std::cmp::min(options.concurrency, repos.len().max(1)));
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-
-    for (owner, name) in repos {
+    let mut repo_stream = stream::iter(repos.iter().map(|(owner, name)| {
         let owner = owner.clone();
         let name = name.clone();
         let client = client.clone();
-        let semaphore = Arc::clone(&semaphore);
         let task_db = db.clone();
 
-        join_set.spawn(async move {
-            let _permit = match semaphore.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    return (
-                        owner,
-                        name,
-                        Err(PlatformError::internal("Semaphore closed unexpectedly")),
-                    );
-                }
-            };
-
+        tokio::spawn(async move {
             let repo = client.get_repo(&owner, &name, task_db.as_deref()).await;
             (owner, name, repo)
-        });
-    }
+        })
+    }))
+    .buffer_unordered(concurrency);
 
     let mut fetched = Vec::new();
     let mut errors = Vec::new();
     let mut attempted = 0usize;
 
-    while let Some(result) = join_set.join_next().await {
+    while let Some(result) = repo_stream.next().await {
         attempted += 1;
         emit(
             on_progress,
@@ -1163,9 +1147,9 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
         );
     }
 
-    // Emit FilterComplete and ModelsReady BEFORE dropping the channel
-    // This ensures the progress reporter knows the final count before any
-    // remaining Persisted events arrive from the persist task's final batch flush
+    // Emit the final filter and persistence totals before closing the model channel.
+    // The CLI reporter can now reconcile these totals independently from any
+    // remaining `Persisted` events, so later final-batch flushes are safe.
     emit(
         on_progress,
         SyncProgress::FilterComplete {
@@ -1175,8 +1159,8 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
         },
     );
 
-    // Emit ModelsReady to create the save bar with correct count
-    // This ensures the save bar appears with progress bar style
+    // Emit the final persistence total so the save reporter can switch from a
+    // spinner to a determinate progress bar if it has already seen persisted rows.
     if final_matched > 0 && !options.dry_run {
         emit(
             on_progress,
@@ -1187,9 +1171,8 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     }
 
     // Drop our copy of the model sender to allow persist task to detect completion
-    // (processor_model_tx was already dropped when the processor task finished)
-    // The persist task will flush its final batch after this, but FilterComplete
-    // has already been emitted so the save bar will use progress bar style
+    // (processor_model_tx was already dropped when the processor task finished).
+    // The persist task may still flush a final batch after this.
     tracing::debug!("Dropping model_tx to signal persist task completion");
     drop(model_tx);
     tracing::debug!("model_tx dropped, persist task should now see channel close");

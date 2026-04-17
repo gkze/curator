@@ -27,7 +27,8 @@ use curator::platform::PlatformClient;
 use curator::rate_limits;
 use curator::repository;
 use curator::sync::{
-    NamespaceSyncResultStreaming, ProgressCallback, SyncContext, SyncOptions, SyncResult,
+    NamespaceSyncResultStreaming, PlatformOptions, ProgressCallback, SyncContext, SyncOptions,
+    SyncResult, SyncStrategy,
 };
 #[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
 use curator::{Instance, InstanceColumn};
@@ -92,8 +93,7 @@ pub(crate) struct ResolvedCommonSyncOptions {
     pub strategy: curator::sync::SyncStrategy,
 }
 
-/// Resolve common sync options with precedence CLI flags > config defaults.
-#[cfg(any(feature = "github", feature = "gitlab", feature = "gitea"))]
+/// Normalize any externally supplied concurrency to at least 1.
 fn normalize_concurrency(concurrency: usize) -> usize {
     concurrency.max(1)
 }
@@ -194,11 +194,37 @@ pub(crate) fn unsupported_platform_error(
     .into()
 }
 
-/// Display final rate limit status with a timeout to avoid hangs.
-pub(crate) async fn display_final_rate_limit<C: PlatformClient>(
+/// Build `SyncOptions` from validated CLI/config values.
+pub(crate) fn build_sync_options(
+    active_within_days: u64,
+    star: bool,
+    dry_run: bool,
+    concurrency: usize,
+    platform_options: PlatformOptions,
+    prune: bool,
+    strategy: SyncStrategy,
+) -> Result<SyncOptions, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(SyncOptions {
+        active_within: active_within_duration(active_within_days)?,
+        star,
+        dry_run,
+        concurrency: normalize_concurrency(concurrency),
+        platform_options,
+        prune,
+        strategy,
+    })
+}
+
+enum RateLimitDisplayPhase {
+    BeforeSync,
+    AfterSync,
+}
+
+async fn display_rate_limit_with_timeout<C: PlatformClient>(
     client: &C,
     is_tty: bool,
     no_rate_limit: bool,
+    phase: RateLimitDisplayPhase,
 ) {
     if no_rate_limit {
         return;
@@ -207,29 +233,57 @@ pub(crate) async fn display_final_rate_limit<C: PlatformClient>(
     let rate_limit =
         tokio::time::timeout(std::time::Duration::from_secs(5), client.get_rate_limit()).await;
 
-    match rate_limit {
-        Ok(Ok(final_rate)) => {
+    match (phase, rate_limit) {
+        (RateLimitDisplayPhase::BeforeSync, Ok(Ok(rate_limit))) => {
             if is_tty {
                 println!(
-                    "\nRate limit after sync: {}/{} remaining",
-                    final_rate.remaining, final_rate.limit
+                    "Rate limit: {}/{} remaining (resets at {})\n",
+                    rate_limit.remaining, rate_limit.limit, rate_limit.reset_at
                 );
             } else {
                 tracing::info!(
-                    remaining = final_rate.remaining,
-                    limit = final_rate.limit,
+                    remaining = rate_limit.remaining,
+                    limit = rate_limit.limit,
+                    "Rate limit status"
+                );
+            }
+        }
+        (RateLimitDisplayPhase::BeforeSync, Ok(Err(error))) => {
+            if is_tty {
+                eprintln!("Warning: Could not fetch rate limit: {error}");
+            } else {
+                tracing::warn!(error = %error, "Could not fetch rate limit");
+            }
+        }
+        (RateLimitDisplayPhase::BeforeSync, Err(_)) => {
+            if is_tty {
+                eprintln!("Warning: Timed out fetching rate limit");
+            } else {
+                tracing::warn!("Timed out fetching rate limit");
+            }
+        }
+        (RateLimitDisplayPhase::AfterSync, Ok(Ok(rate_limit))) => {
+            if is_tty {
+                println!(
+                    "\nRate limit after sync: {}/{} remaining",
+                    rate_limit.remaining, rate_limit.limit
+                );
+            } else {
+                tracing::info!(
+                    remaining = rate_limit.remaining,
+                    limit = rate_limit.limit,
                     "Rate limit after sync"
                 );
             }
         }
-        Ok(Err(error)) => {
+        (RateLimitDisplayPhase::AfterSync, Ok(Err(error))) => {
             if is_tty {
                 eprintln!("Warning: Failed to fetch rate limit after sync: {error}");
             } else {
                 tracing::warn!(error = %error, "Failed to fetch rate limit after sync");
             }
         }
-        Err(_) => {
+        (RateLimitDisplayPhase::AfterSync, Err(_)) => {
             if is_tty {
                 eprintln!("Warning: Timed out fetching rate limit after sync");
             } else {
@@ -237,6 +291,36 @@ pub(crate) async fn display_final_rate_limit<C: PlatformClient>(
             }
         }
     }
+}
+
+/// Display current rate limit status with a timeout to avoid hangs.
+pub(crate) async fn display_initial_rate_limit<C: PlatformClient>(
+    client: &C,
+    is_tty: bool,
+    no_rate_limit: bool,
+) {
+    display_rate_limit_with_timeout(
+        client,
+        is_tty,
+        no_rate_limit,
+        RateLimitDisplayPhase::BeforeSync,
+    )
+    .await;
+}
+
+/// Display final rate limit status with a timeout to avoid hangs.
+pub(crate) async fn display_final_rate_limit<C: PlatformClient>(
+    client: &C,
+    is_tty: bool,
+    no_rate_limit: bool,
+) {
+    display_rate_limit_with_timeout(
+        client,
+        is_tty,
+        no_rate_limit,
+        RateLimitDisplayPhase::AfterSync,
+    )
+    .await;
 }
 
 /// The type of sync operation being performed.
@@ -912,15 +996,21 @@ async fn load_token_credential(
 ) -> Result<Option<LocatedCredential>, Box<dyn std::error::Error>> {
     match credentials::load_credential(instance, config, db).await {
         Ok(located) => Ok(located),
-        Err(err) => {
+        Err(err)
+            if matches!(
+                config.credential_store(),
+                crate::config::CredentialStore::Auto
+            ) =>
+        {
             tracing::warn!(
                 instance = %instance.name,
                 host = %instance.host,
                 error = %err,
-                "credential lookup failed; continuing with environment and netrc fallbacks"
+                "auto credential lookup failed; continuing with netrc fallback"
             );
             Ok(None)
         }
+        Err(err) => Err(err),
     }
 }
 
@@ -1733,6 +1823,48 @@ mod tests {
 
     #[cfg(feature = "github")]
     #[tokio::test]
+    async fn get_token_for_instance_propagates_backend_errors_before_netrc_fallback() {
+        let _guard = env_lock().lock().await;
+        let dir =
+            std::env::temp_dir().join(format!("curator-netrc-backend-error-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        std::fs::write(
+            dir.join(".netrc"),
+            "machine github.com login octo password ghp_from_netrc\n",
+        )
+        .expect("netrc should be written");
+
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+
+        let mut config = Config::default();
+        config.auth.credential_store = crate::config::CredentialStore::Db;
+
+        let instance = sample_instance("github", PlatformType::GitHub, "github.com");
+        let err = get_token_for_instance_with_db(&instance, &config, None)
+            .await
+            .expect_err("db-backed credential lookup without a database should fail");
+
+        match original_home {
+            Some(home) => unsafe {
+                std::env::set_var("HOME", home);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert!(
+            err.to_string()
+                .contains("database backend requires a database connection"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "github")]
+    #[tokio::test]
     async fn get_token_for_instance_prefers_instance_env_override() {
         let _guard = env_lock().lock().await;
         let instance = sample_instance("github-work", PlatformType::GitHub, "github.example.com");
@@ -2115,6 +2247,30 @@ mod tests {
         runner.print_single_result("starred", &persisted_result, SyncKind::Namespace);
         runner.print_multi_result(1, &persisted_result, SyncKind::User);
         runner.print_starred_result(&persisted_result, true);
+    }
+
+    #[tokio::test]
+    async fn display_initial_rate_limit_skips_fetch_when_disabled() {
+        let client = FakeRateLimitClient::new(RateLimitBehavior::Ok);
+
+        display_initial_rate_limit(&client, false, true).await;
+
+        assert_eq!(client.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn display_initial_rate_limit_fetches_for_success_error_and_timeout_results() {
+        let ok_client = FakeRateLimitClient::new(RateLimitBehavior::Ok);
+        display_initial_rate_limit(&ok_client, false, false).await;
+        assert_eq!(ok_client.calls(), 1);
+
+        let err_client = FakeRateLimitClient::new(RateLimitBehavior::Err);
+        display_initial_rate_limit(&err_client, false, false).await;
+        assert_eq!(err_client.calls(), 1);
+
+        let slow_client = FakeRateLimitClient::new(RateLimitBehavior::Never);
+        display_initial_rate_limit(&slow_client, false, false).await;
+        assert_eq!(slow_client.calls(), 1);
     }
 
     #[tokio::test]

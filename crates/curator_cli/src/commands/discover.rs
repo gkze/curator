@@ -19,8 +19,10 @@ use curator::{
 
 use crate::CommonSyncOptions;
 use crate::DiscoverOptions;
+#[cfg(test)]
+use crate::commands::shared::active_within_duration;
 use crate::commands::shared::{
-    ResolvedCommonSyncOptions, SyncKind, SyncRunner, active_within_duration, build_rate_limiter,
+    ResolvedCommonSyncOptions, SyncKind, SyncRunner, build_rate_limiter, build_sync_options,
     display_final_rate_limit, get_token_for_instance_with_db, resolve_common_sync_options,
 };
 use crate::config::Config;
@@ -310,15 +312,16 @@ fn build_discovery_sync_options(
     concurrency: usize,
     strategy: curator::sync::SyncStrategy,
 ) -> Result<SyncOptions, Box<dyn std::error::Error>> {
-    Ok(SyncOptions {
-        active_within: active_within_duration(active_within_days)?,
+    build_sync_options(
+        active_within_days,
         star,
         dry_run,
-        concurrency: concurrency.max(1),
-        platform_options: PlatformOptions::default(),
-        prune: false,
+        concurrency,
+        PlatformOptions::default(),
+        false,
         strategy,
-    })
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err })
 }
 
 async fn run_discovery_sync_for_client<C: curator::PlatformClient + Clone + 'static>(

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use clap::Subcommand;
-use console::{Term, style};
+use console::Term;
 use sea_orm::{DatabaseConnection, EntityTrait, QueryOrder};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -21,10 +21,12 @@ use curator::{
 
 use crate::CommonSyncOptions;
 use crate::StarredSyncOptions;
+#[cfg(test)]
+use crate::commands::shared::active_within_duration;
 use crate::commands::shared::{
-    SyncKind, SyncRunner, active_within_duration, build_rate_limiter, display_final_rate_limit,
-    find_instance_by_name, get_token_for_instance_with_db, resolve_common_sync_options,
-    resolve_starred_sync_options,
+    SyncKind, SyncRunner, build_rate_limiter, build_sync_options, display_final_rate_limit,
+    display_initial_rate_limit, find_instance_by_name, get_token_for_instance_with_db,
+    resolve_common_sync_options, resolve_starred_sync_options,
 };
 use crate::config::Config;
 use crate::shutdown::SHUTDOWN_FLAG;
@@ -257,17 +259,17 @@ fn build_namespace_sync_options(
     no_subgroups: bool,
     strategy: SyncStrategy,
 ) -> Result<SyncOptions, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(SyncOptions {
-        active_within: active_within_duration(active_within_days)?,
+    build_sync_options(
+        active_within_days,
         star,
         dry_run,
-        concurrency: concurrency.max(1),
-        platform_options: PlatformOptions {
+        concurrency,
+        PlatformOptions {
             include_subgroups: !no_subgroups,
         },
-        prune: false,
+        false,
         strategy,
-    })
+    )
 }
 
 fn build_user_sync_options(
@@ -277,29 +279,29 @@ fn build_user_sync_options(
     dry_run: bool,
     strategy: SyncStrategy,
 ) -> Result<SyncOptions, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(SyncOptions {
-        active_within: active_within_duration(active_within_days)?,
+    build_sync_options(
+        active_within_days,
         star,
         dry_run,
-        concurrency: concurrency.max(1),
-        platform_options: PlatformOptions::default(),
-        prune: false,
+        concurrency,
+        PlatformOptions::default(),
+        false,
         strategy,
-    })
+    )
 }
 
 fn build_starred_sync_options(
     settings: ResolvedStarredSyncSettings,
 ) -> Result<SyncOptions, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(SyncOptions {
-        active_within: active_within_duration(settings.active_within_days)?,
-        star: false,
-        dry_run: settings.dry_run,
-        concurrency: settings.concurrency.max(1),
-        platform_options: PlatformOptions::default(),
-        prune: settings.prune,
-        strategy: SyncStrategy::Full,
-    })
+    build_sync_options(
+        settings.active_within_days,
+        false,
+        settings.dry_run,
+        settings.concurrency,
+        PlatformOptions::default(),
+        settings.prune,
+        SyncStrategy::Full,
+    )
 }
 
 fn stars_all_parallelism(requested_concurrency: usize, instance_count: usize) -> usize {
@@ -576,7 +578,7 @@ async fn prepare_sync_execution(
     let client: Arc<dyn curator::PlatformClient> =
         Arc::from(create_client(instance, token, rate_limiter).await?);
 
-    display_rate_limit(&client, is_tty).await;
+    display_initial_rate_limit(&client, is_tty, no_rate_limit).await;
 
     Ok(PreparedSyncExecution {
         runner,
@@ -626,36 +628,6 @@ async fn sync_stars_for_instance_with_token(
     .await?;
 
     Ok(())
-}
-
-async fn display_rate_limit<C: curator::PlatformClient>(client: &C, is_tty: bool) {
-    match client.get_rate_limit().await {
-        Ok(rate_limit) => {
-            if is_tty {
-                println!(
-                    "Rate limit: {}/{} remaining (resets at {})\n",
-                    rate_limit.remaining, rate_limit.limit, rate_limit.reset_at
-                );
-            } else {
-                tracing::info!(
-                    remaining = rate_limit.remaining,
-                    limit = rate_limit.limit,
-                    "Rate limit status"
-                );
-            }
-        }
-        Err(e) => {
-            if is_tty {
-                println!(
-                    "{} Could not fetch rate limit: {}\n",
-                    style("⚠").yellow(),
-                    e
-                );
-            } else {
-                tracing::warn!(error = %e, "Could not fetch rate limit");
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1363,16 +1335,16 @@ mod tests {
 
     #[cfg(feature = "github")]
     #[tokio::test]
-    async fn display_rate_limit_handles_success_and_error() {
+    async fn display_initial_rate_limit_handles_success_and_error() {
         let ok_client = TestClient {
             rate_limit_error: None,
         };
-        display_rate_limit(&ok_client, false).await;
+        display_initial_rate_limit(&ok_client, false, false).await;
 
         let err_client = TestClient {
             rate_limit_error: Some("rate limit unavailable".to_string()),
         };
-        display_rate_limit(&err_client, false).await;
+        display_initial_rate_limit(&err_client, false, false).await;
     }
 
     #[tokio::test]
