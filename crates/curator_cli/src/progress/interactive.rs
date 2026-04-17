@@ -113,436 +113,582 @@ impl InteractiveReporter {
         pb
     }
 
-    pub fn handle(&self, event: SyncProgress) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ProgressState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
+    fn set_prefix(pb: &ProgressBar, prefix: &str) {
+        pb.set_prefix(format!("{prefix:12}"));
+    }
+
+    fn repo_label(owner: &str, name: &str) -> String {
+        format!("{owner}/{name}")
+    }
+
+    fn retry_after_seconds(retry_after_ms: u64) -> String {
+        let seconds = retry_after_ms / 1000;
+        let tenths = (retry_after_ms % 1000) / 100;
+        format!("{seconds}.{tenths}")
+    }
+
+    fn ensure_save_bar(&self, state: &mut ProgressState) {
+        if state.save_bar.is_none() {
+            let pb = self.create_save_bar(state);
+            Self::set_prefix(&pb, "Saving");
+            pb.set_message("Saving to database...");
+            state.save_bar = Some(pb);
+        }
+    }
+
+    fn infer_filter_total(state: &ProgressState) -> Option<usize> {
+        state
+            .fetch_bars
+            .values()
+            .find(|fetch_state| !fetch_state.done)
+            .and_then(|fetch_state| {
+                fetch_state.total_repos.or_else(|| {
+                    fetch_state
+                        .bar
+                        .length()
+                        .and_then(|pages| pages.checked_mul(100))
+                        .and_then(|repos| usize::try_from(repos).ok())
+                })
+            })
+            .or_else(|| {
+                state
+                    .fetch_bars
+                    .values()
+                    .find(|fetch_state| fetch_state.fetched > 0)
+                    .map(|fetch_state| fetch_state.fetched)
+            })
+    }
+
+    fn handle_fetch_event(&self, state: &mut ProgressState, event: SyncProgress) {
         match event {
             SyncProgress::FetchingRepos {
                 namespace,
                 total_repos,
                 expected_pages,
-            } => {
-                let pb = if let Some(pages) = expected_pages {
-                    let bar = self.multi.add(ProgressBar::new(pages as u64));
-                    bar.set_style(Self::bar_style());
-                    bar
-                } else {
-                    let bar = self.multi.add(ProgressBar::new_spinner());
-                    bar.set_style(Self::spinner_style());
-                    bar.enable_steady_tick(std::time::Duration::from_millis(100));
-                    bar
-                };
-                pb.set_prefix(format!("{:12}", namespace));
-                let msg = match total_repos {
-                    Some(total) => format!("Fetching {} repos...", total),
-                    None => "Fetching repositories...".to_string(),
-                };
-                pb.set_message(msg);
-
-                state.fetch_bars.insert(
-                    namespace,
-                    FetchState {
-                        bar: pb,
-                        total_repos,
-                        fetched: 0,
-                        matched: 0,
-                        done: false,
-                    },
-                );
-            }
-
+            } => self.handle_fetching_repos(state, namespace, total_repos, expected_pages),
             SyncProgress::FetchedPage {
                 namespace,
                 page,
                 count: _,
                 total_so_far,
                 expected_pages: _,
-            } => {
-                if let Some(fetch_state) = state.fetch_bars.get(&namespace)
-                    && !fetch_state.done
-                {
-                    if let Some(len) = fetch_state.bar.length()
-                        && page as u64 > len
-                    {
-                        fetch_state.bar.set_length(page as u64);
-                    }
-                    fetch_state.bar.set_position(page as u64);
-                    fetch_state
-                        .bar
-                        .set_message(format!("Page {} ({} repos)", page, total_so_far));
-                }
-            }
-
+            } => Self::handle_fetched_page(state, &namespace, page, total_so_far),
             SyncProgress::FetchComplete { namespace, total } => {
-                if let Some(fetch_state) = state.fetch_bars.get_mut(&namespace)
-                    && !fetch_state.done
-                {
-                    fetch_state.fetched = total;
-                    fetch_state
-                        .bar
-                        .set_message(format!("Fetched {} repos, filtering...", total));
-                }
-
-                // Convert filter spinner to progress bar in-place (preserves position in MultiProgress)
-                if let Some(ref pb) = state.filter_bar {
-                    pb.set_length(total as u64);
-                    pb.set_style(Self::bar_style());
-                    pb.disable_steady_tick();
-                }
+                Self::handle_fetch_complete(state, &namespace, total);
             }
-
             SyncProgress::FilteringByActivity { namespace, days } => {
-                if state.filter_bar.is_none() {
-                    let pb = self.create_filter_bar(&state, true);
-                    pb.set_prefix(format!("{:12}", "Filtering"));
-                    state.filter_bar = Some(pb);
-                }
-                if let Some(fetch_state) = state.fetch_bars.get(&namespace)
-                    && !fetch_state.done
-                {
-                    fetch_state
-                        .bar
-                        .set_message(format!("Filtering (last {} days)...", days));
-                }
+                self.handle_filtering_by_activity(state, &namespace, days);
             }
-
             SyncProgress::FilterComplete {
                 namespace,
                 matched,
                 total,
-            } => {
-                // Finish fetch bar
-                if let Some(fetch_state) = state.fetch_bars.get_mut(&namespace)
-                    && !fetch_state.done
-                {
-                    fetch_state.matched = matched;
-                    fetch_state.done = true;
-                    fetch_state
-                        .bar
-                        .finish_with_message(format!("✓ {} repos fetched", total));
-                }
-
-                // Finish filter bar
-                if let Some(ref pb) = state.filter_bar {
-                    pb.finish_with_message(format!("✓ {matched}/{total} active"));
-                }
-            }
-
+            } => Self::handle_filter_complete(state, &namespace, matched, total),
             SyncProgress::FilteredPage {
                 matched_so_far,
                 processed_so_far,
-            } => {
-                if state.filter_bar.is_none() {
-                    let fetch_total = state
-                        .fetch_bars
-                        .values()
-                        .find(|fs| !fs.done)
-                        .and_then(|fs| {
-                            fs.total_repos
-                                .or_else(|| fs.bar.length().map(|pages| (pages * 100) as usize))
-                        })
-                        .or_else(|| {
-                            state
-                                .fetch_bars
-                                .values()
-                                .find(|fs| fs.fetched > 0)
-                                .map(|fs| fs.fetched)
-                        });
+            } => self.handle_filtered_page(state, matched_so_far, processed_so_far),
+            SyncProgress::CacheHit {
+                namespace,
+                cached_count,
+            } => self.handle_cache_hit(state, namespace, cached_count),
+            other => unreachable!("unexpected fetch event: {other:?}"),
+        }
+    }
 
-                    let pb = if let Some(total) = fetch_total {
-                        // Create progress bar with known total, insert before save bar if exists
-                        let bar = ProgressBar::new(total as u64);
-                        let bar = if let Some(ref save_bar) = state.save_bar {
-                            self.multi.insert_before(save_bar, bar)
-                        } else {
-                            self.multi.add(bar)
-                        };
-                        bar.set_style(Self::bar_style());
-                        bar
-                    } else {
-                        self.create_filter_bar(&state, true)
-                    };
-                    pb.set_prefix(format!("{:12}", "Filtering"));
-                    state.filter_bar = Some(pb);
-                }
+    fn handle_fetching_repos(
+        &self,
+        state: &mut ProgressState,
+        namespace: String,
+        total_repos: Option<usize>,
+        expected_pages: Option<u32>,
+    ) {
+        let pb = if let Some(pages) = expected_pages {
+            let bar = self.multi.add(ProgressBar::new(u64::from(pages)));
+            bar.set_style(Self::bar_style());
+            bar
+        } else {
+            let bar = self.multi.add(ProgressBar::new_spinner());
+            bar.set_style(Self::spinner_style());
+            bar.enable_steady_tick(std::time::Duration::from_millis(100));
+            bar
+        };
 
-                if let Some(ref pb) = state.filter_bar {
-                    if let Some(len) = pb.length()
-                        && len > 0
-                        && processed_so_far as u64 > len
-                    {
-                        pb.set_length(processed_so_far as u64);
-                    }
-                    if pb.length().is_some() && pb.length() != Some(0) {
-                        pb.set_position(processed_so_far as u64);
-                    }
-                    pb.set_message(format!("{}/{} active", matched_so_far, processed_so_far));
-                }
+        Self::set_prefix(&pb, &namespace);
+        let message = total_repos.map_or_else(
+            || "Fetching repositories...".to_string(),
+            |total| format!("Fetching {total} repos..."),
+        );
+        pb.set_message(message);
+
+        state.fetch_bars.insert(
+            namespace,
+            FetchState {
+                bar: pb,
+                total_repos,
+                fetched: 0,
+                matched: 0,
+                done: false,
+            },
+        );
+    }
+
+    fn handle_fetched_page(
+        state: &mut ProgressState,
+        namespace: &str,
+        page: u32,
+        total_so_far: usize,
+    ) {
+        if let Some(fetch_state) = state.fetch_bars.get(namespace)
+            && !fetch_state.done
+        {
+            let page = u64::from(page);
+            if let Some(length) = fetch_state.bar.length()
+                && page > length
+            {
+                fetch_state.bar.set_length(page);
             }
+            fetch_state.bar.set_position(page);
+            fetch_state
+                .bar
+                .set_message(format!("Page {page} ({total_so_far} repos)"));
+        }
+    }
 
+    fn handle_fetch_complete(state: &mut ProgressState, namespace: &str, total: usize) {
+        if let Some(fetch_state) = state.fetch_bars.get_mut(namespace)
+            && !fetch_state.done
+        {
+            fetch_state.fetched = total;
+            fetch_state
+                .bar
+                .set_message(format!("Fetched {total} repos, filtering..."));
+        }
+
+        if let Some(pb) = state.filter_bar.as_ref() {
+            pb.set_length(total as u64);
+            pb.set_style(Self::bar_style());
+            pb.disable_steady_tick();
+        }
+    }
+
+    fn handle_filtering_by_activity(&self, state: &mut ProgressState, namespace: &str, days: i64) {
+        if state.filter_bar.is_none() {
+            let pb = self.create_filter_bar(state, true);
+            Self::set_prefix(&pb, "Filtering");
+            state.filter_bar = Some(pb);
+        }
+
+        if let Some(fetch_state) = state.fetch_bars.get(namespace)
+            && !fetch_state.done
+        {
+            fetch_state
+                .bar
+                .set_message(format!("Filtering (last {days} days)..."));
+        }
+    }
+
+    fn handle_filter_complete(
+        state: &mut ProgressState,
+        namespace: &str,
+        matched: usize,
+        total: usize,
+    ) {
+        if let Some(fetch_state) = state.fetch_bars.get_mut(namespace)
+            && !fetch_state.done
+        {
+            fetch_state.matched = matched;
+            fetch_state.done = true;
+            fetch_state
+                .bar
+                .finish_with_message(format!("✓ {total} repos fetched"));
+        }
+
+        if let Some(pb) = state.filter_bar.as_ref() {
+            pb.finish_with_message(format!("✓ {matched}/{total} active"));
+        }
+    }
+
+    fn handle_filtered_page(
+        &self,
+        state: &mut ProgressState,
+        matched_so_far: usize,
+        processed_so_far: usize,
+    ) {
+        if state.filter_bar.is_none() {
+            let pb = if let Some(total) = Self::infer_filter_total(state) {
+                let bar = ProgressBar::new(total as u64);
+                let bar = if let Some(save_bar) = state.save_bar.as_ref() {
+                    self.multi.insert_before(save_bar, bar)
+                } else {
+                    self.multi.add(bar)
+                };
+                bar.set_style(Self::bar_style());
+                bar
+            } else {
+                self.create_filter_bar(state, true)
+            };
+            Self::set_prefix(&pb, "Filtering");
+            state.filter_bar = Some(pb);
+        }
+
+        if let Some(pb) = state.filter_bar.as_ref() {
+            if let Some(length) = pb.length()
+                && length > 0
+                && processed_so_far as u64 > length
+            {
+                pb.set_length(processed_so_far as u64);
+            }
+            if matches!(pb.length(), Some(length) if length > 0) {
+                pb.set_position(processed_so_far as u64);
+            }
+            pb.set_message(format!("{matched_so_far}/{processed_so_far} active"));
+        }
+    }
+
+    fn handle_cache_hit(&self, state: &mut ProgressState, namespace: String, cached_count: usize) {
+        if let Some(fetch_state) = state.fetch_bars.get_mut(&namespace) {
+            fetch_state.total_repos = Some(cached_count);
+            fetch_state.fetched = cached_count;
+            fetch_state.matched = cached_count;
+            fetch_state.done = true;
+            fetch_state
+                .bar
+                .finish_with_message(format!("✓ {cached_count} repos (cached)"));
+        } else {
+            let pb = self.multi.add(ProgressBar::new(1));
+            pb.set_style(Self::bar_style());
+            Self::set_prefix(&pb, &namespace);
+            pb.set_position(1);
+            pb.finish_with_message(format!("✓ {cached_count} repos (cached)"));
+
+            state.fetch_bars.insert(
+                namespace,
+                FetchState {
+                    bar: pb,
+                    total_repos: Some(cached_count),
+                    fetched: cached_count,
+                    matched: cached_count,
+                    done: true,
+                },
+            );
+        }
+    }
+
+    fn handle_star_event(&self, state: &mut ProgressState, event: SyncProgress) {
+        match event {
             SyncProgress::StarringRepos {
                 count,
                 concurrency: _,
                 dry_run,
-            } => {
-                state.star_total += count;
-
-                if state.star_bar.is_none() {
-                    let pb = self.multi.add(ProgressBar::new(state.star_total as u64));
-                    pb.set_style(Self::bar_style());
-                    pb.set_prefix(format!("{:12}", "Starring"));
-                    let action = if dry_run { "Checking" } else { "Starring" };
-                    pb.set_message(format!("{}...", action));
-                    state.star_bar = Some(pb);
-                } else if let Some(ref pb) = state.star_bar {
-                    pb.set_length(state.star_total as u64);
-                }
-            }
-
+            } => self.handle_starring_repos(state, count, dry_run),
             SyncProgress::StarredRepo {
                 owner,
                 name,
                 already_starred,
-            } => {
-                if let Some(ref pb) = state.star_bar {
-                    pb.inc(1);
-                    let symbol = if already_starred { "·" } else { "★" };
-                    pb.set_message(format!("{} {}/{}", symbol, owner, name));
-                }
-            }
-
+            } => Self::handle_starred_repo(state, &owner, &name, already_starred),
             SyncProgress::StarError { owner, name, error } => {
-                if let Some(ref pb) = state.star_bar {
-                    pb.inc(1);
-                    pb.set_message(format!("✗ {}/{}: {}", owner, name, error));
-                }
+                Self::handle_star_error(state, &owner, &name, &error);
             }
-
             SyncProgress::StarringComplete {
                 starred,
                 already_starred,
                 errors,
-            } => {
-                if let Some(ref pb) = state.star_bar {
-                    let msg = if errors > 0 {
-                        format!(
-                            "✓ {} starred, {} skipped, {} errors",
-                            starred, already_starred, errors
-                        )
-                    } else {
-                        format!("✓ {} starred, {} skipped", starred, already_starred)
-                    };
-                    pb.finish_with_message(msg);
-                }
-            }
-
-            SyncProgress::ConvertingModels => {}
-
-            SyncProgress::ModelsReady { count } => {
-                state.save_total = count;
-
-                if let Some(ref pb) = state.save_bar {
-                    if count > 0 {
-                        pb.set_length(count as u64);
-                        pb.set_style(Self::bar_style());
-                        pb.disable_steady_tick();
-
-                        let pos = pb.position();
-                        if pos > 0 {
-                            pb.set_message(format!("{pos}/{count} saved"));
-                        } else {
-                            pb.set_message("Saving to database...");
-                        }
-                    }
-                } else if count > 0 {
-                    let pb = self.create_save_bar(&state);
-                    pb.set_prefix(format!("{:12}", "Saving"));
-                    pb.set_message("Saving to database...");
-                    state.save_bar = Some(pb);
-                }
-            }
-
-            SyncProgress::PersistingBatch { count, final_batch } => {
-                // Create save bar on first batch if not exists
-                if state.save_bar.is_none() {
-                    let pb = self.create_save_bar(&state);
-                    pb.set_prefix(format!("{:12}", "Saving"));
-                    pb.set_message("Saving to database...");
-                    state.save_bar = Some(pb);
-                }
-
-                if let Some(ref pb) = state.save_bar {
-                    let message = if final_batch {
-                        format!("Flushing final batch ({} repos)...", count)
-                    } else {
-                        format!("Flushing batch ({} repos)...", count)
-                    };
-                    pb.set_message(message);
-                }
-            }
-
-            SyncProgress::Persisted { owner, name } => {
-                // Create save bar on first persist if not exists
-                if state.save_bar.is_none() {
-                    let pb = self.create_save_bar(&state);
-                    pb.set_prefix(format!("{:12}", "Saving"));
-                    pb.set_message("Saving to database...");
-                    state.save_bar = Some(pb);
-                }
-
-                if let Some(ref pb) = state.save_bar {
-                    pb.inc(1);
-
-                    if state.save_total > 0 {
-                        if pb.length() != Some(state.save_total as u64) {
-                            pb.set_length(state.save_total as u64);
-                            pb.set_style(Self::bar_style());
-                            pb.disable_steady_tick();
-                        }
-                        pb.set_message(format!("{owner}/{name}"));
-                    } else {
-                        pb.set_message(format!("saved - {owner}/{name}"));
-                    }
-                }
-            }
-
-            SyncProgress::PersistError { owner, name, error } => {
-                if let Some(ref pb) = state.save_bar {
-                    pb.inc(1);
-                    pb.set_message(format!("✗ {}/{}: {}", owner, name, error));
-                }
-            }
-
-            SyncProgress::SyncingNamespaces { count: _ } => {}
-
-            SyncProgress::SyncNamespacesComplete { successful, failed } => {
-                if let Some(ref pb) = state.save_bar {
-                    let msg = if failed > 0 {
-                        format!("✓ {} orgs done, {} failed", successful, failed)
-                    } else {
-                        format!("✓ {} orgs done", successful)
-                    };
-                    pb.finish_with_message(msg);
-                }
-            }
-
-            SyncProgress::PruningRepos { count, dry_run } => {
-                state.prune_total += count;
-
-                if state.prune_bar.is_none() {
-                    let pb = self.multi.add(ProgressBar::new(state.prune_total as u64));
-                    pb.set_style(Self::bar_style());
-                    pb.set_prefix(format!("{:12}", "Pruning"));
-                    let action = if dry_run {
-                        "Checking..."
-                    } else {
-                        "Unstarring..."
-                    };
-                    pb.set_message(action);
-                    state.prune_bar = Some(pb);
-                } else if let Some(ref pb) = state.prune_bar {
-                    pb.set_length(state.prune_total as u64);
-                }
-            }
-
-            SyncProgress::PrunedRepo { owner, name } => {
-                if let Some(ref pb) = state.prune_bar {
-                    pb.inc(1);
-                    pb.set_message(format!("- {}/{}", owner, name));
-                }
-            }
-
-            SyncProgress::PruneError { owner, name, error } => {
-                if let Some(ref pb) = state.prune_bar {
-                    pb.inc(1);
-                    pb.set_message(format!("✗ {}/{}: {}", owner, name, error));
-                }
-            }
-
-            SyncProgress::PruningComplete { pruned, errors } => {
-                if let Some(ref pb) = state.prune_bar {
-                    let msg = if errors > 0 {
-                        format!("✓ {} pruned, {} errors", pruned, errors)
-                    } else {
-                        format!("✓ {} pruned", pruned)
-                    };
-                    pb.finish_with_message(msg);
-                }
-            }
-
-            SyncProgress::Warning { message } => {
-                drop(state);
-                self.multi.println(format!("⚠ {}", message)).ok();
-            }
-
+            } => Self::handle_starring_complete(state, starred, already_starred, errors),
             SyncProgress::RateLimitBackoff {
                 owner,
                 name,
                 retry_after_ms,
                 attempt,
-            } => {
-                if let Some(ref pb) = state.star_bar {
-                    pb.set_message(format!(
-                        "⏳ {}/{} rate limited, retry {} in {:.1}s",
-                        owner,
-                        name,
-                        attempt,
-                        retry_after_ms as f64 / 1000.0
-                    ));
+            } => Self::handle_rate_limit_backoff(state, &owner, &name, retry_after_ms, attempt),
+            other => unreachable!("unexpected star event: {other:?}"),
+        }
+    }
+
+    fn handle_starring_repos(&self, state: &mut ProgressState, count: usize, dry_run: bool) {
+        state.star_total += count;
+
+        if state.star_bar.is_none() {
+            let pb = self.multi.add(ProgressBar::new(state.star_total as u64));
+            pb.set_style(Self::bar_style());
+            Self::set_prefix(&pb, "Starring");
+            let action = if dry_run { "Checking" } else { "Starring" };
+            pb.set_message(format!("{action}..."));
+            state.star_bar = Some(pb);
+        } else if let Some(pb) = state.star_bar.as_ref() {
+            pb.set_length(state.star_total as u64);
+        }
+    }
+
+    fn handle_starred_repo(
+        state: &mut ProgressState,
+        owner: &str,
+        name: &str,
+        already_starred: bool,
+    ) {
+        if let Some(pb) = state.star_bar.as_ref() {
+            pb.inc(1);
+            let symbol = if already_starred { "·" } else { "★" };
+            pb.set_message(format!("{symbol} {owner}/{name}"));
+        }
+    }
+
+    fn handle_star_error(state: &mut ProgressState, owner: &str, name: &str, error: &str) {
+        if let Some(pb) = state.star_bar.as_ref() {
+            pb.inc(1);
+            pb.set_message(format!("✗ {owner}/{name}: {error}"));
+        }
+    }
+
+    fn handle_starring_complete(
+        state: &mut ProgressState,
+        starred: usize,
+        already_starred: usize,
+        errors: usize,
+    ) {
+        if let Some(pb) = state.star_bar.as_ref() {
+            let message = if errors > 0 {
+                format!("✓ {starred} starred, {already_starred} skipped, {errors} errors")
+            } else {
+                format!("✓ {starred} starred, {already_starred} skipped")
+            };
+            pb.finish_with_message(message);
+        }
+    }
+
+    fn handle_rate_limit_backoff(
+        state: &mut ProgressState,
+        owner: &str,
+        name: &str,
+        retry_after_ms: u64,
+        attempt: u32,
+    ) {
+        if let Some(pb) = state.star_bar.as_ref() {
+            let seconds = Self::retry_after_seconds(retry_after_ms);
+            pb.set_message(format!(
+                "⏳ {owner}/{name} rate limited, retry {attempt} in {seconds}s"
+            ));
+        }
+    }
+
+    fn handle_persistence_event(&self, state: &mut ProgressState, event: SyncProgress) {
+        match event {
+            SyncProgress::ConvertingModels | SyncProgress::SyncingNamespaces { count: _ } => {}
+            SyncProgress::ModelsReady { count } => self.handle_models_ready(state, count),
+            SyncProgress::PersistingBatch { count, final_batch } => {
+                self.handle_persisting_batch(state, count, final_batch);
+            }
+            SyncProgress::Persisted { owner, name } => self.handle_persisted(state, &owner, &name),
+            SyncProgress::PersistError { owner, name, error } => {
+                Self::handle_persist_error(state, &owner, &name, &error);
+            }
+            SyncProgress::SyncNamespacesComplete { successful, failed } => {
+                Self::handle_sync_namespaces_complete(state, successful, failed);
+            }
+            other => unreachable!("unexpected persistence event: {other:?}"),
+        }
+    }
+
+    fn handle_models_ready(&self, state: &mut ProgressState, count: usize) {
+        state.save_total = count;
+
+        if let Some(pb) = state.save_bar.as_ref() {
+            if count > 0 {
+                pb.set_length(count as u64);
+                pb.set_style(Self::bar_style());
+                pb.disable_steady_tick();
+
+                let position = pb.position();
+                if position > 0 {
+                    pb.set_message(format!("{position}/{count} saved"));
+                } else {
+                    pb.set_message("Saving to database...");
                 }
             }
+        } else if count > 0 {
+            self.ensure_save_bar(state);
+        }
+    }
 
+    fn handle_persisting_batch(&self, state: &mut ProgressState, count: usize, final_batch: bool) {
+        self.ensure_save_bar(state);
+
+        if let Some(pb) = state.save_bar.as_ref() {
+            let message = if final_batch {
+                format!("Flushing final batch ({count} repos)...")
+            } else {
+                format!("Flushing batch ({count} repos)...")
+            };
+            pb.set_message(message);
+        }
+    }
+
+    fn handle_persisted(&self, state: &mut ProgressState, owner: &str, name: &str) {
+        self.ensure_save_bar(state);
+
+        if let Some(pb) = state.save_bar.as_ref() {
+            pb.inc(1);
+
+            if state.save_total > 0 {
+                if pb.length() != Some(state.save_total as u64) {
+                    pb.set_length(state.save_total as u64);
+                    pb.set_style(Self::bar_style());
+                    pb.disable_steady_tick();
+                }
+                pb.set_message(Self::repo_label(owner, name));
+            } else {
+                pb.set_message(format!("saved - {owner}/{name}"));
+            }
+        }
+    }
+
+    fn handle_persist_error(state: &mut ProgressState, owner: &str, name: &str, error: &str) {
+        if let Some(pb) = state.save_bar.as_ref() {
+            pb.inc(1);
+            pb.set_message(format!("✗ {owner}/{name}: {error}"));
+        }
+    }
+
+    fn handle_sync_namespaces_complete(
+        state: &mut ProgressState,
+        successful: usize,
+        failed: usize,
+    ) {
+        if let Some(pb) = state.save_bar.as_ref() {
+            let message = if failed > 0 {
+                format!("✓ {successful} orgs done, {failed} failed")
+            } else {
+                format!("✓ {successful} orgs done")
+            };
+            pb.finish_with_message(message);
+        }
+    }
+
+    fn handle_prune_event(&self, state: &mut ProgressState, event: SyncProgress) {
+        match event {
+            SyncProgress::PruningRepos { count, dry_run } => {
+                self.handle_pruning_repos(state, count, dry_run);
+            }
+            SyncProgress::PrunedRepo { owner, name } => {
+                Self::handle_pruned_repo(state, &owner, &name);
+            }
+            SyncProgress::PruneError { owner, name, error } => {
+                Self::handle_prune_error(state, &owner, &name, &error);
+            }
+            SyncProgress::PruningComplete { pruned, errors } => {
+                Self::handle_pruning_complete(state, pruned, errors);
+            }
+            other => unreachable!("unexpected prune event: {other:?}"),
+        }
+    }
+
+    fn handle_pruning_repos(&self, state: &mut ProgressState, count: usize, dry_run: bool) {
+        state.prune_total += count;
+
+        if state.prune_bar.is_none() {
+            let pb = self.multi.add(ProgressBar::new(state.prune_total as u64));
+            pb.set_style(Self::bar_style());
+            Self::set_prefix(&pb, "Pruning");
+            let action = if dry_run {
+                "Checking..."
+            } else {
+                "Unstarring..."
+            };
+            pb.set_message(action);
+            state.prune_bar = Some(pb);
+        } else if let Some(pb) = state.prune_bar.as_ref() {
+            pb.set_length(state.prune_total as u64);
+        }
+    }
+
+    fn handle_pruned_repo(state: &mut ProgressState, owner: &str, name: &str) {
+        if let Some(pb) = state.prune_bar.as_ref() {
+            pb.inc(1);
+            pb.set_message(format!("- {owner}/{name}"));
+        }
+    }
+
+    fn handle_prune_error(state: &mut ProgressState, owner: &str, name: &str, error: &str) {
+        if let Some(pb) = state.prune_bar.as_ref() {
+            pb.inc(1);
+            pb.set_message(format!("✗ {owner}/{name}: {error}"));
+        }
+    }
+
+    fn handle_pruning_complete(state: &mut ProgressState, pruned: usize, errors: usize) {
+        if let Some(pb) = state.prune_bar.as_ref() {
+            let message = if errors > 0 {
+                format!("✓ {pruned} pruned, {errors} errors")
+            } else {
+                format!("✓ {pruned} pruned")
+            };
+            pb.finish_with_message(message);
+        }
+    }
+
+    fn handle_warning(&self, message: &str) {
+        self.multi.println(format!("⚠ {message}")).ok();
+    }
+
+    fn handle_page_fetch_retry(&self, page: u32, retry_after_ms: u64, attempt: u32) {
+        let seconds = Self::retry_after_seconds(retry_after_ms);
+        self.multi
+            .println(format!(
+                "⏳ page {page} rate limited, retry {attempt} in {seconds}s"
+            ))
+            .ok();
+    }
+
+    pub fn handle(&self, event: SyncProgress) {
+        match event {
+            event @ SyncProgress::FetchingRepos { .. }
+            | event @ SyncProgress::FetchedPage { .. }
+            | event @ SyncProgress::FetchComplete { .. }
+            | event @ SyncProgress::FilteringByActivity { .. }
+            | event @ SyncProgress::FilterComplete { .. }
+            | event @ SyncProgress::FilteredPage { .. }
+            | event @ SyncProgress::CacheHit { .. } => {
+                let mut state = self.lock_state();
+                self.handle_fetch_event(&mut state, event);
+            }
+            event @ SyncProgress::StarringRepos { .. }
+            | event @ SyncProgress::StarredRepo { .. }
+            | event @ SyncProgress::StarError { .. }
+            | event @ SyncProgress::StarringComplete { .. }
+            | event @ SyncProgress::RateLimitBackoff { .. } => {
+                let mut state = self.lock_state();
+                self.handle_star_event(&mut state, event);
+            }
+            event @ SyncProgress::ConvertingModels
+            | event @ SyncProgress::ModelsReady { .. }
+            | event @ SyncProgress::PersistingBatch { .. }
+            | event @ SyncProgress::Persisted { .. }
+            | event @ SyncProgress::PersistError { .. }
+            | event @ SyncProgress::SyncingNamespaces { .. }
+            | event @ SyncProgress::SyncNamespacesComplete { .. } => {
+                let mut state = self.lock_state();
+                self.handle_persistence_event(&mut state, event);
+            }
+            event @ SyncProgress::PruningRepos { .. }
+            | event @ SyncProgress::PrunedRepo { .. }
+            | event @ SyncProgress::PruneError { .. }
+            | event @ SyncProgress::PruningComplete { .. } => {
+                let mut state = self.lock_state();
+                self.handle_prune_event(&mut state, event);
+            }
+            SyncProgress::Warning { message } => self.handle_warning(&message),
             SyncProgress::PageFetchRetry {
                 page,
                 retry_after_ms,
                 attempt,
-            } => {
-                drop(state);
-                self.multi
-                    .println(format!(
-                        "⏳ page {} rate limited, retry {} in {:.1}s",
-                        page,
-                        attempt,
-                        retry_after_ms as f64 / 1000.0
-                    ))
-                    .ok();
-            }
-
-            SyncProgress::CacheHit {
-                namespace,
-                cached_count,
-            } => {
-                if let Some(fetch_state) = state.fetch_bars.get_mut(&namespace) {
-                    fetch_state.total_repos = Some(cached_count);
-                    fetch_state.fetched = cached_count;
-                    fetch_state.matched = cached_count;
-                    fetch_state.done = true;
-                    fetch_state
-                        .bar
-                        .finish_with_message(format!("✓ {} repos (cached)", cached_count));
-                } else {
-                    let pb = self.multi.add(ProgressBar::new(1));
-                    pb.set_style(Self::bar_style());
-                    pb.set_prefix(format!("{:12}", namespace));
-                    pb.set_position(1);
-                    pb.finish_with_message(format!("✓ {} repos (cached)", cached_count));
-
-                    state.fetch_bars.insert(
-                        namespace,
-                        FetchState {
-                            bar: pb,
-                            total_repos: Some(cached_count),
-                            fetched: cached_count,
-                            matched: cached_count,
-                            done: true,
-                        },
-                    );
-                }
-            }
-
-            other => {
-                tracing::debug!(event = ?other, "Unhandled sync progress event");
-            }
+            } => self.handle_page_fetch_retry(page, retry_after_ms, attempt),
+            other => tracing::debug!(event = ?other, "Unhandled sync progress event"),
         }
     }
 
@@ -552,7 +698,7 @@ impl InteractiveReporter {
     }
 
     pub fn finish(&self) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.lock_state();
         for fetch_state in state.fetch_bars.values() {
             if !fetch_state.bar.is_finished() {
                 fetch_state.bar.finish();
