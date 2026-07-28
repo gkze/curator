@@ -27,6 +27,14 @@ pub struct RepoSyncInfo {
     pub synced_at: DateTime<Utc>,
 }
 
+/// Stored repository identity used internally to reconcile platform renames.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct RepositoryIdentity {
+    pub(crate) platform_id: i64,
+    pub(crate) owner: String,
+    pub(crate) name: String,
+}
+
 /// Pagination parameters for list queries.
 #[derive(Debug, Clone)]
 pub struct Pagination {
@@ -47,6 +55,7 @@ impl Pagination {
 }
 
 const MIN_PER_PAGE: u64 = 1;
+const IDENTITY_QUERY_CHUNK_SIZE: usize = 500;
 
 impl Default for Pagination {
     fn default() -> Self {
@@ -265,6 +274,79 @@ pub async fn get_sync_info_by_instance_and_owner(
         .collect())
 }
 
+/// Load stored owner/name identities for a set of platform repository IDs.
+///
+/// Platform IDs are queried directly so owner transfers and nested GitLab
+/// namespaces do not depend on parsing or guessing the previous owner.
+pub(crate) async fn get_identities_by_platform_ids(
+    db: &DatabaseConnection,
+    instance_id: Uuid,
+    platform_ids: &[i64],
+) -> Result<Vec<RepositoryIdentity>> {
+    if platform_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut unique_ids = platform_ids.to_vec();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+
+    let mut identities = Vec::new();
+    for chunk in unique_ids.chunks(IDENTITY_QUERY_CHUNK_SIZE) {
+        let rows = CodeRepository::find()
+            .filter(Column::InstanceId.eq(instance_id))
+            .filter(Column::PlatformId.is_in(chunk.iter().copied()))
+            .select_only()
+            .column(Column::PlatformId)
+            .column(Column::Owner)
+            .column(Column::Name)
+            .into_tuple::<(i64, String, String)>()
+            .all(db)
+            .await
+            .map_err(RepositoryError::from)?;
+
+        identities.extend(
+            rows.into_iter()
+                .map(|(platform_id, owner, name)| RepositoryIdentity {
+                    platform_id,
+                    owner,
+                    name,
+                }),
+        );
+    }
+
+    Ok(identities)
+}
+
+/// Load all stored owner/name identities for an instance.
+///
+/// Starred repository sync receives platform IDs incrementally, so it uses
+/// this lightweight projection once before starting its processor task.
+pub(crate) async fn get_identities_by_instance(
+    db: &DatabaseConnection,
+    instance_id: Uuid,
+) -> Result<Vec<RepositoryIdentity>> {
+    CodeRepository::find()
+        .filter(Column::InstanceId.eq(instance_id))
+        .select_only()
+        .column(Column::PlatformId)
+        .column(Column::Owner)
+        .column(Column::Name)
+        .into_tuple::<(i64, String, String)>()
+        .all(db)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(platform_id, owner, name)| RepositoryIdentity {
+                    platform_id,
+                    owner,
+                    name,
+                })
+                .collect()
+        })
+        .map_err(RepositoryError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -311,6 +393,20 @@ mod tests {
         row.insert(
             "4".to_string(),
             Value::ChronoDateTimeWithTimeZone(Some(Box::new(synced_at))),
+        );
+        row
+    }
+
+    fn identity_row(platform_id: i64, owner: &str, name: &str) -> BTreeMap<String, Value> {
+        let mut row = BTreeMap::new();
+        row.insert("0".to_string(), Value::BigInt(Some(platform_id)));
+        row.insert(
+            "1".to_string(),
+            Value::String(Some(Box::new(owner.to_string()))),
+        );
+        row.insert(
+            "2".to_string(),
+            Value::String(Some(Box::new(name.to_string()))),
         );
         row
     }
@@ -488,6 +584,44 @@ mod tests {
         assert_eq!(info[0].name, "repo");
         assert!(info[0].updated_at.is_none());
         assert!(info[0].pushed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_queries_map_rows_and_batch_large_id_sets() {
+        let instance_id = Uuid::new_v4();
+        let platform_ids: Vec<i64> = (0..=IDENTITY_QUERY_CHUNK_SIZE as i64).collect();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([
+                vec![identity_row(1, "group/subgroup", "one")],
+                vec![identity_row(500, "new-owner", "two")],
+                vec![
+                    identity_row(1, "group/subgroup", "one"),
+                    identity_row(500, "new-owner", "two"),
+                ],
+            ])
+            .into_connection();
+
+        let selected = get_identities_by_platform_ids(&db, instance_id, &platform_ids)
+            .await
+            .expect("chunked identity lookup should succeed");
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].owner, "group/subgroup");
+        assert_eq!(selected[1].name, "two");
+
+        let all = get_identities_by_instance(&db, instance_id)
+            .await
+            .expect("instance identity lookup should succeed");
+        assert_eq!(all, selected);
+    }
+
+    #[tokio::test]
+    async fn identity_query_skips_database_for_empty_id_set() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite).into_connection();
+        let identities = get_identities_by_platform_ids(&db, Uuid::new_v4(), &[])
+            .await
+            .expect("empty identity lookup should succeed");
+        assert!(identities.is_empty());
+        assert!(db.into_transaction_log().is_empty());
     }
 }
 

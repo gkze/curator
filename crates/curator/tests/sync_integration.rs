@@ -13,8 +13,8 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -23,10 +23,12 @@ use curator::entity::code_repository::ActiveModel;
 use curator::entity::code_visibility::CodeVisibility;
 use curator::entity::instance::{ActiveModel as InstanceActiveModel, Entity as Instance};
 use curator::entity::platform_type::PlatformType;
+use curator::repository;
 use curator::sync::{
-    PersistTaskResult, SyncProgress, await_persist_task, create_model_channel, spawn_persist_task,
+    PERSIST_BATCH_SIZE, PersistTaskResult, SyncProgress, await_persist_task, create_model_channel,
+    spawn_persist_task,
 };
-use sea_orm::{EntityTrait, Set};
+use sea_orm::{ConnectionTrait, EntityTrait, Set};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -174,6 +176,409 @@ async fn test_persist_task_completes_immediately_when_empty() {
 
     let persist_result = result.unwrap();
     assert_eq!(persist_result.saved_count, 0);
+}
+
+#[tokio::test]
+async fn test_persist_task_preserves_repository_id_across_rename_batches() {
+    let db = Arc::new(setup_test_db().await);
+    let instance_id = test_instance_id();
+
+    let mut original_alchemy = create_test_model("alchemy-run", "alchemy");
+    original_alchemy.platform_id = Set(917_974_798);
+    let mut original_alchemy_effect = create_test_model("alchemy-run", "alchemy-effect");
+    original_alchemy_effect.platform_id = Set(1_081_394_458);
+    repository::bulk_upsert(&db, vec![original_alchemy, original_alchemy_effect])
+        .await
+        .unwrap();
+
+    let original_alchemy_id = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    let (tx, rx) = mpsc::channel::<ActiveModel>(PERSIST_BATCH_SIZE + 1);
+    let (handle, _counter) = spawn_persist_task(Arc::clone(&db), rx, None, None);
+
+    // Fill the first persistence batch with the successor before sending the
+    // displaced repository in the next batch.
+    let mut renamed_alchemy_effect = create_test_model("alchemy-run", "alchemy");
+    renamed_alchemy_effect.platform_id = Set(1_081_394_458);
+    tx.send(renamed_alchemy_effect).await.unwrap();
+    for i in 1..PERSIST_BATCH_SIZE {
+        let mut filler = create_test_model("filler", &format!("repo-{i}"));
+        filler.platform_id = Set(2_000_000_000 + i as i64);
+        tx.send(filler).await.unwrap();
+    }
+
+    let mut renamed_alchemy = create_test_model("alchemy-run", "alchemy-async");
+    renamed_alchemy.platform_id = Set(917_974_798);
+    tx.send(renamed_alchemy).await.unwrap();
+    drop(tx);
+
+    let result = await_persist_task(handle).await;
+    assert!(!result.has_errors());
+
+    let renamed_alchemy = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(renamed_alchemy.id, original_alchemy_id);
+    assert_eq!(renamed_alchemy.name, "alchemy-async");
+}
+
+#[tokio::test]
+async fn test_failed_final_rename_batch_rolls_back_without_losing_existing_rows() {
+    let db = Arc::new(setup_test_db().await);
+    let instance_id = test_instance_id();
+
+    let mut original_alchemy = create_test_model("alchemy-run", "alchemy");
+    original_alchemy.platform_id = Set(917_974_798);
+    let mut original_alchemy_effect = create_test_model("alchemy-run", "alchemy-effect");
+    original_alchemy_effect.platform_id = Set(1_081_394_458);
+    repository::bulk_upsert(&db, vec![original_alchemy, original_alchemy_effect])
+        .await
+        .unwrap();
+
+    let original_alchemy = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_alchemy_effect = repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+        .await
+        .unwrap()
+        .unwrap();
+
+    db.execute_unprepared(
+        "CREATE TRIGGER fail_alchemy_async \
+         BEFORE UPDATE ON code_repositories \
+         WHEN NEW.name = 'alchemy-async' \
+         BEGIN SELECT RAISE(FAIL, 'forced rename failure'); END",
+    )
+    .await
+    .unwrap();
+
+    let (tx, rx) = mpsc::channel::<ActiveModel>(PERSIST_BATCH_SIZE + 1);
+    let (handle, _counter) = spawn_persist_task(Arc::clone(&db), rx, None, None);
+
+    let mut renamed_alchemy_effect = create_test_model("alchemy-run", "alchemy");
+    renamed_alchemy_effect.platform_id = Set(1_081_394_458);
+    tx.send(renamed_alchemy_effect).await.unwrap();
+    for i in 1..PERSIST_BATCH_SIZE {
+        let mut filler = create_test_model("filler", &format!("rollback-{i}"));
+        filler.platform_id = Set(3_000_000_000 + i as i64);
+        tx.send(filler).await.unwrap();
+    }
+
+    let mut renamed_alchemy = create_test_model("alchemy-run", "alchemy-async");
+    renamed_alchemy.platform_id = Set(917_974_798);
+    tx.send(renamed_alchemy).await.unwrap();
+    drop(tx);
+
+    let result = await_persist_task(handle).await;
+    assert!(result.has_errors());
+    assert_eq!(result.errors.len(), 2);
+
+    let alchemy = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    let alchemy_effect = repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alchemy.id, original_alchemy.id);
+    assert_eq!(alchemy.name, "alchemy");
+    assert_eq!(alchemy_effect.id, original_alchemy_effect.id);
+    assert_eq!(alchemy_effect.name, "alchemy-effect");
+
+    let repos = repository::find_all_by_instance(&db, instance_id)
+        .await
+        .unwrap();
+    assert!(
+        repos
+            .iter()
+            .all(|repo| !repo.owner.starts_with("__curator_reconcile__/"))
+    );
+}
+
+#[tokio::test]
+async fn test_aborted_persist_task_leaves_deferred_rename_rows_untouched() {
+    let db = Arc::new(setup_test_db().await);
+    let instance_id = test_instance_id();
+
+    let mut original_alchemy = create_test_model("alchemy-run", "alchemy");
+    original_alchemy.platform_id = Set(917_974_798);
+    let mut original_alchemy_effect = create_test_model("alchemy-run", "alchemy-effect");
+    original_alchemy_effect.platform_id = Set(1_081_394_458);
+    repository::bulk_upsert(&db, vec![original_alchemy, original_alchemy_effect])
+        .await
+        .unwrap();
+
+    let original_alchemy = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_alchemy_effect = repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel::<ActiveModel>(PERSIST_BATCH_SIZE);
+    let (handle, saved_counter) = spawn_persist_task(Arc::clone(&db), rx, None, None);
+
+    let mut renamed_alchemy_effect = create_test_model("alchemy-run", "alchemy");
+    renamed_alchemy_effect.platform_id = Set(1_081_394_458);
+    tx.send(renamed_alchemy_effect).await.unwrap();
+    for i in 1..PERSIST_BATCH_SIZE {
+        let mut filler = create_test_model("filler", &format!("abort-{i}"));
+        filler.platform_id = Set(4_000_000_000 + i as i64);
+        tx.send(filler).await.unwrap();
+    }
+
+    tokio::time::timeout(FAST_TIMEOUT, async {
+        while saved_counter.load(Ordering::Relaxed) < PERSIST_BATCH_SIZE - 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ready rows should persist before cancellation");
+
+    handle.abort();
+    drop(tx);
+    let result = await_persist_task(handle).await;
+    assert_eq!(result.panic_info.as_deref(), Some("Task was cancelled"));
+
+    let alchemy = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    let alchemy_effect = repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alchemy.id, original_alchemy.id);
+    assert_eq!(alchemy.name, "alchemy");
+    assert_eq!(alchemy_effect.id, original_alchemy_effect.id);
+    assert_eq!(alchemy_effect.name, "alchemy-effect");
+
+    let repos = repository::find_all_by_instance(&db, instance_id)
+        .await
+        .unwrap();
+    assert!(
+        repos
+            .iter()
+            .all(|repo| !repo.owner.starts_with("__curator_reconcile__/"))
+    );
+}
+
+#[tokio::test]
+async fn test_persist_task_preserves_rows_when_rename_input_is_incomplete() {
+    let db = Arc::new(setup_test_db().await);
+    let instance_id = test_instance_id();
+
+    let mut displaced = create_test_model("alchemy-run", "alchemy");
+    displaced.platform_id = Set(917_974_798);
+    let mut successor = create_test_model("alchemy-run", "alchemy-effect");
+    successor.platform_id = Set(1_081_394_458);
+    repository::bulk_upsert(&db, vec![displaced, successor])
+        .await
+        .unwrap();
+
+    let original_displaced = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_successor = repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel::<ActiveModel>(1);
+    let (handle, _counter) = spawn_persist_task(Arc::clone(&db), rx, None, None);
+
+    let mut renamed_successor = create_test_model("alchemy-run", "alchemy");
+    renamed_successor.platform_id = Set(1_081_394_458);
+    tx.send(renamed_successor).await.unwrap();
+    drop(tx);
+
+    let result = await_persist_task(handle).await;
+    assert!(result.has_errors());
+    assert_eq!(result.errors.len(), 1);
+    assert!(result.errors[0].2.contains("incomplete repository rename"));
+
+    let repos = repository::find_all_by_instance_and_owner(&db, instance_id, "alchemy-run")
+        .await
+        .unwrap();
+    assert_eq!(repos.len(), 2);
+    let displaced = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    let successor = repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(displaced.id, original_displaced.id);
+    assert_eq!(displaced.name, "alchemy");
+    assert_eq!(successor.id, original_successor.id);
+    assert_eq!(successor.name, "alchemy-effect");
+    assert!(
+        repos
+            .iter()
+            .all(|repo| !repo.owner.starts_with("__curator_reconcile__/"))
+    );
+}
+
+#[tokio::test]
+async fn test_known_incomplete_final_component_skips_reconciliation_backoff() {
+    let db = Arc::new(setup_test_db().await);
+
+    let mut displaced = create_test_model("alchemy-run", "alchemy");
+    displaced.platform_id = Set(917_974_798);
+    let mut successor = create_test_model("alchemy-run", "alchemy-effect");
+    successor.platform_id = Set(1_081_394_458);
+    repository::bulk_upsert(&db, vec![displaced, successor])
+        .await
+        .expect("original repositories should persist");
+
+    let mut incomplete_rename = create_test_model("alchemy-run", "alchemy");
+    incomplete_rename.platform_id = Set(1_081_394_458);
+
+    let (tx, rx) = mpsc::channel::<ActiveModel>(1);
+    let (handle, _counter) = spawn_persist_task(Arc::clone(&db), rx, None, None);
+    tx.send(incomplete_rename)
+        .await
+        .expect("incomplete rename should send");
+    drop(tx);
+
+    let result = tokio::time::timeout(Duration::from_millis(500), await_persist_task(handle))
+        .await
+        .expect("known incomplete input should not wait through reconciliation backoff");
+    assert_eq!(result.saved_count, 0);
+    assert_eq!(result.errors.len(), 1);
+    assert!(result.errors[0].2.contains("incomplete repository rename"));
+}
+
+#[tokio::test]
+async fn test_final_flush_persists_valid_rows_beside_an_incomplete_rename() {
+    let db = Arc::new(setup_test_db().await);
+    let instance_id = test_instance_id();
+
+    let mut displaced = create_test_model("alchemy-run", "alchemy");
+    displaced.platform_id = Set(917_974_798);
+    let mut successor = create_test_model("alchemy-run", "alchemy-effect");
+    successor.platform_id = Set(1_081_394_458);
+    repository::bulk_upsert(&db, vec![displaced, successor])
+        .await
+        .expect("original repositories should persist");
+
+    let mut incomplete_rename = create_test_model("alchemy-run", "alchemy");
+    incomplete_rename.platform_id = Set(1_081_394_458);
+    let mut unrelated = create_test_model("unrelated", "valid");
+    unrelated.platform_id = Set(6_000_000_000);
+
+    let (tx, rx) = mpsc::channel::<ActiveModel>(2);
+    let (handle, _counter) = spawn_persist_task(Arc::clone(&db), rx, None, None);
+    tx.send(incomplete_rename)
+        .await
+        .expect("incomplete rename should send");
+    tx.send(unrelated)
+        .await
+        .expect("unrelated repository should send");
+    drop(tx);
+
+    let result = await_persist_task(handle).await;
+    assert_eq!(result.saved_count, 1);
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(result.errors[0].0, "alchemy-run");
+    assert_eq!(result.errors[0].1, "alchemy");
+    assert!(result.errors[0].2.contains("incomplete repository rename"));
+
+    let unrelated = repository::find_by_platform_id(&db, instance_id, 6_000_000_000)
+        .await
+        .expect("unrelated lookup should succeed")
+        .expect("unrelated valid repository should persist");
+    assert_eq!(unrelated.owner, "unrelated");
+    assert_eq!(unrelated.name, "valid");
+}
+
+#[tokio::test]
+async fn test_persist_task_bounds_writes_for_many_independent_rename_pairs() {
+    const PAIR_COUNT: usize = PERSIST_BATCH_SIZE + 1;
+
+    let db = Arc::new(setup_test_db().await);
+    let mut original_models = Vec::with_capacity(PAIR_COUNT * 2);
+    let mut renamed_successor_models = Vec::with_capacity(PAIR_COUNT);
+    let mut renamed_displaced_models = Vec::with_capacity(PAIR_COUNT);
+
+    for index in 0..PAIR_COUNT {
+        let displaced_platform_id = 5_000_000_000 + (index as i64 * 2);
+        let successor_platform_id = displaced_platform_id + 1;
+
+        let mut displaced = create_test_model("bounded", &format!("old-{index}"));
+        displaced.platform_id = Set(displaced_platform_id);
+        original_models.push(displaced);
+
+        let mut successor = create_test_model("bounded", &format!("successor-{index}"));
+        successor.platform_id = Set(successor_platform_id);
+        original_models.push(successor);
+
+        let mut renamed_successor = create_test_model("bounded", &format!("old-{index}"));
+        renamed_successor.platform_id = Set(successor_platform_id);
+        renamed_successor_models.push(renamed_successor);
+
+        let mut renamed_displaced = create_test_model("bounded", &format!("renamed-{index}"));
+        renamed_displaced.platform_id = Set(displaced_platform_id);
+        renamed_displaced_models.push(renamed_displaced);
+    }
+
+    for seed_batch in original_models.chunks(100) {
+        repository::bulk_upsert(&db, seed_batch.to_vec())
+            .await
+            .expect("seed batch should persist");
+    }
+
+    let persisted_batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let callback_batch_sizes = Arc::clone(&persisted_batch_sizes);
+    let callback: Arc<curator::sync::ProgressCallback> =
+        Arc::new(Box::new(move |event: SyncProgress| {
+            if let SyncProgress::PersistingBatch { count, .. } = event {
+                callback_batch_sizes
+                    .lock()
+                    .expect("batch sizes mutex should lock")
+                    .push(count);
+            }
+        }));
+
+    let (tx, rx) = mpsc::channel::<ActiveModel>(PERSIST_BATCH_SIZE);
+    let (handle, _counter) = spawn_persist_task(Arc::clone(&db), rx, None, Some(callback));
+
+    // Successors arrive first, so they are deferred until their displaced
+    // repositories arrive in later persistence batches.
+    for model in renamed_successor_models {
+        tx.send(model).await.expect("successor should send");
+    }
+    for model in renamed_displaced_models {
+        tx.send(model).await.expect("displaced repo should send");
+    }
+    drop(tx);
+
+    let result = tokio::time::timeout(SYNC_TIMEOUT, await_persist_task(handle))
+        .await
+        .expect("persist task should not exceed the timeout");
+    assert!(!result.has_errors(), "{:?}", result.errors);
+    assert_eq!(result.saved_count, PAIR_COUNT * 2);
+
+    let persisted_batch_sizes = persisted_batch_sizes
+        .lock()
+        .expect("batch sizes mutex should lock");
+    assert!(
+        persisted_batch_sizes
+            .iter()
+            .all(|count| *count <= PERSIST_BATCH_SIZE),
+        "every database write should honor the persistence batch limit: {persisted_batch_sizes:?}"
+    );
 }
 
 // ─── Stress Tests ──────────────────────────────────────────────────────────────
