@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "curator"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "curator_cli"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "arboard",
  "async-trait",
