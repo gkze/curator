@@ -66,9 +66,10 @@ pub const CODEBERG_HOST: &str = "https://codeberg.org";
 /// Default OAuth scope for Gitea API access.
 ///
 /// - `read:user` - Read user profile
-/// - `write:repository` - Star/unstar repositories
+/// - `write:repository` - Read repository metadata through Codeberg OAuth
+/// - `write:user` - Star/unstar repositories
 /// - `read:organization` - List organization memberships
-pub const DEFAULT_SCOPE: &str = "read:user write:repository read:organization";
+pub const DEFAULT_SCOPE: &str = "read:user write:repository write:user read:organization";
 
 /// OAuth configuration for a Gitea-based platform.
 pub trait GiteaOAuth {
@@ -456,8 +457,13 @@ pub async fn authorize(
     let auth_url = build_auth_url(auth, &pkce, &state, &callback_uri);
 
     // Open browser
-    tracing::info!("Opening browser for authorization...");
-    if let Err(e) = open::that(&auth_url) {
+    tracing::info!(authorization_url = %auth_url, "Opening browser for authorization...");
+    if std::env::var_os("CURATOR_NO_OPEN").is_some() {
+        println!(
+            "\nPlease open this URL in your browser:\n\n  {}\n",
+            auth_url
+        );
+    } else if let Err(e) = open::that(&auth_url) {
         tracing::warn!("Failed to open browser automatically: {}", e);
         println!(
             "\nPlease open this URL in your browser:\n\n  {}\n",
