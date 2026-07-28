@@ -13,12 +13,14 @@ pub use bulk::{
     bulk_upsert_with_retry, delete_by_instance, delete_by_owner_name, delete_many, insert_many,
     upsert_many,
 };
+pub(crate) use bulk::{bulk_upsert_with_transient_retry, partition_deferred_upserts};
 pub use errors::{RepositoryError, Result};
 pub use query::{
     PaginatedResult, Pagination, RepoSyncInfo, count, count_by_instance, find_all,
     find_all_by_instance, find_all_by_instance_and_owner, find_by_instance, find_by_owner,
     find_stale, get_sync_info_by_instance_and_owner,
 };
+pub(crate) use query::{get_identities_by_instance, get_identities_by_platform_ids};
 pub use single::{
     delete, find_by_id, find_by_natural_key, find_by_platform_id, insert, update, upsert,
 };

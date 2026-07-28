@@ -1,4 +1,5 @@
 use chrono::Utc;
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
@@ -27,6 +28,7 @@ pub(super) async fn process_streaming_repos<C: PlatformClient>(
     client: &C,
     namespace: &str,
     repos: &[PlatformRepo],
+    identity_changes: &HashSet<i64>,
     options: &SyncOptions,
     model_tx: &mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
@@ -50,26 +52,28 @@ pub(super) async fn process_streaming_repos<C: PlatformClient>(
     let mut repos_to_star: Vec<(String, String)> = Vec::new();
 
     for repo in repos {
-        if is_active_repo(repo, cutoff) {
+        let is_active = is_active_repo(repo, cutoff);
+        if is_active {
             result.matched += 1;
 
             if options.star {
                 repos_to_star.push((repo.owner.clone(), repo.name.clone()));
             }
+        }
 
-            if !options.dry_run && !channel_closed {
-                let model = repo.to_active_model(client.instance_id());
-                if model_tx.send(model).await.is_err() {
-                    channel_closed = true;
-                    emit(
-                        on_progress,
-                        SyncProgress::Warning {
-                            message: "persistence channel closed".to_string(),
-                        },
-                    );
-                } else {
-                    result.saved += 1;
-                }
+        let should_persist = is_active || identity_changes.contains(&repo.platform_id);
+        if should_persist && !options.dry_run && !channel_closed {
+            let model = repo.to_active_model(client.instance_id());
+            if model_tx.send(model).await.is_err() {
+                channel_closed = true;
+                emit(
+                    on_progress,
+                    SyncProgress::Warning {
+                        message: "persistence channel closed".to_string(),
+                    },
+                );
+            } else {
+                result.saved += 1;
             }
         }
     }
@@ -91,6 +95,7 @@ pub(super) async fn process_streaming_repos<C: PlatformClient>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -242,8 +247,16 @@ mod tests {
         let repos = vec![repo("org", "active", 3), repo("org", "inactive", 90)];
         let (tx, mut rx) = mpsc::channel(10);
 
-        let result =
-            process_streaming_repos(&client, "org", &repos, &options(true, false), &tx, None).await;
+        let result = process_streaming_repos(
+            &client,
+            "org",
+            &repos,
+            &HashSet::new(),
+            &options(true, false),
+            &tx,
+            None,
+        )
+        .await;
 
         assert_eq!(result.result.processed, 2);
         assert_eq!(result.result.matched, 1);
@@ -255,6 +268,31 @@ mod tests {
 
         let saved_model = rx.recv().await;
         assert!(saved_model.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_process_streaming_repos_persists_inactive_identity_changes() {
+        let client = TestClient;
+        let repos = vec![repo("org", "renamed-inactive", 90)];
+        let identity_changes = HashSet::from([42]);
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let result = process_streaming_repos(
+            &client,
+            "org",
+            &repos,
+            &identity_changes,
+            &options(false, false),
+            &tx,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.result.processed, 1);
+        assert_eq!(result.result.matched, 0);
+        assert_eq!(result.result.saved, 1);
+        let saved_model = rx.recv().await.expect("identity refresh model");
+        assert_eq!(saved_model.name.unwrap(), "renamed-inactive");
     }
 
     #[tokio::test]
@@ -278,6 +316,7 @@ mod tests {
             &client,
             "org",
             &repos,
+            &HashSet::new(),
             &options(false, false),
             &tx,
             Some(&callback),

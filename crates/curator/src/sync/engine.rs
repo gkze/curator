@@ -29,6 +29,7 @@ mod star;
 
 pub use filter::{filter_by_activity, filter_for_incremental_sync};
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -239,14 +240,25 @@ where
 fn apply_incremental_filter(
     repos: Vec<PlatformRepo>,
     sync_info: &[RepoSyncInfo],
+    stored_owners: &HashMap<i64, String>,
 ) -> Vec<PlatformRepo> {
     if sync_info.is_empty() {
         return repos;
     }
 
-    filter::filter_for_incremental_sync(&repos, sync_info)
+    let sync_map: HashMap<i64, &RepoSyncInfo> = sync_info
+        .iter()
+        .map(|info| (info.platform_id, info))
+        .collect();
+
+    repos
         .into_iter()
-        .cloned()
+        .filter(|repo| {
+            stored_owners
+                .get(&repo.platform_id)
+                .is_some_and(|owner| owner != &repo.owner)
+                || filter::needs_refresh(repo, sync_map.get(&repo.platform_id).copied())
+        })
         .collect()
 }
 
@@ -269,8 +281,12 @@ async fn maybe_filter_incremental_for_owner<C: PlatformClient>(
         repository::get_sync_info_by_instance_and_owner(db, client.instance_id(), owner)
             .await
             .map_err(|e| PlatformError::internal(e.to_string()))?;
+    let stored_owners = sync_info
+        .iter()
+        .map(|info| (info.platform_id, owner.to_string()))
+        .collect();
 
-    Ok(apply_incremental_filter(repos, &sync_info))
+    Ok(apply_incremental_filter(repos, &sync_info, &stored_owners))
 }
 
 async fn maybe_filter_incremental_for_owners<C: PlatformClient>(
@@ -293,21 +309,91 @@ async fn maybe_filter_incremental_for_owners<C: PlatformClient>(
     }
 
     let mut sync_info: Vec<RepoSyncInfo> = Vec::new();
+    let mut stored_owners = HashMap::new();
     for owner in owners {
         let mut owner_info =
             repository::get_sync_info_by_instance_and_owner(db, client.instance_id(), owner)
                 .await
                 .map_err(|e| PlatformError::internal(e.to_string()))?;
+        stored_owners.extend(
+            owner_info
+                .iter()
+                .map(|info| (info.platform_id, owner.clone())),
+        );
         sync_info.append(&mut owner_info);
     }
 
-    Ok(apply_incremental_filter(repos, &sync_info))
+    Ok(apply_incremental_filter(repos, &sync_info, &stored_owners))
+}
+
+async fn find_repository_identity_changes<C: PlatformClient>(
+    client: &C,
+    repos: &[PlatformRepo],
+    db: Option<&DatabaseConnection>,
+) -> Result<HashSet<i64>, PlatformError> {
+    let Some(db) = db else {
+        return Ok(HashSet::new());
+    };
+    if repos.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let platform_ids: Vec<i64> = repos.iter().map(|repo| repo.platform_id).collect();
+    let stored =
+        repository::get_identities_by_platform_ids(db, client.instance_id(), &platform_ids)
+            .await
+            .map_err(|error| PlatformError::internal(error.to_string()))?;
+    let current: HashMap<i64, (&str, &str)> = repos
+        .iter()
+        .map(|repo| (repo.platform_id, (repo.owner.as_str(), repo.name.as_str())))
+        .collect();
+
+    Ok(stored
+        .into_iter()
+        .filter_map(|identity| {
+            current
+                .get(&identity.platform_id)
+                .is_some_and(|(owner, name)| {
+                    *owner != identity.owner.as_str() || *name != identity.name.as_str()
+                })
+                .then_some(identity.platform_id)
+        })
+        .collect())
+}
+
+async fn load_repository_identities<C: PlatformClient>(
+    client: &C,
+    db: Option<&DatabaseConnection>,
+) -> Result<HashMap<i64, (String, String)>, PlatformError> {
+    let Some(db) = db else {
+        return Ok(HashMap::new());
+    };
+
+    repository::get_identities_by_instance(db, client.instance_id())
+        .await
+        .map(|identities| {
+            identities
+                .into_iter()
+                .map(|identity| (identity.platform_id, (identity.owner, identity.name)))
+                .collect()
+        })
+        .map_err(|error| PlatformError::internal(error.to_string()))
+}
+
+fn repository_identity_changed(
+    repo: &PlatformRepo,
+    stored_identities: &HashMap<i64, (String, String)>,
+) -> bool {
+    stored_identities
+        .get(&repo.platform_id)
+        .is_some_and(|(owner, name)| owner != &repo.owner || name != &repo.name)
 }
 
 async fn sync_repos<C: PlatformClient + Clone + 'static>(
     client: &C,
     namespace: &str,
     repos: Vec<PlatformRepo>,
+    identity_changes: &HashSet<i64>,
     options: &SyncOptions,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<(SyncResult, Vec<CodeRepositoryActiveModel>), PlatformError> {
@@ -332,7 +418,11 @@ async fn sync_repos<C: PlatformClient + Clone + 'static>(
         },
     );
 
-    let active_repos = filter::filter_by_activity(&repos, options.active_within);
+    let cutoff = Utc::now() - options.active_within;
+    let active_repos: Vec<&PlatformRepo> = repos
+        .iter()
+        .filter(|repo| filter::is_active_repo(repo, cutoff))
+        .collect();
     result.matched = active_repos.len();
 
     emit(
@@ -366,7 +456,13 @@ async fn sync_repos<C: PlatformClient + Clone + 'static>(
 
     emit(on_progress, SyncProgress::ConvertingModels);
 
-    let models = persist::build_models(client, &active_repos);
+    let repos_to_persist: Vec<&PlatformRepo> = repos
+        .iter()
+        .filter(|repo| {
+            filter::is_active_repo(repo, cutoff) || identity_changes.contains(&repo.platform_id)
+        })
+        .collect();
+    let models = persist::build_models(client, &repos_to_persist);
     result.saved = models.len();
 
     emit(
@@ -387,6 +483,7 @@ async fn sync_repos_streaming<C: PlatformClient + Clone + 'static>(
     client: &C,
     namespace: &str,
     repos: Vec<PlatformRepo>,
+    identity_changes: &HashSet<i64>,
     options: &SyncOptions,
     model_tx: mpsc::Sender<CodeRepositoryActiveModel>,
     on_progress: Option<&ProgressCallback>,
@@ -395,6 +492,7 @@ async fn sync_repos_streaming<C: PlatformClient + Clone + 'static>(
         client,
         namespace,
         &repos,
+        identity_changes,
         options,
         &model_tx,
         on_progress,
@@ -418,6 +516,86 @@ async fn sync_repos_streaming<C: PlatformClient + Clone + 'static>(
     }
 
     Ok(result)
+}
+
+#[derive(Debug)]
+struct FetchedRequestedRepo {
+    input_index: usize,
+    requested_owner: String,
+    requested_name: String,
+    repo: PlatformRepo,
+}
+
+async fn resolve_redirected_repo_aliases<C: PlatformClient>(
+    client: &C,
+    mut fetched: Vec<FetchedRequestedRepo>,
+    on_progress: Option<&ProgressCallback>,
+    errors: &mut Vec<String>,
+) -> Vec<PlatformRepo> {
+    fetched.sort_by_key(|item| item.input_index);
+
+    let mut alias_counts_by_platform_id: HashMap<i64, usize> = HashMap::new();
+    for item in &fetched {
+        *alias_counts_by_platform_id
+            .entry(item.repo.platform_id)
+            .or_default() += 1;
+    }
+
+    // Duplicate cached IDs identify aliases, but the old name may since have
+    // been reused by a different repository. Refresh every member so the
+    // result can be regrouped by its current platform ID.
+    let mut candidates = Vec::with_capacity(fetched.len());
+    for item in fetched {
+        let is_alias = alias_counts_by_platform_id
+            .get(&item.repo.platform_id)
+            .is_some_and(|count| *count > 1);
+        if !is_alias {
+            candidates.push((item.input_index, item.repo, false));
+            continue;
+        }
+
+        match client
+            .get_repo(&item.requested_owner, &item.requested_name, None)
+            .await
+        {
+            Ok(repo) => candidates.push((item.input_index, repo, true)),
+            Err(error) => {
+                let message = format!(
+                    "Failed to refresh redirected repository alias {}/{}: {}",
+                    item.requested_owner, item.requested_name, error
+                );
+                emit(
+                    on_progress,
+                    SyncProgress::Warning {
+                        message: message.clone(),
+                    },
+                );
+                errors.push(message);
+            }
+        }
+    }
+
+    // Regroup after refresh: aliases that still redirect to the same repository
+    // collapse to one model, while a reused name with a new ID remains a
+    // distinct explicitly requested repository. Fresh data wins if it collides
+    // with a non-refreshed cached result from another initial group.
+    let mut resolved = Vec::with_capacity(candidates.len());
+    let mut position_by_platform_id = HashMap::with_capacity(candidates.len());
+    for (input_index, repo, refreshed) in candidates {
+        if let Some(position) = position_by_platform_id.get(&repo.platform_id).copied() {
+            let (_, existing_repo, existing_refreshed): &mut (usize, PlatformRepo, bool) =
+                &mut resolved[position];
+            if refreshed && !*existing_refreshed {
+                *existing_repo = repo;
+                *existing_refreshed = true;
+            }
+        } else {
+            position_by_platform_id.insert(repo.platform_id, resolved.len());
+            resolved.push((input_index, repo, refreshed));
+        }
+    }
+
+    resolved.into_iter().map(|(_, repo, _)| repo).collect()
 }
 
 /// Sync a namespace (org/group) using a platform client.
@@ -450,8 +628,17 @@ pub async fn sync_namespace<C: PlatformClient + Clone + 'static>(
         .list_org_repos_with_concurrency(namespace, db, options.concurrency, on_progress)
         .await?;
     let repos = maybe_filter_incremental_for_owner(client, namespace, options, db, repos).await?;
+    let identity_changes = find_repository_identity_changes(client, &repos, db).await?;
 
-    sync_repos(client, namespace, repos, options, on_progress).await
+    sync_repos(
+        client,
+        namespace,
+        repos,
+        &identity_changes,
+        options,
+        on_progress,
+    )
+    .await
 }
 
 /// Sync a namespace with streaming persistence.
@@ -482,8 +669,18 @@ pub async fn sync_namespace_streaming<C: PlatformClient + Clone + 'static>(
         .list_org_repos_with_concurrency(namespace, db, options.concurrency, on_progress)
         .await?;
     let repos = maybe_filter_incremental_for_owner(client, namespace, options, db, repos).await?;
+    let identity_changes = find_repository_identity_changes(client, &repos, db).await?;
 
-    sync_repos_streaming(client, namespace, repos, options, model_tx, on_progress).await
+    sync_repos_streaming(
+        client,
+        namespace,
+        repos,
+        &identity_changes,
+        options,
+        model_tx,
+        on_progress,
+    )
+    .await
 }
 
 /// Sync multiple namespaces concurrently.
@@ -640,8 +837,17 @@ pub async fn sync_user<C: PlatformClient + Clone + 'static>(
         .list_user_repos_with_concurrency(username, db, options.concurrency, on_progress)
         .await?;
     let repos = maybe_filter_incremental_for_owner(client, username, options, db, repos).await?;
+    let identity_changes = find_repository_identity_changes(client, &repos, db).await?;
 
-    sync_repos(client, username, repos, options, on_progress).await
+    sync_repos(
+        client,
+        username,
+        repos,
+        &identity_changes,
+        options,
+        on_progress,
+    )
+    .await
 }
 
 /// Sync a user's repositories with streaming persistence.
@@ -672,8 +878,18 @@ pub async fn sync_user_streaming<C: PlatformClient + Clone + 'static>(
         .list_user_repos_with_concurrency(username, db, options.concurrency, on_progress)
         .await?;
     let repos = maybe_filter_incremental_for_owner(client, username, options, db, repos).await?;
+    let identity_changes = find_repository_identity_changes(client, &repos, db).await?;
 
-    sync_repos_streaming(client, username, repos, options, model_tx, on_progress).await
+    sync_repos_streaming(
+        client,
+        username,
+        repos,
+        &identity_changes,
+        options,
+        model_tx,
+        on_progress,
+    )
+    .await
 }
 
 /// Sync an explicit list of repositories (owner/name pairs) with streaming persistence.
@@ -704,17 +920,19 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
     );
 
     let concurrency = std::cmp::max(1, std::cmp::min(options.concurrency, repos.len().max(1)));
-    let mut repo_stream = stream::iter(repos.iter().map(|(owner, name)| {
-        let owner = owner.clone();
-        let name = name.clone();
-        let client = client.clone();
-        let task_db = db.clone();
+    let mut repo_stream = stream::iter(repos.iter().enumerate().map(
+        |(input_index, (owner, name))| {
+            let owner = owner.clone();
+            let name = name.clone();
+            let client = client.clone();
+            let task_db = db.clone();
 
-        tokio::spawn(async move {
-            let repo = client.get_repo(&owner, &name, task_db.as_deref()).await;
-            (owner, name, repo)
-        })
-    }))
+            tokio::spawn(async move {
+                let repo = client.get_repo(&owner, &name, task_db.as_deref()).await;
+                (input_index, owner, name, repo)
+            })
+        },
+    ))
     .buffer_unordered(concurrency);
 
     let mut fetched = Vec::new();
@@ -735,11 +953,16 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
         );
 
         match result {
-            Ok((owner, name, Ok(repo))) => {
-                fetched.push(repo);
+            Ok((input_index, owner, name, Ok(repo))) => {
+                fetched.push(FetchedRequestedRepo {
+                    input_index,
+                    requested_owner: owner.clone(),
+                    requested_name: name.clone(),
+                    repo,
+                });
                 tracing::debug!(owner = %owner, name = %name, "Fetched repo");
             }
-            Ok((owner, name, Err(error))) => {
+            Ok((_input_index, owner, name, Err(error))) => {
                 let message = format!("{}/{}: {}", owner, name, error);
                 emit(
                     on_progress,
@@ -770,8 +993,14 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
         },
     );
 
+    let mut owners: Vec<String> = fetched
+        .iter()
+        .map(|item| item.requested_owner.clone())
+        .collect();
+    let fetched = resolve_redirected_repo_aliases(client, fetched, on_progress, &mut errors).await;
+
     let fetched = if options.strategy == SyncStrategy::Incremental {
-        let mut owners: Vec<String> = fetched.iter().map(|repo| repo.owner.clone()).collect();
+        owners.extend(fetched.iter().map(|repo| repo.owner.clone()));
         owners.sort();
         owners.dedup();
         maybe_filter_incremental_for_owners(client, &owners, options, db.as_deref(), fetched)
@@ -779,9 +1008,19 @@ pub async fn sync_repo_list_streaming<C: PlatformClient + Clone + 'static>(
     } else {
         fetched
     };
+    let identity_changes =
+        find_repository_identity_changes(client, &fetched, db.as_deref()).await?;
 
-    let mut result =
-        sync_repos_streaming(client, namespace, fetched, options, model_tx, on_progress).await?;
+    let mut result = sync_repos_streaming(
+        client,
+        namespace,
+        fetched,
+        &identity_changes,
+        options,
+        model_tx,
+        on_progress,
+    )
+    .await?;
 
     result.errors.extend(errors);
     Ok(result)
@@ -861,16 +1100,18 @@ struct StarredProcessorState {
     saved: Arc<AtomicUsize>,
     channel_closed: Arc<AtomicBool>,
     repos_to_prune: Arc<Mutex<Vec<(String, String)>>>,
+    stored_identities: Arc<HashMap<i64, (String, String)>>,
 }
 
 impl StarredProcessorState {
-    fn new() -> Self {
+    fn new(stored_identities: HashMap<i64, (String, String)>) -> Self {
         Self {
             processed: Arc::new(AtomicUsize::new(0)),
             matched: Arc::new(AtomicUsize::new(0)),
             saved: Arc::new(AtomicUsize::new(0)),
             channel_closed: Arc::new(AtomicBool::new(false)),
             repos_to_prune: Arc::new(Mutex::new(Vec::new())),
+            stored_identities: Arc::new(stored_identities),
         }
     }
 }
@@ -892,6 +1133,7 @@ fn spawn_starred_processor_task<C: PlatformClient + Clone + 'static>(
     let processor_saved = Arc::clone(&state.saved);
     let processor_channel_closed = Arc::clone(&state.channel_closed);
     let processor_repos_to_prune = Arc::clone(&state.repos_to_prune);
+    let processor_stored_identities = Arc::clone(&state.stored_identities);
 
     tokio::spawn(async move {
         let mut repo_rx = repo_rx;
@@ -912,6 +1154,7 @@ fn spawn_starred_processor_task<C: PlatformClient + Clone + 'static>(
                 &processor_saved,
                 &processor_channel_closed,
                 &processor_repos_to_prune,
+                &processor_stored_identities,
             )
             .await;
         }
@@ -939,6 +1182,7 @@ async fn process_starred_repo<C: PlatformClient>(
     saved: &AtomicUsize,
     channel_closed: &AtomicBool,
     repos_to_prune: &Mutex<Vec<(String, String)>>,
+    stored_identities: &HashMap<i64, (String, String)>,
 ) {
     let new_processed = processed.fetch_add(1, Ordering::Relaxed) + 1;
     if new_processed.is_multiple_of(PROCESSOR_LOG_EVERY) {
@@ -960,16 +1204,20 @@ async fn process_starred_repo<C: PlatformClient>(
         );
     }
 
-    if is_active {
-        if !dry_run && !channel_closed.load(Ordering::Relaxed) {
-            let model = repo.to_active_model(client.instance_id());
-            if model_tx.send(model).await.is_err() {
-                channel_closed.store(true, Ordering::Relaxed);
-            } else {
-                saved.fetch_add(1, Ordering::Relaxed);
-            }
+    let should_persist = is_active || repository_identity_changed(&repo, stored_identities);
+    if should_persist && !dry_run && !channel_closed.load(Ordering::Relaxed) {
+        let model = repo.to_active_model(client.instance_id());
+        if model_tx.send(model).await.is_err() {
+            channel_closed.store(true, Ordering::Relaxed);
+        } else {
+            saved.fetch_add(1, Ordering::Relaxed);
         }
-    } else if prune && let Ok(mut prune_list) = repos_to_prune.lock() {
+    }
+
+    if !is_active
+        && prune
+        && let Ok(mut prune_list) = repos_to_prune.lock()
+    {
         prune_list.push((repo.owner.clone(), repo.name.clone()));
     }
 }
@@ -1098,7 +1346,12 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     // during streaming (not as a separate phase). The FilteredPage events
     // provide incremental filtering progress.
 
-    let state = StarredProcessorState::new();
+    let stored_identities = if options.dry_run {
+        HashMap::new()
+    } else {
+        load_repository_identities(client, db).await?
+    };
+    let state = StarredProcessorState::new(stored_identities);
 
     // Create channel for receiving repos from the streaming fetch.
     // Buffer of 500 provides headroom to reduce backpressure likelihood.
@@ -1161,12 +1414,11 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
 
     // Emit the final persistence total so the save reporter can switch from a
     // spinner to a determinate progress bar if it has already seen persisted rows.
-    if final_matched > 0 && !options.dry_run {
+    let final_saved = state.saved.load(Ordering::Relaxed);
+    if final_saved > 0 && !options.dry_run {
         emit(
             on_progress,
-            SyncProgress::ModelsReady {
-                count: final_matched,
-            },
+            SyncProgress::ModelsReady { count: final_saved },
         );
     }
 
@@ -1181,7 +1433,7 @@ pub async fn sync_starred_streaming<C: PlatformClient + Clone + 'static>(
     let mut result = SyncResult {
         processed: final_processed,
         matched: final_matched,
-        saved: state.saved.load(Ordering::Relaxed),
+        saved: final_saved,
         ..Default::default()
     };
 
@@ -1273,6 +1525,7 @@ mod tests {
     struct TestClient {
         starred_repos: Arc<Mutex<Vec<PlatformRepo>>>,
         repo_results: Arc<Mutex<HashMap<String, PlatformResult<PlatformRepo>>>>,
+        uncached_repo_results: Arc<Mutex<HashMap<String, PlatformResult<PlatformRepo>>>>,
         star_results: Arc<Mutex<HashMap<String, PlatformResult<bool>>>>,
         unstar_results: Arc<Mutex<HashMap<String, PlatformResult<bool>>>>,
         star_calls: Arc<Mutex<Vec<String>>>,
@@ -1299,6 +1552,19 @@ mod tests {
         fn set_repo_result(&self, owner: &str, name: &str, value: PlatformResult<PlatformRepo>) {
             let key = Self::key(owner, name);
             self.repo_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, value);
+        }
+
+        fn set_uncached_repo_result(
+            &self,
+            owner: &str,
+            name: &str,
+            value: PlatformResult<PlatformRepo>,
+        ) {
+            let key = Self::key(owner, name);
+            self.uncached_repo_results
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key, value);
@@ -1693,6 +1959,20 @@ mod tests {
         row
     }
 
+    fn identity_row(platform_id: i64, owner: &str, name: &str) -> BTreeMap<String, Value> {
+        let mut row = BTreeMap::new();
+        row.insert("0".to_string(), Value::BigInt(Some(platform_id)));
+        row.insert(
+            "1".to_string(),
+            Value::String(Some(Box::new(owner.to_string()))),
+        );
+        row.insert(
+            "2".to_string(),
+            Value::String(Some(Box::new(name.to_string()))),
+        );
+        row
+    }
+
     #[async_trait]
     impl PlatformClient for TestClient {
         fn platform_type(&self) -> PlatformType {
@@ -1719,9 +1999,19 @@ mod tests {
             &self,
             owner: &str,
             name: &str,
-            _db: Option<&DatabaseConnection>,
+            db: Option<&DatabaseConnection>,
         ) -> PlatformResult<PlatformRepo> {
             let key = Self::key(owner, name);
+            if db.is_none()
+                && let Some(result) = self
+                    .uncached_repo_results
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key)
+            {
+                return result;
+            }
+
             self.repo_results
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2388,9 +2678,10 @@ mod tests {
         };
 
         let repos = vec![mock_repo("recent", 1)];
-        let (result, models) = sync_repos(&client, "test-org", repos, &options, None)
-            .await
-            .expect("sync should succeed");
+        let (result, models) =
+            sync_repos(&client, "test-org", repos, &HashSet::new(), &options, None)
+                .await
+                .expect("sync should succeed");
 
         assert_eq!(result.processed, 1);
         assert_eq!(result.matched, 1);
@@ -2412,9 +2703,10 @@ mod tests {
         };
 
         let repos = vec![mock_repo("old", 90)];
-        let (result, models) = sync_repos(&client, "test-org", repos, &options, None)
-            .await
-            .expect("sync should succeed");
+        let (result, models) =
+            sync_repos(&client, "test-org", repos, &HashSet::new(), &options, None)
+                .await
+                .expect("sync should succeed");
 
         assert_eq!(result.processed, 1);
         assert_eq!(result.matched, 0);
@@ -2422,6 +2714,64 @@ mod tests {
         assert_eq!(result.saved, 0);
         assert!(models.is_empty());
         assert_eq!(client.star_calls_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sync_repos_persists_inactive_identity_changes() {
+        let client = TestClient::default();
+        let options = SyncOptions {
+            star: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+
+        let repos = vec![mock_repo("renamed-inactive", 90)];
+        let (result, models) = sync_repos(
+            &client,
+            "test-org",
+            repos,
+            &HashSet::from([123]),
+            &options,
+            None,
+        )
+        .await
+        .expect("identity refresh should succeed");
+
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.matched, 0);
+        assert_eq!(result.saved, 1);
+        assert_eq!(models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sync_starred_streaming_persists_inactive_identity_changes() {
+        let client = TestClient::default();
+        client.set_starred_repos(vec![mock_repo_with_owner(
+            "new-owner",
+            "renamed-inactive",
+            90,
+        )]);
+        let options = SyncOptions {
+            star: false,
+            dry_run: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![identity_row(123, "old-owner", "old-name")]])
+            .into_connection();
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+
+        let result = sync_starred_streaming(&client, &options, Some(&db), 2, false, model_tx, None)
+            .await
+            .expect("starred identity refresh should succeed");
+
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.matched, 0);
+        assert_eq!(result.saved, 1);
+        let model = model_rx.recv().await.expect("identity refresh model");
+        assert_eq!(model.owner.unwrap(), "new-owner");
+        assert_eq!(model.name.unwrap(), "renamed-inactive");
     }
 
     #[tokio::test]
@@ -2734,10 +3084,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sync_repo_list_streaming_resolves_redirected_aliases_deterministically() {
+        for repos in [
+            vec![
+                ("old-owner".to_string(), "old-name".to_string()),
+                ("new-owner".to_string(), "new-name".to_string()),
+            ],
+            vec![
+                ("new-owner".to_string(), "new-name".to_string()),
+                ("old-owner".to_string(), "old-name".to_string()),
+            ],
+        ] {
+            let client = TestClient::default();
+            let stale_alias = mock_repo_with_owner("old-owner", "old-name", 1);
+            let canonical = mock_repo_with_owner("new-owner", "new-name", 1);
+
+            client.set_repo_result("old-owner", "old-name", Ok(stale_alias));
+            client.set_repo_result("new-owner", "new-name", Ok(canonical.clone()));
+            client.set_uncached_repo_result("old-owner", "old-name", Ok(canonical.clone()));
+            client.set_uncached_repo_result("new-owner", "new-name", Ok(canonical));
+
+            let options = SyncOptions {
+                star: false,
+                dry_run: false,
+                active_within: Duration::days(30),
+                ..SyncOptions::default()
+            };
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Sqlite)
+                    .append_query_results([Vec::<BTreeMap<String, Value>>::new()])
+                    .into_connection(),
+            );
+
+            let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+            let result = sync_repo_list_streaming(
+                &client,
+                "redirected",
+                &repos,
+                &options,
+                Some(db),
+                model_tx,
+                None,
+            )
+            .await
+            .expect("redirected aliases should resolve");
+
+            assert_eq!(result.processed, 1);
+            assert_eq!(result.matched, 1);
+            assert_eq!(result.saved, 1);
+            assert!(result.errors.is_empty());
+
+            let model = model_rx.recv().await.expect("canonical model");
+            assert_eq!(model.owner.unwrap(), "new-owner");
+            assert_eq!(model.name.unwrap(), "new-name");
+            assert!(model_rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_list_streaming_regroups_aliases_when_a_name_is_reused() {
+        let client = TestClient::default();
+        let stale_alias = mock_repo_with_owner("old-owner", "old-name", 1);
+        let canonical = mock_repo_with_owner("new-owner", "new-name", 1);
+        let mut reused_name = mock_repo_with_owner("old-owner", "old-name", 1);
+        reused_name.platform_id = 456;
+
+        client.set_repo_result("old-owner", "old-name", Ok(stale_alias));
+        client.set_repo_result("new-owner", "new-name", Ok(canonical.clone()));
+        client.set_uncached_repo_result("old-owner", "old-name", Ok(reused_name));
+        client.set_uncached_repo_result("new-owner", "new-name", Ok(canonical));
+
+        let options = SyncOptions {
+            star: false,
+            dry_run: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+        let repos = vec![
+            ("old-owner".to_string(), "old-name".to_string()),
+            ("new-owner".to_string(), "new-name".to_string()),
+        ];
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([Vec::<BTreeMap<String, Value>>::new()])
+                .into_connection(),
+        );
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result = sync_repo_list_streaming(
+            &client,
+            "redirected",
+            &repos,
+            &options,
+            Some(db),
+            model_tx,
+            None,
+        )
+        .await
+        .expect("fresh aliases should be regrouped by their current platform IDs");
+
+        assert_eq!(result.processed, 2);
+        assert_eq!(result.matched, 2);
+        assert_eq!(result.saved, 2);
+        assert!(result.errors.is_empty());
+
+        let reused_name = model_rx.recv().await.expect("reused-name model");
+        assert_eq!(reused_name.platform_id.unwrap(), 456);
+        assert_eq!(reused_name.owner.unwrap(), "old-owner");
+        assert_eq!(reused_name.name.unwrap(), "old-name");
+
+        let canonical = model_rx.recv().await.expect("canonical model");
+        assert_eq!(canonical.platform_id.unwrap(), 123);
+        assert_eq!(canonical.owner.unwrap(), "new-owner");
+        assert_eq!(canonical.name.unwrap(), "new-name");
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_list_streaming_warns_and_tries_next_redirected_alias() {
+        let client = TestClient::default();
+        let stale_alias = mock_repo_with_owner("old-owner", "old-name", 1);
+        let canonical = mock_repo_with_owner("new-owner", "new-name", 1);
+        client.set_repo_result("old-owner", "old-name", Ok(stale_alias));
+        client.set_repo_result("new-owner", "new-name", Ok(canonical.clone()));
+        client.set_uncached_repo_result(
+            "old-owner",
+            "old-name",
+            Err(PlatformError::internal("uncached refresh failed")),
+        );
+        client.set_uncached_repo_result("new-owner", "new-name", Ok(canonical));
+
+        let warnings = Arc::new(Mutex::new(Vec::<String>::new()));
+        let warnings_clone = Arc::clone(&warnings);
+        let callback: ProgressCallback = Box::new(move |event| {
+            if let SyncProgress::Warning { message } = event {
+                warnings_clone
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(message);
+            }
+        });
+        let options = SyncOptions {
+            star: false,
+            dry_run: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+        let repos = vec![
+            ("old-owner".to_string(), "old-name".to_string()),
+            ("new-owner".to_string(), "new-name".to_string()),
+        ];
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([Vec::<BTreeMap<String, Value>>::new()])
+                .into_connection(),
+        );
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result = sync_repo_list_streaming(
+            &client,
+            "redirected",
+            &repos,
+            &options,
+            Some(db),
+            model_tx,
+            Some(&callback),
+        )
+        .await
+        .expect("the next alias should provide the canonical repository");
+
+        assert_eq!(result.processed, 1);
+        assert_eq!(result.saved, 1);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("uncached refresh failed"));
+        assert!(
+            warnings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|warning| warning.contains("uncached refresh failed"))
+        );
+
+        let model = model_rx.recv().await.expect("canonical model");
+        assert_eq!(model.owner.unwrap(), "new-owner");
+        assert_eq!(model.name.unwrap(), "new-name");
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_repo_list_streaming_skips_alias_group_when_all_refreshes_fail() {
+        let client = TestClient::default();
+        let stale_alias = mock_repo_with_owner("old-owner", "old-name", 1);
+        let canonical = mock_repo_with_owner("new-owner", "new-name", 1);
+        client.set_repo_result("old-owner", "old-name", Ok(stale_alias));
+        client.set_repo_result("new-owner", "new-name", Ok(canonical));
+        client.set_uncached_repo_result(
+            "old-owner",
+            "old-name",
+            Err(PlatformError::internal("old alias refresh failed")),
+        );
+        client.set_uncached_repo_result(
+            "new-owner",
+            "new-name",
+            Err(PlatformError::internal("new alias refresh failed")),
+        );
+
+        let options = SyncOptions {
+            star: false,
+            dry_run: false,
+            active_within: Duration::days(30),
+            ..SyncOptions::default()
+        };
+        let repos = vec![
+            ("old-owner".to_string(), "old-name".to_string()),
+            ("new-owner".to_string(), "new-name".to_string()),
+        ];
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Sqlite).into_connection());
+
+        let (model_tx, mut model_rx) = mpsc::channel::<CodeRepositoryActiveModel>(8);
+        let result = sync_repo_list_streaming(
+            &client,
+            "redirected",
+            &repos,
+            &options,
+            Some(db),
+            model_tx,
+            None,
+        )
+        .await
+        .expect("refresh failures should be reported without persisting stale aliases");
+
+        assert_eq!(result.processed, 0);
+        assert_eq!(result.saved, 0);
+        assert_eq!(result.errors.len(), 2);
+        assert!(model_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_sync_repo_list_streaming_incremental_without_db_keeps_fetched_repos() {
         let client = TestClient::default();
+        let mut second_repo = mock_repo_with_owner("acme", "two", 2);
+        second_repo.platform_id = 124;
         client.set_repo_result("acme", "one", Ok(mock_repo_with_owner("acme", "one", 1)));
-        client.set_repo_result("acme", "two", Ok(mock_repo_with_owner("acme", "two", 2)));
+        client.set_repo_result("acme", "two", Ok(second_repo));
 
         let options = SyncOptions {
             strategy: SyncStrategy::Incremental,
@@ -2885,7 +3474,7 @@ mod tests {
     #[test]
     fn test_apply_incremental_filter_returns_original_when_sync_info_empty() {
         let repos = vec![mock_repo("one", 1), mock_repo("two", 2)];
-        let filtered = apply_incremental_filter(repos.clone(), &[]);
+        let filtered = apply_incremental_filter(repos.clone(), &[], &HashMap::new());
 
         assert_eq!(filtered.len(), repos.len());
         assert_eq!(filtered[0].name, "one");
@@ -2982,6 +3571,64 @@ mod tests {
         .await
         .expect("db-backed incremental owners filter should succeed");
         assert!(filtered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_incremental_owner_filter_includes_redirected_owner_with_stale_activity() {
+        let client = SuccessClient;
+        let synced_at = Utc::now().fixed_offset();
+        let stale_activity = (Utc::now() - Duration::days(5)).fixed_offset();
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![sync_info_row(
+                123,
+                "repo",
+                Some(stale_activity),
+                Some(stale_activity),
+                synced_at,
+            )]])
+            .into_connection();
+        let repo = mock_repo_with_owner("new-owner", "repo", 5);
+
+        let filtered = maybe_filter_incremental_for_owner(
+            &client,
+            "old-owner",
+            &SyncOptions {
+                strategy: SyncStrategy::Incremental,
+                ..SyncOptions::default()
+            },
+            Some(&db),
+            vec![repo],
+        )
+        .await
+        .expect("redirected owner should be compared with the queried owner");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].owner, "new-owner");
+    }
+
+    #[tokio::test]
+    async fn test_identity_changes_use_platform_ids_across_owner_transfers() {
+        let client = SuccessClient;
+        let mut unchanged = mock_repo_with_owner("group/subgroup", "unchanged", 90);
+        unchanged.platform_id = 1;
+        let mut transferred = mock_repo_with_owner("new/group", "renamed", 90);
+        transferred.platform_id = 2;
+        let mut new_inactive = mock_repo_with_owner("new/group", "brand-new", 90);
+        new_inactive.platform_id = 3;
+        let repos = vec![unchanged, transferred, new_inactive];
+
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([vec![
+                identity_row(1, "group/subgroup", "unchanged"),
+                identity_row(2, "old/group", "old-name"),
+            ]])
+            .into_connection();
+
+        let changed = find_repository_identity_changes(&client, &repos, Some(&db))
+            .await
+            .expect("identity lookup should succeed");
+
+        assert_eq!(changed, HashSet::from([2]));
     }
 
     #[tokio::test]

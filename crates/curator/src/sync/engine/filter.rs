@@ -28,6 +28,7 @@ pub fn filter_by_activity(repos: &[PlatformRepo], active_within: Duration) -> Ve
 ///
 /// A repository needs refresh if:
 /// - It's not in the sync info (new repo)
+/// - Its name changed while retaining the same platform ID
 /// - Its `updated_at` or `pushed_at` is newer than `synced_at`
 ///
 /// Returns `true` if the repository should be re-fetched/processed.
@@ -36,6 +37,10 @@ pub fn needs_refresh(repo: &PlatformRepo, sync_info: Option<&RepoSyncInfo>) -> b
         // New repo - not in DB yet, needs processing
         None => true,
         Some(info) => {
+            if repo.name != info.name {
+                return true;
+            }
+
             // Get the most recent activity timestamp from the platform
             let platform_latest = repo.pushed_at.or(repo.updated_at);
 
@@ -157,6 +162,29 @@ mod tests {
 
         // No timestamp from platform means we should refresh to be safe
         assert!(needs_refresh(&repo, Some(&info)));
+    }
+
+    #[test]
+    fn test_filter_for_incremental_sync_includes_renamed_repo_with_stale_activity() {
+        let synced_at = Utc::now();
+        let stale_activity = synced_at - ChronoDuration::days(1);
+
+        let mut renamed = make_repo(1, "new-name", Some(stale_activity));
+        renamed.pushed_at = Some(stale_activity);
+        let mut unchanged = make_repo(2, "unchanged", Some(stale_activity));
+        unchanged.pushed_at = Some(stale_activity);
+
+        let repos = vec![renamed, unchanged];
+        let sync_info = vec![
+            make_sync_info(1, "old-name", synced_at),
+            make_sync_info(2, "unchanged", synced_at),
+        ];
+
+        let filtered = filter_for_incremental_sync(&repos, &sync_info);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].platform_id, 1);
+        assert_eq!(filtered[0].name, "new-name");
     }
 
     #[test]

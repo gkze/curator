@@ -298,6 +298,189 @@ async fn test_bulk_upsert_updates_changed_repos() {
 }
 
 #[tokio::test]
+async fn test_bulk_upsert_reconciles_repository_rename_chain() {
+    let db = setup_test_db().await;
+    create_test_instances(&db).await;
+    let now = Utc::now();
+    let later = now + chrono::Duration::hours(1);
+    let instance_id = test_instance_id();
+
+    // GitHub repository 917974798 was originally named "alchemy", while
+    // 1081394458 was named "alchemy-effect".
+    let mut original_alchemy = create_test_model(instance_id, "alchemy-run", "alchemy", now);
+    original_alchemy.platform_id = Set(917_974_798);
+    let mut original_alchemy_effect =
+        create_test_model(instance_id, "alchemy-run", "alchemy-effect", now);
+    original_alchemy_effect.platform_id = Set(1_081_394_458);
+    repository::bulk_upsert(&db, vec![original_alchemy, original_alchemy_effect])
+        .await
+        .unwrap();
+
+    let original_alchemy_id = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let original_alchemy_effect_id =
+        repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+    // The first repository was renamed to "alchemy-async" and the second took
+    // over the now-available "alchemy" name.
+    let mut renamed_alchemy = create_test_model(instance_id, "alchemy-run", "alchemy-async", later);
+    renamed_alchemy.platform_id = Set(917_974_798);
+    let mut renamed_alchemy_effect =
+        create_test_model(instance_id, "alchemy-run", "alchemy", later);
+    renamed_alchemy_effect.platform_id = Set(1_081_394_458);
+
+    let rows_affected = repository::bulk_upsert(&db, vec![renamed_alchemy_effect, renamed_alchemy])
+        .await
+        .expect("rename chain should not violate the owner/name constraint");
+
+    assert_eq!(rows_affected, 2);
+
+    let repos = find_all_by_instance_and_owner(&db, instance_id, "alchemy-run")
+        .await
+        .unwrap();
+    assert_eq!(repos.len(), 2);
+    assert!(
+        repos
+            .iter()
+            .any(|repo| repo.name == "alchemy" && repo.platform_id == 1_081_394_458)
+    );
+    assert!(
+        repos
+            .iter()
+            .any(|repo| repo.name == "alchemy-async" && repo.platform_id == 917_974_798)
+    );
+
+    let renamed_alchemy = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    let renamed_alchemy_effect = repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(renamed_alchemy.id, original_alchemy_id);
+    assert_eq!(renamed_alchemy_effect.id, original_alchemy_effect_id);
+}
+
+#[tokio::test]
+async fn test_bulk_upsert_rejects_incomplete_rename_without_deleting_existing_rows() {
+    let db = setup_test_db().await;
+    create_test_instances(&db).await;
+    let now = Utc::now();
+    let later = now + chrono::Duration::hours(1);
+    let instance_id = test_instance_id();
+
+    let mut displaced = create_test_model(instance_id, "alchemy-run", "alchemy", now);
+    displaced.platform_id = Set(917_974_798);
+    let mut successor = create_test_model(instance_id, "alchemy-run", "alchemy-effect", now);
+    successor.platform_id = Set(1_081_394_458);
+    repository::bulk_upsert(&db, vec![displaced, successor])
+        .await
+        .unwrap();
+
+    let original_displaced = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_successor = repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut renamed_successor = create_test_model(instance_id, "alchemy-run", "alchemy", later);
+    renamed_successor.platform_id = Set(1_081_394_458);
+    let error = repository::bulk_upsert(&db, vec![renamed_successor])
+        .await
+        .expect_err("an incomplete rename must not delete the displaced repository");
+    assert!(error.to_string().contains("incomplete repository rename"));
+
+    let repos = find_all_by_instance_and_owner(&db, instance_id, "alchemy-run")
+        .await
+        .unwrap();
+    assert_eq!(repos.len(), 2);
+    let displaced = repository::find_by_platform_id(&db, instance_id, 917_974_798)
+        .await
+        .unwrap()
+        .unwrap();
+    let successor = repository::find_by_platform_id(&db, instance_id, 1_081_394_458)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(displaced.id, original_displaced.id);
+    assert_eq!(displaced.name, "alchemy");
+    assert_eq!(successor.id, original_successor.id);
+    assert_eq!(successor.name, "alchemy-effect");
+    assert!(
+        repos
+            .iter()
+            .all(|repo| !repo.owner.starts_with("__curator_reconcile__/"))
+    );
+}
+
+#[tokio::test]
+async fn test_bulk_upsert_persists_rename_when_updated_at_is_unchanged() {
+    let db = setup_test_db().await;
+    create_test_instances(&db).await;
+    let now = Utc::now();
+    let instance_id = test_instance_id();
+
+    let mut original = create_test_model(instance_id, "test-org", "old-name", now);
+    original.platform_id = Set(42);
+    repository::bulk_upsert(&db, vec![original]).await.unwrap();
+
+    let mut renamed = create_test_model(instance_id, "test-org", "new-name", now);
+    renamed.platform_id = Set(42);
+    let rows_affected = repository::bulk_upsert(&db, vec![renamed])
+        .await
+        .expect("rename should be persisted even when updated_at is unchanged");
+
+    assert_eq!(rows_affected, 1);
+    let repo = repository::find_by_platform_id(&db, instance_id, 42)
+        .await
+        .unwrap()
+        .expect("renamed repository should exist");
+    assert_eq!(repo.name, "new-name");
+}
+
+#[tokio::test]
+async fn test_bulk_upsert_deduplicates_redirected_aliases_by_platform_id() {
+    let db = setup_test_db().await;
+    create_test_instances(&db).await;
+    let now = Utc::now();
+    let instance_id = test_instance_id();
+
+    let alias_id = Uuid::new_v4();
+    let mut redirected_alias = create_test_model(instance_id, "test-org", "old-name", now);
+    redirected_alias.id = Set(alias_id);
+    redirected_alias.platform_id = Set(42);
+
+    let canonical_id = Uuid::new_v4();
+    let mut canonical = create_test_model(instance_id, "test-org", "new-name", now);
+    canonical.id = Set(canonical_id);
+    canonical.platform_id = Set(42);
+
+    let rows_affected = repository::bulk_upsert(&db, vec![redirected_alias, canonical])
+        .await
+        .expect("redirected aliases should be collapsed before the database write");
+
+    assert_eq!(rows_affected, 1);
+    let repo = repository::find_by_platform_id(&db, instance_id, 42)
+        .await
+        .unwrap()
+        .expect("canonical repository should exist");
+    assert_eq!(repo.id, canonical_id);
+    assert_ne!(repo.id, alias_id);
+    assert_eq!(repo.name, "new-name");
+}
+
+#[tokio::test]
 async fn test_bulk_upsert_mixed_new_and_unchanged() {
     let db = setup_test_db().await;
     create_test_instances(&db).await;

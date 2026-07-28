@@ -39,14 +39,16 @@
 //! println!("Saved {} repos", result.saved_count);
 //! ```
 
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use sea_orm::DatabaseConnection;
+use sea_orm::{ActiveValue, DatabaseConnection};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, interval_at};
+use uuid::Uuid;
 
 use crate::entity::code_repository::ActiveModel as CodeRepositoryActiveModel;
 use crate::repository;
@@ -114,39 +116,277 @@ impl PersistTaskResult {
     }
 }
 
-/// Flush a batch of models to the database.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PlatformIdentity {
+    instance_id: Uuid,
+    platform_id: i64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct NaturalKey {
+    instance_id: Uuid,
+    owner: String,
+    name: String,
+}
+
+#[derive(Clone, Debug)]
+struct IncomingIdentity {
+    platform: PlatformIdentity,
+    desired: NaturalKey,
+}
+
+fn required_model_value<T>(field: &str, value: &ActiveValue<T>) -> repository::Result<T>
+where
+    T: Clone + Into<sea_orm::Value>,
+{
+    match value {
+        ActiveValue::Set(value) | ActiveValue::Unchanged(value) => Ok(value.clone()),
+        ActiveValue::NotSet => Err(repository::RepositoryError::InvalidInput {
+            message: format!("Missing required field: {field}"),
+        }),
+    }
+}
+
+fn incoming_identity(model: &CodeRepositoryActiveModel) -> repository::Result<IncomingIdentity> {
+    let instance_id = required_model_value("instance_id", &model.instance_id)?;
+    Ok(IncomingIdentity {
+        platform: PlatformIdentity {
+            instance_id,
+            platform_id: required_model_value("platform_id", &model.platform_id)?,
+        },
+        desired: NaturalKey {
+            instance_id,
+            owner: required_model_value("owner", &model.owner)?,
+            name: required_model_value("name", &model.name)?,
+        },
+    })
+}
+
+/// Keep only the last model for each durable platform identity.
 ///
-/// This helper handles the database write, progress reporting, and error accumulation.
-/// Returns the number of rows successfully persisted.
-async fn flush_batch(
+/// This mirrors the bulk upsert semantics while preserving the first-seen
+/// position, which keeps component and progress ordering deterministic.
+fn deduplicate_pending_models(
+    models: Vec<CodeRepositoryActiveModel>,
+) -> repository::Result<Vec<CodeRepositoryActiveModel>> {
+    let mut deduplicated = Vec::with_capacity(models.len());
+    let mut positions = HashMap::with_capacity(models.len());
+
+    for model in models {
+        let identity = incoming_identity(&model)?.platform;
+        if let Some(position) = positions.get(&identity).copied() {
+            deduplicated[position] = model;
+        } else {
+            positions.insert(identity, deduplicated.len());
+            deduplicated.push(model);
+        }
+    }
+
+    Ok(deduplicated)
+}
+
+fn find_component_root(parents: &mut [usize], index: usize) -> usize {
+    let mut root = index;
+    while parents[root] != root {
+        root = parents[root];
+    }
+
+    let mut current = index;
+    while parents[current] != current {
+        let next = parents[current];
+        parents[current] = root;
+        current = next;
+    }
+
+    root
+}
+
+fn join_components(parents: &mut [usize], left: usize, right: usize) {
+    let left_root = find_component_root(parents, left);
+    let right_root = find_component_root(parents, right);
+    if left_root != right_root {
+        let (root, child) = if left_root < right_root {
+            (left_root, right_root)
+        } else {
+            (right_root, left_root)
+        };
+        parents[child] = root;
+    }
+}
+
+/// Group pending models into weakly connected rename components.
+///
+/// A dependency exists when one incoming model wants the current natural key
+/// of another incoming platform identity. Every connected component must be
+/// passed to `bulk_upsert` atomically so reconciliation either preserves all
+/// durable UUIDs in the component or rolls the whole rename back.
+async fn dependency_components(
     db: &DatabaseConnection,
-    batch: Vec<CodeRepositoryActiveModel>,
+    models: Vec<CodeRepositoryActiveModel>,
+) -> repository::Result<Vec<Vec<CodeRepositoryActiveModel>>> {
+    let models = deduplicate_pending_models(models)?;
+    if models.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let incoming: Vec<IncomingIdentity> = models
+        .iter()
+        .map(incoming_identity)
+        .collect::<repository::Result<_>>()?;
+    let positions_by_platform: HashMap<PlatformIdentity, usize> = incoming
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (key.platform.clone(), index))
+        .collect();
+
+    let mut platform_ids_by_instance: HashMap<Uuid, Vec<i64>> = HashMap::new();
+    for key in &incoming {
+        platform_ids_by_instance
+            .entry(key.platform.instance_id)
+            .or_default()
+            .push(key.platform.platform_id);
+    }
+
+    let mut positions_by_current_key = HashMap::with_capacity(models.len());
+    for (instance_id, platform_ids) in platform_ids_by_instance {
+        let stored =
+            repository::get_identities_by_platform_ids(db, instance_id, &platform_ids).await?;
+        for identity in stored {
+            let platform = PlatformIdentity {
+                instance_id,
+                platform_id: identity.platform_id,
+            };
+            let Some(position) = positions_by_platform.get(&platform).copied() else {
+                continue;
+            };
+            positions_by_current_key.insert(
+                NaturalKey {
+                    instance_id,
+                    owner: identity.owner,
+                    name: identity.name,
+                },
+                position,
+            );
+        }
+    }
+
+    let mut parents: Vec<usize> = (0..models.len()).collect();
+    for (position, key) in incoming.iter().enumerate() {
+        if let Some(occupant_position) = positions_by_current_key.get(&key.desired).copied()
+            && occupant_position != position
+        {
+            join_components(&mut parents, position, occupant_position);
+        }
+    }
+
+    let mut component_positions = HashMap::new();
+    let mut components: Vec<Vec<CodeRepositoryActiveModel>> = Vec::new();
+    for (position, model) in models.into_iter().enumerate() {
+        let root = find_component_root(&mut parents, position);
+        let component_position = *component_positions.entry(root).or_insert_with(|| {
+            components.push(Vec::new());
+            components.len() - 1
+        });
+        components[component_position].push(model);
+    }
+
+    Ok(components)
+}
+
+/// Pack independent components into bounded writes without splitting one.
+///
+/// A single component larger than the configured limit is intentionally kept
+/// indivisible. That exceptional logical batch can exceed `PERSIST_BATCH_SIZE`,
+/// but the repository layer still bounds its SQL statements inside one atomic
+/// transaction.
+fn pack_atomic_components(
+    components: Vec<Vec<CodeRepositoryActiveModel>>,
+) -> Vec<Vec<CodeRepositoryActiveModel>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::with_capacity(PERSIST_BATCH_SIZE);
+
+    for component in components {
+        if component.len() > PERSIST_BATCH_SIZE {
+            if !current.is_empty() {
+                batches.push(std::mem::take(&mut current));
+            }
+            tracing::warn!(
+                component_size = component.len(),
+                batch_limit = PERSIST_BATCH_SIZE,
+                "Repository rename component exceeds persistence batch limit; keeping it atomic"
+            );
+            batches.push(component);
+        } else {
+            if current.len() + component.len() > PERSIST_BATCH_SIZE {
+                batches.push(std::mem::replace(
+                    &mut current,
+                    Vec::with_capacity(PERSIST_BATCH_SIZE),
+                ));
+            }
+            current.extend(component);
+        }
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
+}
+
+fn model_names(models: &[CodeRepositoryActiveModel]) -> Vec<(String, String)> {
+    models
+        .iter()
+        .map(|model| {
+            let owner = match &model.owner {
+                ActiveValue::Set(value) | ActiveValue::Unchanged(value) => value.clone(),
+                ActiveValue::NotSet => "<unknown>".to_string(),
+            };
+            let name = match &model.name {
+                ActiveValue::Set(value) | ActiveValue::Unchanged(value) => value.clone(),
+                ActiveValue::NotSet => "<unknown>".to_string(),
+            };
+            (owner, name)
+        })
+        .collect()
+}
+
+fn report_model_errors(
+    models: &[CodeRepositoryActiveModel],
+    error: String,
+    result: &mut PersistTaskResult,
+    on_progress: &Option<Arc<ProgressCallback>>,
+) {
+    for (owner, name) in model_names(models) {
+        result
+            .errors
+            .push((owner.clone(), name.clone(), error.clone()));
+        if let Some(callback) = on_progress {
+            callback(SyncProgress::PersistError {
+                owner,
+                name,
+                error: error.clone(),
+            });
+        }
+    }
+}
+
+/// Persist one dependency-safe batch and report its result.
+async fn persist_atomic_batch(
+    db: &DatabaseConnection,
+    models: Vec<CodeRepositoryActiveModel>,
     is_final: bool,
+    retry_incomplete_reconciliation: bool,
     result: &mut PersistTaskResult,
     saved_count: &AtomicUsize,
     on_progress: &Option<Arc<ProgressCallback>>,
 ) {
-    if batch.is_empty() {
+    if models.is_empty() {
         return;
     }
 
-    // Extract names for progress reporting before consuming the batch
-    let batch_names: Vec<(String, String)> = batch
-        .iter()
-        .map(|model| {
-            let owner = match &model.owner {
-                sea_orm::ActiveValue::Set(v) | sea_orm::ActiveValue::Unchanged(v) => v.clone(),
-                sea_orm::ActiveValue::NotSet => "<unknown>".to_string(),
-            };
-            let name = match &model.name {
-                sea_orm::ActiveValue::Set(v) | sea_orm::ActiveValue::Unchanged(v) => v.clone(),
-                sea_orm::ActiveValue::NotSet => "<unknown>".to_string(),
-            };
-            (owner, name)
-        })
-        .collect();
-
-    let batch_size = batch.len();
+    let names = model_names(&models);
+    let batch_size = models.len();
 
     if let Some(cb) = on_progress {
         cb(SyncProgress::PersistingBatch {
@@ -158,14 +398,24 @@ async fn flush_batch(
     tracing::debug!(batch_size, is_final, "Flushing batch");
 
     let flush_start = std::time::Instant::now();
-    match repository::bulk_upsert_with_retry(
-        db,
-        batch,
-        PERSIST_RETRY_ATTEMPTS,
-        PERSIST_RETRY_BACKOFF_MS,
-    )
-    .await
-    {
+    let upsert_result = if retry_incomplete_reconciliation {
+        repository::bulk_upsert_with_retry(
+            db,
+            models,
+            PERSIST_RETRY_ATTEMPTS,
+            PERSIST_RETRY_BACKOFF_MS,
+        )
+        .await
+    } else {
+        repository::bulk_upsert_with_transient_retry(
+            db,
+            models,
+            PERSIST_RETRY_ATTEMPTS,
+            PERSIST_RETRY_BACKOFF_MS,
+        )
+        .await
+    };
+    match upsert_result {
         Ok(rows_affected) => {
             let elapsed = flush_start.elapsed();
             tracing::debug!(
@@ -179,7 +429,7 @@ async fn flush_batch(
             saved_count.fetch_add(count, Ordering::Relaxed);
             // Report progress for actually persisted items
             if let Some(cb) = on_progress {
-                for (owner, name) in batch_names.into_iter().take(count) {
+                for (owner, name) in names.into_iter().take(count) {
                     cb(SyncProgress::Persisted { owner, name });
                 }
             }
@@ -195,14 +445,14 @@ async fn flush_batch(
             );
             let error = e.to_string();
             // Accumulate errors for later reporting
-            for (owner, name) in &batch_names {
+            for (owner, name) in &names {
                 result
                     .errors
                     .push((owner.clone(), name.clone(), error.clone()));
             }
             // Also emit progress events for real-time feedback
             if let Some(cb) = on_progress {
-                for (owner, name) in batch_names {
+                for (owner, name) in names {
                     cb(SyncProgress::PersistError {
                         owner,
                         name,
@@ -211,6 +461,132 @@ async fn flush_batch(
                 }
             }
         }
+    }
+}
+
+/// Flush pending models as bounded, dependency-safe database writes.
+async fn flush_batch(
+    db: &DatabaseConnection,
+    batch: Vec<CodeRepositoryActiveModel>,
+    deferred: &mut Vec<CodeRepositoryActiveModel>,
+    is_final: bool,
+    result: &mut PersistTaskResult,
+    saved_count: &AtomicUsize,
+    on_progress: &Option<Arc<ProgressCallback>>,
+) {
+    if batch.is_empty() && deferred.is_empty() {
+        return;
+    }
+
+    let mut pending = std::mem::take(deferred);
+    pending.extend(batch);
+
+    let components = match dependency_components(db, pending.clone()).await {
+        Ok(components) => components,
+        Err(error) => {
+            let error_message = error.to_string();
+            tracing::warn!(
+                error = %error,
+                final_batch = is_final,
+                "Failed to inspect repository rename components"
+            );
+
+            // A non-final dependency read can be retried with later input. At
+            // final flush, report the read failure instead of splitting rows
+            // without enough information to preserve rename atomicity.
+            if is_final {
+                report_model_errors(&pending, error_message, result, on_progress);
+            } else {
+                *deferred = pending;
+            }
+            return;
+        }
+    };
+
+    let planned_batches = pack_atomic_components(components);
+    let mut ready_batches = Vec::new();
+    let mut blocked_components = Vec::new();
+
+    if is_final {
+        for planned in planned_batches {
+            if planned.len() > PERSIST_BATCH_SIZE {
+                // `pack_atomic_components` only emits an oversized batch for a
+                // single indivisible component, so it cannot contaminate an
+                // unrelated repository if reconciliation fails.
+                ready_batches.push(planned);
+                continue;
+            }
+
+            match repository::partition_deferred_upserts(db, planned.clone()).await {
+                Ok((ready, blocked)) => {
+                    if !ready.is_empty() {
+                        ready_batches.push(ready);
+                    }
+                    if !blocked.is_empty() {
+                        match dependency_components(db, blocked.clone()).await {
+                            Ok(components) => blocked_components.extend(components),
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "Failed to isolate incomplete repository rename components"
+                                );
+                                report_model_errors(
+                                    &blocked,
+                                    error.to_string(),
+                                    result,
+                                    on_progress,
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Failed to validate final repository rename components"
+                    );
+                    report_model_errors(&planned, error.to_string(), result, on_progress);
+                }
+            }
+        }
+    } else {
+        for planned in planned_batches {
+            if planned.len() > PERSIST_BATCH_SIZE {
+                // An oversized component is indivisible. Keep it in memory and
+                // write it only at final flush, when no missing members can
+                // still arrive from the stream.
+                deferred.extend(planned);
+                continue;
+            }
+
+            match repository::partition_deferred_upserts(db, planned.clone()).await {
+                Ok((ready, blocked)) => {
+                    if !ready.is_empty() {
+                        ready_batches.push(ready);
+                    }
+                    deferred.extend(blocked);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Failed to inspect repository rename dependencies; deferring batch"
+                    );
+                    // No database mutation has happened. Keep the models in
+                    // memory so a later flush can retry them.
+                    deferred.extend(planned);
+                }
+            }
+        }
+    }
+
+    for ready in ready_batches {
+        persist_atomic_batch(db, ready, is_final, true, result, saved_count, on_progress).await;
+    }
+    // Each blocked dependency component is attempted in its own transaction.
+    // Incomplete renames therefore report their reconciliation error without
+    // rolling back any unrelated valid component from the final flush.
+    for blocked in blocked_components {
+        persist_atomic_batch(db, blocked, true, false, result, saved_count, on_progress).await;
     }
 }
 
@@ -253,6 +629,7 @@ pub fn spawn_persist_task(
         // This approach immediately detects when the channel closes (recv returns None)
         // and flushes remaining items without waiting for any timeout.
         let mut batch: Vec<CodeRepositoryActiveModel> = Vec::with_capacity(PERSIST_BATCH_SIZE);
+        let mut deferred: Vec<CodeRepositoryActiveModel> = Vec::new();
         let mut batch_count = 0u64;
 
         // Create an interval for timeout-based flushing (deadlock prevention mid-stream).
@@ -270,9 +647,18 @@ pub fn spawn_persist_task(
 
             if shutdown_requested {
                 tracing::debug!("Shutdown requested, flushing final batch");
-                if !batch.is_empty() {
+                if !batch.is_empty() || !deferred.is_empty() {
                     batch_count += 1;
-                    flush_batch(&db, batch, true, &mut result, &saved_count, &on_progress).await;
+                    flush_batch(
+                        &db,
+                        batch,
+                        &mut deferred,
+                        true,
+                        &mut result,
+                        &saved_count,
+                        &on_progress,
+                    )
+                    .await;
                 }
                 break;
             }
@@ -291,7 +677,16 @@ pub fn spawn_persist_task(
                                     &mut batch,
                                     Vec::with_capacity(PERSIST_BATCH_SIZE)
                                 );
-                                flush_batch(&db, full_batch, false, &mut result, &saved_count, &on_progress).await;
+                                flush_batch(
+                                    &db,
+                                    full_batch,
+                                    &mut deferred,
+                                    false,
+                                    &mut result,
+                                    &saved_count,
+                                    &on_progress,
+                                )
+                                .await;
                                 // Reset the flush interval since we just flushed
                                 flush_interval.reset();
                             }
@@ -299,9 +694,18 @@ pub fn spawn_persist_task(
                         None => {
                             // Channel closed - flush remaining items immediately and exit
                             tracing::debug!("Channel closed, flushing final batch");
-                            if !batch.is_empty() {
+                            if !batch.is_empty() || !deferred.is_empty() {
                                 batch_count += 1;
-                                flush_batch(&db, batch, true, &mut result, &saved_count, &on_progress).await;
+                                flush_batch(
+                                    &db,
+                                    batch,
+                                    &mut deferred,
+                                    true,
+                                    &mut result,
+                                    &saved_count,
+                                    &on_progress,
+                                )
+                                .await;
                             }
                             break;
                         }
@@ -316,7 +720,16 @@ pub fn spawn_persist_task(
                         &mut batch,
                         Vec::with_capacity(PERSIST_BATCH_SIZE)
                     );
-                    flush_batch(&db, partial_batch, false, &mut result, &saved_count, &on_progress).await;
+                    flush_batch(
+                        &db,
+                        partial_batch,
+                        &mut deferred,
+                        false,
+                        &mut result,
+                        &saved_count,
+                        &on_progress,
+                    )
+                    .await;
                 }
             }
         }
@@ -731,12 +1144,18 @@ mod tests {
     #[tokio::test]
     async fn test_flush_batch_success_updates_counts_and_progress() {
         let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([
+                Vec::<crate::entity::code_repository::Model>::new(),
+                Vec::<crate::entity::code_repository::Model>::new(),
+                Vec::<crate::entity::code_repository::Model>::new(),
+            ])
             .append_exec_results([MockExecResult {
                 rows_affected: 1,
                 last_insert_id: 0,
             }])
             .into_connection();
         let mut result = PersistTaskResult::default();
+        let mut deferred = Vec::new();
         let saved_count = AtomicUsize::new(0);
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_for_cb = Arc::clone(&events);
@@ -759,6 +1178,7 @@ mod tests {
         flush_batch(
             &db,
             vec![active_model("octo", "demo")],
+            &mut deferred,
             true,
             &mut result,
             &saved_count,
@@ -778,9 +1198,15 @@ mod tests {
     #[tokio::test]
     async fn test_flush_batch_error_records_failures_and_progress() {
         let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results([
+                Vec::<crate::entity::code_repository::Model>::new(),
+                Vec::<crate::entity::code_repository::Model>::new(),
+                Vec::<crate::entity::code_repository::Model>::new(),
+            ])
             .append_exec_errors([DbErr::Query(RuntimeErr::Internal("boom".to_string()))])
             .into_connection();
         let mut result = PersistTaskResult::default();
+        let mut deferred = Vec::new();
         let saved_count = AtomicUsize::new(0);
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_for_cb = Arc::clone(&events);
@@ -796,7 +1222,8 @@ mod tests {
         flush_batch(
             &db,
             vec![active_model("octo", "broken")],
-            false,
+            &mut deferred,
+            true,
             &mut result,
             &saved_count,
             &Some(callback),
@@ -821,10 +1248,21 @@ mod tests {
     async fn test_spawn_persist_task_flushes_when_channel_closes() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Sqlite)
-                .append_exec_results([MockExecResult {
-                    rows_affected: 1,
-                    last_insert_id: 0,
-                }])
+                .append_query_results([
+                    Vec::<crate::entity::code_repository::Model>::new(),
+                    Vec::<crate::entity::code_repository::Model>::new(),
+                    Vec::<crate::entity::code_repository::Model>::new(),
+                ])
+                .append_exec_results([
+                    MockExecResult {
+                        rows_affected: 1,
+                        last_insert_id: 0,
+                    },
+                    MockExecResult {
+                        rows_affected: 0,
+                        last_insert_id: 0,
+                    },
+                ])
                 .into_connection(),
         );
         let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(4);
@@ -846,10 +1284,21 @@ mod tests {
     async fn test_spawn_persist_task_flushes_partial_batch_after_timeout() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Sqlite)
-                .append_exec_results([MockExecResult {
-                    rows_affected: 1,
-                    last_insert_id: 0,
-                }])
+                .append_query_results([
+                    Vec::<crate::entity::code_repository::Model>::new(),
+                    Vec::<crate::entity::code_repository::Model>::new(),
+                    Vec::<crate::entity::code_repository::Model>::new(),
+                ])
+                .append_exec_results([
+                    MockExecResult {
+                        rows_affected: 1,
+                        last_insert_id: 0,
+                    },
+                    MockExecResult {
+                        rows_affected: 0,
+                        last_insert_id: 0,
+                    },
+                ])
                 .into_connection(),
         );
         let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(4);
@@ -872,7 +1321,16 @@ mod tests {
     async fn test_spawn_persist_task_accumulates_errors_from_failed_flush() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([
+                    Vec::<crate::entity::code_repository::Model>::new(),
+                    Vec::<crate::entity::code_repository::Model>::new(),
+                    Vec::<crate::entity::code_repository::Model>::new(),
+                ])
                 .append_exec_errors([DbErr::Query(RuntimeErr::Internal("boom".to_string()))])
+                .append_exec_results([MockExecResult {
+                    rows_affected: 0,
+                    last_insert_id: 0,
+                }])
                 .into_connection(),
         );
         let (tx, rx) = mpsc::channel::<CodeRepositoryActiveModel>(4);
@@ -890,5 +1348,57 @@ mod tests {
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].0, "octo");
         assert_eq!(result.errors[0].1, "fail-flush");
+    }
+
+    #[tokio::test]
+    async fn test_flush_batch_retries_deferred_models_at_final_flush() {
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_errors([DbErr::Query(RuntimeErr::Internal(
+                "dependency query failed".to_string(),
+            ))])
+            .append_query_results([
+                Vec::<crate::entity::code_repository::Model>::new(),
+                Vec::<crate::entity::code_repository::Model>::new(),
+                Vec::<crate::entity::code_repository::Model>::new(),
+            ])
+            .append_exec_results([MockExecResult {
+                rows_affected: 1,
+                last_insert_id: 0,
+            }])
+            .into_connection();
+        let mut result = PersistTaskResult::default();
+        let saved_count = AtomicUsize::new(0);
+        let mut deferred = Vec::new();
+
+        flush_batch(
+            &db,
+            vec![active_model("octo", "retry-final")],
+            &mut deferred,
+            false,
+            &mut result,
+            &saved_count,
+            &None,
+        )
+        .await;
+
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(result.saved_count, 0);
+        assert!(result.errors.is_empty());
+
+        flush_batch(
+            &db,
+            Vec::new(),
+            &mut deferred,
+            true,
+            &mut result,
+            &saved_count,
+            &None,
+        )
+        .await;
+
+        assert!(deferred.is_empty());
+        assert_eq!(result.saved_count, 1);
+        assert!(result.errors.is_empty());
+        assert_eq!(saved_count.load(Ordering::Relaxed), 1);
     }
 }

@@ -93,7 +93,7 @@ pub async fn upsert(db: &DatabaseConnection, model: ActiveModel) -> Result<Model
     }
 }
 
-fn required_active_value<T: Clone + Into<sea_orm::Value>>(
+pub(super) fn required_active_value<T: Clone + Into<sea_orm::Value>>(
     field: &str,
     value: &ActiveValue<T>,
 ) -> Result<T> {
